@@ -78,10 +78,13 @@ tags = version_detail.tags or {}
 from platform_utils.promotion import CHAMPION, get_alias_version
 
 current_champion = get_alias_version(names.model_name, CHAMPION)
+# On a first deployment there is no champion yet. Rendered once here so every message
+# below reads correctly instead of printing a literal "vNone".
+champion_display = f"v{current_champion}" if current_champion else "no champion yet (first deployment)"
 
 print("--- Promotion request ---------------------------------------------")
 print(f"Candidate       : v{model_version}")
-print(f"Current champion: v{current_champion if current_champion else '(none — first deployment)'}")
+print(f"Current champion: {champion_display}")
 print(f"Validation      : {tags.get('validation_status', 'NOT RUN')}")
 print(f"Run ID          : {version_detail.run_id}")
 for key in sorted(k for k in tags if k.startswith("validation_") and k != "validation_status"):
@@ -117,7 +120,8 @@ if approval_required and not approved:
         f"To approve, set this tag on the model version and re-run this task:\n"
         f"    {APPROVAL_TAG} = {APPROVED_VALUE}\n"
         f"    approved_by    = <reviewer identity>\n\n"
-        f"Production keeps serving champion v{current_champion} until then.\n"
+        f"Until then, production serves {champion_display} — this candidate does not "
+        f"receive traffic.\n"
         f"{'=' * 70}"
     )
 
