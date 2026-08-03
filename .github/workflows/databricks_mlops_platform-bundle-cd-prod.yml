@@ -24,11 +24,15 @@ defaults:
     working-directory: ./databricks_mlops_platform
 
 env:
-  DATABRICKS_HOST: ${{ secrets.PROD_WORKSPACE_HOST }}
-  # See the staging workflow for the OAuth-vs-PAT note.
-  DATABRICKS_CLIENT_ID: ${{ secrets.PROD_CLIENT_ID }}
-  DATABRICKS_CLIENT_SECRET: ${{ secrets.PROD_CLIENT_SECRET }}
-  DATABRICKS_TOKEN: ${{ secrets.PROD_WORKSPACE_TOKEN }}
+  # One credential pair for every environment, matching this deployment: staging and prod
+  # live in the same workspace and are separated by Unity Catalog schema, not by workspace.
+  #
+  # Where staging and prod are genuinely separate workspaces, define these as *environment*
+  # secrets (Settings > Environments) rather than repository secrets. Prod credentials are
+  # then unreachable from any workflow that does not target the production environment,
+  # which a shared repository secret cannot enforce.
+  DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+  DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
 
 jobs:
   deploy:

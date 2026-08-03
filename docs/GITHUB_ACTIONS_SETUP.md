@@ -16,31 +16,27 @@ gate has teeth.
 
 ---
 
-## Step 1 — Create service principals (recommended) or get tokens
+## Step 1 — Get an access token
 
-Workflows authenticate to Databricks as a **service principal**, not as a person. A human's
-token ties production deploys to one employee's account and breaks when they rotate
-credentials or leave.
+For a demo, a personal access token for your own identity is fine.
 
-Create one SP per environment, each with:
+For anything durable, use a **service principal** instead. A human's token ties production
+deploys to one person's account and breaks when they rotate credentials or leave. The SP
+needs:
+
 - workspace access
-- `USE CATALOG` + `CREATE TABLE` / `CREATE FUNCTION` / `CREATE VOLUME` on its schema
-- `CAN_MANAGE` on that environment's bundle root path
+- `USE CATALOG` plus `CREATE TABLE` / `CREATE FUNCTION` / `CREATE VOLUME` on its schema
+- `CAN_MANAGE` on the bundle root path
 
-> **Note for this demo workspace:** the current identity cannot create tokens
-> (`User does not have permission to use tokens`), and cannot create schemas. Both need a
-> workspace admin. See [DEMO_SCRIPT.md](DEMO_SCRIPT.md) for the schema bootstrap.
+> **Blocker in this demo workspace:** the current identity cannot create tokens —
+> `databricks tokens list` returns `User does not have permission to use tokens`. It also
+> cannot create schemas. Both need a workspace admin, so raise them together. See
+> [DEMO_SCRIPT.md](DEMO_SCRIPT.md) for the schema bootstrap.
 
-### Option A — OAuth (M2M), preferred
-
-No long-lived secret to rotate. Create an OAuth secret for the SP, then set
-`DATABRICKS_CLIENT_ID` / `DATABRICKS_CLIENT_SECRET` instead of `DATABRICKS_TOKEN`. The
-Databricks CLI picks these up automatically — no workflow edit needed beyond swapping the
-two `env:` lines.
-
-### Option B — Personal access token
-
-Simpler, but long-lived. Generate a PAT per SP and use `DATABRICKS_TOKEN`.
+If you later want to avoid a long-lived token entirely, Databricks supports OAuth (M2M):
+create an OAuth secret for the SP and set `DATABRICKS_CLIENT_ID` / `DATABRICKS_CLIENT_SECRET`
+in place of `DATABRICKS_TOKEN`. The CLI picks those up automatically — swapping the two
+`env:` lines is the only workflow change.
 
 ---
 
@@ -48,38 +44,49 @@ Simpler, but long-lived. Generate a PAT per SP and use `DATABRICKS_TOKEN`.
 
 **Settings → Secrets and variables → Actions → Secrets → New repository secret**
 
-Always set the two hosts:
+Two secrets, used by all four workflows:
 
 | Secret | Value |
 |---|---|
-| `STAGING_WORKSPACE_HOST` | `https://<workspace>.cloud.databricks.com` |
-| `PROD_WORKSPACE_HOST` | prod workspace URL (same host here — environments are separated by schema) |
+| `DATABRICKS_HOST` | `https://dbc-aef35066-afa2.cloud.databricks.com` |
+| `DATABRICKS_TOKEN` | access token for the identity CI runs as |
 
-Then **one** of the following credential pairs per environment. The workflows read both, and
-the Databricks CLI prefers OAuth when the client id/secret are present, so you can start with
-a PAT and move to OAuth later without editing any workflow.
+One pair covers every environment because staging and prod live in the **same workspace**,
+separated by Unity Catalog schema. The Databricks CLI reads both variables automatically, so
+no workflow changes are needed.
 
-| OAuth (preferred) | Personal access token |
-|---|---|
-| `STAGING_CLIENT_ID` / `STAGING_CLIENT_SECRET` | `STAGING_WORKSPACE_TOKEN` |
-| `PROD_CLIENT_ID` / `PROD_CLIENT_SECRET` | `PROD_WORKSPACE_TOKEN` |
+### The trade-off, stated plainly
 
-Leave the unused ones unset — an empty secret resolves to an empty string, which the CLI
-ignores.
+A single repository secret means the staging pipeline holds credentials that can also write
+to prod. The approval gate still prevents an unapproved *model* from serving traffic — it is
+enforced inside the pipeline, not by the credential — but credential-level separation is
+weaker than it could be.
 
-Or with the CLI, authenticated as the repo owner:
+Two ways to tighten it when you want to:
+
+1. **Environment secrets.** Define `DATABRICKS_HOST` / `DATABRICKS_TOKEN` under
+   Settings → Environments → `production` instead of as repository secrets. Workflows not
+   targeting that environment cannot read them. Requires separate workspaces (or separate
+   service principals) to be meaningful.
+2. **Per-environment service principals.** One SP per environment, each granted only on its
+   own schema, so a staging credential physically cannot write to `mlops_prod`.
+
+Either is a straightforward change later. Starting with one pair is a reasonable choice for a
+demo and for a single-workspace deployment.
+
+### Setting them
+
+Via the UI, or with the CLI as the repo owner:
 
 ```bash
 gh auth login   # must be the account that owns the repo
 R=anirvandecodes/databricks_mlops_platform
 
-gh secret set STAGING_WORKSPACE_HOST  --repo $R --body "https://dbc-aef35066-afa2.cloud.databricks.com"
-gh secret set STAGING_WORKSPACE_TOKEN --repo $R   # prompts, not in shell history
-gh secret set PROD_WORKSPACE_HOST     --repo $R --body "https://dbc-aef35066-afa2.cloud.databricks.com"
-gh secret set PROD_WORKSPACE_TOKEN    --repo $R
+gh secret set DATABRICKS_HOST  --repo $R --body "https://dbc-aef35066-afa2.cloud.databricks.com"
+gh secret set DATABRICKS_TOKEN --repo $R   # prompts; keeps it out of shell history
 ```
 
-Set the token secrets interactively (no `--body`) so they never land in your shell history.
+Set the token with no `--body` so it is prompted for and never lands in shell history.
 
 ---
 
@@ -112,8 +119,9 @@ Then configure:
 1. **Required reviewers** — add whoever owns model risk. The prod CD workflow's
    `train_and_stage_candidate` job now pauses until one of them approves, *before* it runs.
 2. **Deployment branches** — restrict to `release` only.
-3. Optionally move `PROD_WORKSPACE_TOKEN` here as an environment secret, so prod credentials
-   are unreachable from any workflow not targeting `production`.
+3. Optionally define `DATABRICKS_TOKEN` here as an environment secret, overriding the
+   repository one, so prod credentials are unreachable from any workflow not targeting
+   `production`. Only meaningful once prod uses a distinct workspace or service principal.
 
 You now have three independent gates:
 

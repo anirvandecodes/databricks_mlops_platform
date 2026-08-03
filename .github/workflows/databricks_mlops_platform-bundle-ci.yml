@@ -31,10 +31,8 @@ jobs:
       matrix:
         target: [dev, staging, prod]
     env:
-      DATABRICKS_HOST: ${{ secrets.STAGING_WORKSPACE_HOST }}
-      DATABRICKS_CLIENT_ID: ${{ secrets.STAGING_CLIENT_ID }}
-      DATABRICKS_CLIENT_SECRET: ${{ secrets.STAGING_CLIENT_SECRET }}
-      DATABRICKS_TOKEN: ${{ secrets.STAGING_WORKSPACE_TOKEN }}
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -54,10 +52,8 @@ jobs:
     if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'workflow_dispatch'
     concurrency: staging-integration
     env:
-      DATABRICKS_HOST: ${{ secrets.STAGING_WORKSPACE_HOST }}
-      DATABRICKS_CLIENT_ID: ${{ secrets.STAGING_CLIENT_ID }}
-      DATABRICKS_CLIENT_SECRET: ${{ secrets.STAGING_CLIENT_SECRET }}
-      DATABRICKS_TOKEN: ${{ secrets.STAGING_WORKSPACE_TOKEN }}
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
