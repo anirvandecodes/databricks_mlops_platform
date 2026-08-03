@@ -18,7 +18,7 @@ import pytest
 
 pytest.importorskip("mlflow")
 
-CATALOG = os.environ.get("MLOPS_TEST_CATALOG", "paypay_demo_catalog")
+CATALOG = os.environ.get("MLOPS_TEST_CATALOG", "workspace")
 SCHEMA = os.environ.get("MLOPS_TEST_SCHEMA", "payments_dev")
 
 
