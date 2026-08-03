@@ -29,16 +29,27 @@ def main() -> int:
         default="challenger",
         help="Alias identifying the staged candidate (default: challenger).",
     )
+    parser.add_argument(
+        "--format",
+        choices=("table", "inline"),
+        default="table",
+        help=(
+            "table: markdown rows for the step summary. inline: one line, for a ::notice:: "
+            "annotation, which cannot contain newlines."
+        ),
+    )
     args = parser.parse_args()
 
-    import mlflow
-
-    mlflow.set_registry_uri("databricks-uc")
+    from mlflow import MlflowClient
 
     sys.path.insert(0, ".")
-    from platform_utils.promotion import get_alias_version, get_client
+    from platform_utils.promotion import get_alias_version
 
-    client = get_client()
+    # Both URIs are passed explicitly. Outside a Databricks notebook there is no ambient
+    # workspace context, and MLflow 3 defaults the tracking URI to a local sqlite file —
+    # so a client built without them silently creates an empty local registry and reports
+    # that nothing is staged, rather than failing.
+    client = MlflowClient(tracking_uri="databricks", registry_uri="databricks-uc")
 
     version = get_alias_version(args.model, args.alias, client=client)
     if not version:
@@ -56,13 +67,25 @@ def main() -> int:
     tags = client.get_model_version(args.model, str(version)).tags or {}
     rows = [(k, v) for k, v in tags.items() if k.startswith(PREFIX)]
     if not rows:
-        print("| _no validation metrics recorded_ | |")
+        # Not an error: a version can exist before ModelValidation has tagged it. The caller
+        # decides whether missing metrics should block, so say so plainly and exit clean.
+        print(
+            "| _no validation metrics recorded_ | |"
+            if args.format == "table"
+            else "no validation metrics recorded"
+        )
         return 0
 
     # Status first, then metrics alphabetically: the verdict is what a reviewer looks for.
     rows.sort(key=lambda kv: (kv[0] != f"{PREFIX}status", kv[0]))
-    for key, value in rows:
-        print(f"| {key[len(PREFIX):].replace('_', ' ')} | {value} |")
+    labelled = [(key[len(PREFIX) :].replace("_", " "), value) for key, value in rows]
+
+    if args.format == "inline":
+        # Annotations are single-line, so join rather than emit one row per metric.
+        print(" | ".join(f"{label} {value}" for label, value in labelled))
+    else:
+        for label, value in labelled:
+            print(f"| {label} | {value} |")
     return 0
 
 

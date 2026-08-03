@@ -9,7 +9,7 @@ What to create in GitHub so the four CI/CD workflows run. Roughly 15 minutes.
 | `...-run-tests.yml` | PR | unit tests, then integration tests |
 | `...-bundle-ci.yml` | PR | validates all 3 targets, then runs the whole pipeline in staging |
 | `...-bundle-cd-staging.yml` | merge to `main` | deploys + runs pipeline in staging |
-| `...-bundle-cd-prod.yml` | push to `release` | deploys to prod, trains, then **stops at the approval gate** |
+| `...-bundle-cd-prod.yml` | push to `release/**` | deploys to prod, trains, then **stops at the approval gate** |
 
 The two PR workflows are the Stage-1 code gate. Make them required status checks and the
 gate has teeth.
@@ -115,8 +115,9 @@ This is where the governance story gets a second control.
 Then configure:
 
 1. **Required reviewers** — add whoever owns model risk. The prod CD workflow's
-   `train_and_stage_candidate` job now pauses until one of them approves, *before* it runs.
-2. **Deployment branches** — restrict to `release` only.
+   `promote` job pauses until one of them approves — *after* training and validation, so
+   the reviewer decides with the candidate's metrics in front of them.
+2. **Deployment branches** — restrict to the `release/*` pattern only.
 3. Optionally define `DATABRICKS_TOKEN` here as an environment secret, overriding the
    repository one, so prod credentials are unreachable from any workflow not targeting
    `production`. Only meaningful once prod uses a distinct workspace or service principal.
@@ -150,7 +151,7 @@ approve code and a run; only the model gate approves the specific artifact.
 Status checks only appear in that list after they've run once, so open a throwaway PR first,
 then come back and select them.
 
-Add the same ruleset for `release`, since that branch deploys to production.
+Add the same ruleset for `release/*`, since those branches deploy to production.
 
 ---
 
@@ -167,9 +168,10 @@ gh pr checks --watch
 Expect: unit tests pass in ~2 min; bundle validation passes for all three targets; the
 staging integration run takes ~10 min and exercises the full pipeline.
 
-Then merge and confirm staging CD runs. When you push to `release`, the prod workflow should
-**deploy successfully but report "Candidate awaiting approval"** — that is the gate working,
-not a failure.
+Then merge and confirm staging CD runs. When you push a `release/<name>` branch, the prod
+workflow should deploy, train, stage the candidate as `@challenger`, and then **pause on the
+`promote` job awaiting your approval** — that pause is the gate working, not a failure.
+Nothing reaches `@champion` until someone approves.
 
 ---
 
