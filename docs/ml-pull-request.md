@@ -46,8 +46,8 @@ jobs in staging and production will automatically use your updated ML code.
 You can track the state of the ML pipelines for the current project from the MLflow registered model UI. 
 
 Links:
-* [Staging model in UC](https://dbc-aef35066-afa2.cloud.databricks.com/explore/data/models/staging/databricks_mlops_platform/databricks_mlops_platform-model)
-* [Prod model in UC](https://dbc-aef35066-afa2.cloud.databricks.com/explore/data/models/prod/databricks_mlops_platform/databricks_mlops_platform-model)
+* [Staging model in UC](https://fevm-paypay-demo.cloud.databricks.com/explore/data/models/staging/databricks_mlops_platform/databricks_mlops_platform-model)
+* [Prod model in UC](https://fevm-paypay-demo.cloud.databricks.com/explore/data/models/prod/databricks_mlops_platform/databricks_mlops_platform-model)
 
 
 

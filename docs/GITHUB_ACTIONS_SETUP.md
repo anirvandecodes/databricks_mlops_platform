@@ -28,10 +28,8 @@ needs:
 - `USE CATALOG` plus `CREATE TABLE` / `CREATE FUNCTION` / `CREATE VOLUME` on its schema
 - `CAN_MANAGE` on the bundle root path
 
-> **Blocker in this demo workspace:** the current identity cannot create tokens —
-> `databricks tokens list` returns `User does not have permission to use tokens`. It also
-> cannot create schemas. Both need a workspace admin, so raise them together. See
-> [DEMO_SCRIPT.md](DEMO_SCRIPT.md) for the schema bootstrap.
+Generate one under **User Settings → Developer → Access tokens**, or with
+`databricks tokens create --comment "github actions"`.
 
 If you later want to avoid a long-lived token entirely, Databricks supports OAuth (M2M):
 create an OAuth secret for the SP and set `DATABRICKS_CLIENT_ID` / `DATABRICKS_CLIENT_SECRET`
@@ -48,7 +46,7 @@ Two secrets, used by all four workflows:
 
 | Secret | Value |
 |---|---|
-| `DATABRICKS_HOST` | `https://dbc-aef35066-afa2.cloud.databricks.com` |
+| `DATABRICKS_HOST` | `https://fevm-paypay-demo.cloud.databricks.com` |
 | `DATABRICKS_TOKEN` | access token for the identity CI runs as |
 
 One pair covers every environment because staging and prod live in the **same workspace**,
@@ -69,7 +67,7 @@ Two ways to tighten it when you want to:
    targeting that environment cannot read them. Requires separate workspaces (or separate
    service principals) to be meaningful.
 2. **Per-environment service principals.** One SP per environment, each granted only on its
-   own schema, so a staging credential physically cannot write to `mlops_prod`.
+   own schema, so a staging credential physically cannot write to `payments_prod`.
 
 Either is a straightforward change later. Starting with one pair is a reasonable choice for a
 demo and for a single-workspace deployment.
@@ -82,7 +80,7 @@ Via the UI, or with the CLI as the repo owner:
 gh auth login   # must be the account that owns the repo
 R=anirvandecodes/databricks_mlops_platform
 
-gh secret set DATABRICKS_HOST  --repo $R --body "https://dbc-aef35066-afa2.cloud.databricks.com"
+gh secret set DATABRICKS_HOST  --repo $R --body "https://fevm-paypay-demo.cloud.databricks.com"
 gh secret set DATABRICKS_TOKEN --repo $R   # prompts; keeps it out of shell history
 ```
 
@@ -96,12 +94,12 @@ Set the token with no `--body` so it is prompted for and never lands in shell hi
 
 | Variable | Value | Purpose |
 |---|---|---|
-| `MLOPS_TEST_CATALOG` | `workspace` | catalog integration tests write to |
-| `MLOPS_TEST_SCHEMA` | `mlops_staging` | schema integration tests write to |
+| `MLOPS_TEST_CATALOG` | `paypay_demo_catalog` | catalog integration tests write to |
+| `MLOPS_TEST_SCHEMA` | `payments_staging` | schema integration tests write to |
 
 ```bash
-gh variable set MLOPS_TEST_CATALOG --repo $R --body "workspace"
-gh variable set MLOPS_TEST_SCHEMA  --repo $R --body "mlops_staging"
+gh variable set MLOPS_TEST_CATALOG --repo $R --body "paypay_demo_catalog"
+gh variable set MLOPS_TEST_SCHEMA  --repo $R --body "payments_staging"
 ```
 
 Both have defaults in the workflow, so this step is optional.

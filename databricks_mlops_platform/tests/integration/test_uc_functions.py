@@ -18,8 +18,8 @@ import uuid
 
 import pytest
 
-CATALOG = os.environ.get("MLOPS_TEST_CATALOG", "workspace")
-SCHEMA = os.environ.get("MLOPS_TEST_SCHEMA", "default")
+CATALOG = os.environ.get("MLOPS_TEST_CATALOG", "paypay_demo_catalog")
+SCHEMA = os.environ.get("MLOPS_TEST_SCHEMA", "payments_dev")
 
 
 @pytest.fixture

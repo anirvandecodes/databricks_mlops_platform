@@ -21,17 +21,19 @@ Everything else in the demo supports that sentence.
 
 ## Before the demo
 
-### 1. Create the environment schemas (one-time, needs a workspace admin)
+### 1. Confirm the environment schemas exist (one-time)
 
 ```bash
-python scripts/bootstrap_uc.py --profile <profile> --catalog workspace
+python scripts/bootstrap_uc.py --profile <profile> \
+  --catalog paypay_demo_catalog --prefix payments
 ```
 
-This creates `mlops_dev`, `mlops_staging`, `mlops_prod` plus the audit Volume, and
-verifies each is writable. It requires `CREATE SCHEMA` on the catalog. If it reports
-`PERMISSION_DENIED`, have an admin run the three `CREATE SCHEMA` statements it prints, or
-demo against a schema you already own by passing `--var schema_name=<your_schema>` to
-every command below.
+Idempotent: it creates `payments_dev`, `payments_staging`, `payments_prod` plus the audit
+Volume if missing, then verifies each is writable. Re-running it is the quickest way to check
+the environment is still sound.
+
+Requires `CREATE SCHEMA` on the catalog. If it reports `PERMISSION_DENIED`, have a workspace
+admin run the `CREATE SCHEMA` statements it prints.
 
 ### 2. Deploy and prime dev
 
@@ -64,9 +66,9 @@ Show `databricks.yml`. Three targets, one code path. Everything environment-spec
 variable:
 
 ```yaml
-dev:      schema_name: mlops_dev      approval_required: "false"
-staging:  schema_name: mlops_staging  approval_required: "false"
-prod:     schema_name: mlops_prod     approval_required: "true"
+dev:      schema_name: payments_dev      approval_required: "false"
+staging:  schema_name: payments_staging  approval_required: "false"
+prod:     schema_name: payments_prod     approval_required: "true"
 ```
 
 > "The code that will run in production is the code that ran in staging. The only thing
@@ -116,7 +118,7 @@ databricks bundle run model_training_job -t dev
 Real output:
 
 ```
-Task Train:            models:/workspace.mlops_dev.credit_risk_model/6
+Task Train:            models:/paypay_demo_catalog.payments_dev.credit_risk_model/6
 Task ModelValidation:  PASSED
 Task ApprovalGate:     AUTO_APPROVED
 Task ModelDeployment:  PROMOTED:6
@@ -138,7 +140,7 @@ The job **fails**, by design:
 ======================================================================
 PROMOTION BLOCKED — approval required in environment 'prod'.
 ======================================================================
-Model  : workspace.mlops_prod.credit_risk_model
+Model  : paypay_demo_catalog.payments_prod.credit_risk_model
 Version: 5
 
 No 'approval_status' tag on version 5. A reviewer must set
@@ -224,7 +226,7 @@ databricks bundle run rollback_job -t dev \
 
 ```sql
 SELECT promoted_version, environment, approver, decision, evaluation_summary
-FROM workspace.mlops_dev.promotion_audit_log
+FROM paypay_demo_catalog.payments_dev.promotion_audit_log
 ORDER BY recorded_at DESC;
 ```
 
@@ -251,7 +253,7 @@ Each row carries the metrics the approver actually saw:
 And the immutable evidence files:
 
 ```sql
-LIST '/Volumes/workspace/mlops_dev/audit_logs';
+LIST '/Volumes/paypay_demo_catalog/payments_dev/audit_logs';
 ```
 
 > "Unity Catalog system tables already track *what* happened. The Volume answers *on what
@@ -271,7 +273,7 @@ Task DriftCheck:    STABLE
 
 ```sql
 SELECT feature, round(psi, 4) AS psi, verdict
-FROM workspace.mlops_dev.drift_check_results
+FROM paypay_demo_catalog.payments_dev.drift_check_results
 ORDER BY psi DESC;
 ```
 
@@ -290,11 +292,11 @@ ORDER BY psi DESC;
 **If you want to show a breach** (adds ~6 min), inject a shifted cohort:
 
 ```sql
-INSERT INTO workspace.mlops_dev.inference_log
+INSERT INTO paypay_demo_catalog.payments_dev.inference_log
 SELECT customer_id, duration*3, credit_amount*5, age+35, installment_commitment,
        monthly_instalment*4, credit_to_age_ratio*3, prediction, model_version,
        scored_at, ground_truth
-FROM workspace.mlops_dev.inference_log LIMIT 150;
+FROM paypay_demo_catalog.payments_dev.inference_log LIMIT 150;
 ```
 
 Re-run `monitoring_job`. Real result:
@@ -316,7 +318,7 @@ Then the governance point:
 > an unreviewed path into production — otherwise it's a back door around everything we just
 > showed."
 
-Afterwards, clean up: `TRUNCATE TABLE workspace.mlops_dev.inference_log;` then re-run
+Afterwards, clean up: `TRUNCATE TABLE paypay_demo_catalog.payments_dev.inference_log;` then re-run
 `batch_inference_job`.
 
 ### 4c. The decision layer
@@ -325,7 +327,7 @@ Afterwards, clean up: `TRUNCATE TABLE workspace.mlops_dev.inference_log;` then r
 SELECT risk_band, count(*) AS applicants,
        round(avg(prediction), 3) AS avg_pd,
        round(avg(offered_credit_limit), 0) AS avg_limit
-FROM workspace.mlops_dev.credit_decisions
+FROM paypay_demo_catalog.payments_dev.credit_decisions
 GROUP BY risk_band ORDER BY risk_band;
 ```
 
@@ -347,7 +349,7 @@ Open `decision_layer/policy.py`.
 > probability bands, so a very low PD can never override a KYC failure."
 
 ```sql
-SELECT rejection_reason, count(*) FROM workspace.mlops_dev.credit_decisions
+SELECT rejection_reason, count(*) FROM paypay_demo_catalog.payments_dev.credit_decisions
 GROUP BY rejection_reason;
 ```
 

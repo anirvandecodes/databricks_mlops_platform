@@ -106,7 +106,7 @@ MLOPS_TEST_PROFILE=<profile> pytest tests/unit -q
 ## Governance model
 
 Environment separation uses one catalog with a schema per environment
-(`mlops_dev` / `mlops_staging` / `mlops_prod`), enforced by schema-level grants.
+(`payments_dev` / `payments_staging` / `payments_prod`), enforced by schema-level grants.
 
 Catalog-per-environment is the stronger posture and is preferred where the metastore allows
 `CREATE CATALOG`. Because both layouts are addressed through the same
