@@ -45,9 +45,16 @@ def temp_model(client):
     versions = []
     for _ in range(2):
         with mlflow.start_run():
-            model = DummyClassifier(strategy="constant", constant=0).fit([[0.0]], [0])
+            features = [[0.0]]
+            model = DummyClassifier(strategy="constant", constant=0).fit(features, [0])
+            # input_example is required, not merely informative: Unity Catalog rejects any
+            # model version logged without a signature, and passing an example is what
+            # lets MLflow infer one. Mirrors how training/Train.py registers the real model.
             logged = mlflow.sklearn.log_model(
-                model, artifact_path="model", registered_model_name=name
+                model,
+                artifact_path="model",
+                registered_model_name=name,
+                input_example=features,
             )
             versions.append(str(logged.registered_model_version))
 
