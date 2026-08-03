@@ -39,22 +39,26 @@ def temp_model(client):
     Two versions are the minimum needed to exercise promotion *and* rollback.
     """
     import mlflow
+    import numpy as np
+    from mlflow.models import infer_signature
     from sklearn.dummy import DummyClassifier
 
     name = f"{CATALOG}.{SCHEMA}.it_credit_model_{uuid.uuid4().hex[:8]}"
     versions = []
+    # Unity Catalog refuses to register a model version that carries no signature. The
+    # signature is passed explicitly rather than left to be inferred from input_example
+    # alone, which does not reliably produce one for a bare list-of-lists input.
+    features = np.array([[0.0]])
+    labels = np.array([0])
     for _ in range(2):
         with mlflow.start_run():
-            features = [[0.0]]
-            model = DummyClassifier(strategy="constant", constant=0).fit(features, [0])
-            # input_example is required, not merely informative: Unity Catalog rejects any
-            # model version logged without a signature, and passing an example is what
-            # lets MLflow infer one. Mirrors how training/Train.py registers the real model.
+            model = DummyClassifier(strategy="constant", constant=0).fit(features, labels)
             logged = mlflow.sklearn.log_model(
                 model,
                 artifact_path="model",
                 registered_model_name=name,
                 input_example=features,
+                signature=infer_signature(features, model.predict(features)),
             )
             versions.append(str(logged.registered_model_version))
 
