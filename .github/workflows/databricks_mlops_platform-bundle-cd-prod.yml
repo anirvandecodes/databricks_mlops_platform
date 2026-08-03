@@ -1,16 +1,25 @@
 # Production CD. Triggered by a push to the release branch.
 #
-# The deployment is split into two jobs on purpose:
+# Three jobs, so that the human decision sits between producing the evidence and acting
+# on it:
 #
-#   deploy  — pushes code and job definitions to prod. Always safe: deploying a bundle
-#             changes no model alias, so production keeps serving the current champion.
-#   train   — runs the training workflow, which halts at the approval gate because prod
-#             sets approval_required=true.
+#   deploy   — pushes code and job definitions to prod. Always safe: deploying a bundle
+#              changes no model alias, so production keeps serving the current champion.
+#   train    — trains, validates, and stages the new version as @challenger. Halts at the
+#              in-pipeline ApprovalGate, then publishes the candidate's validation metrics
+#              to the run summary. Still changes nothing that serves traffic.
+#   promote  — gated on the GitHub `production` environment. Waits for a reviewer, then
+#              records their approval in Unity Catalog and moves @champion.
 #
-# So a merge to release never silently changes what production serves. It stages a
-# candidate and waits for a reviewer. The GitHub "production" environment adds an
-# optional second control: if configured with required reviewers, the train job itself
-# needs sign-off before it even starts.
+# So a push to release never silently changes what production serves: it stages a
+# candidate, shows the metrics, and waits. The reviewer approves *after* seeing how the
+# model performed, which is the point — gating the training job instead would ask for
+# sign-off before any metric existed.
+#
+# The GitHub approval and the Unity Catalog approval_status tag are one decision recorded
+# in two places, not two independent reviews: approving here writes the tag, and the
+# in-pipeline gate then re-checks it. That keeps a single enforcement point for "may this
+# version serve traffic" while leaving an audit trail next to the model.
 name: Prod CD for databricks_mlops_platform
 
 on:
@@ -50,44 +59,111 @@ jobs:
         # what production is currently serving.
         run: databricks bundle deploy -t prod
 
+  # No GitHub environment here on purpose. Staging a candidate changes nothing that
+  # production serves, so it needs no sign-off — and gating this job would ask a reviewer
+  # to approve a model that does not exist yet, before any metric has been computed.
   train_and_stage_candidate:
     needs: deploy
     runs-on: ubuntu-latest
     concurrency: prod-training
-    # Maps to a GitHub Environment. Add required reviewers there to gate the run itself,
-    # in addition to the in-pipeline model gate.
-    environment: production
     steps:
       - uses: actions/checkout@v4
       - uses: databricks/setup-cli@main
 
-      - name: Run training workflow
-        # Expected to FAIL at the ApprovalGate task when the newly trained version has no
-        # approval tag. That failure is the control working as designed, not a broken
-        # pipeline — see the step below.
+      - name: Train, validate and stage a challenger
+        # Expected to FAIL at the ApprovalGate task: the freshly trained version carries no
+        # approval tag, so the gate holds and ModelDeployment is skipped. That failure is
+        # the control working as designed, which is why the step continues on error.
         id: train
         continue-on-error: true
-        run: databricks bundle run model_training_job -t prod
+        run: databricks bundle run model_training_job -t prod --only Train,ModelValidation,ApprovalGate
 
-      - name: Report promotion status
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install --quiet -r requirements.txt
+
+      - name: Publish the candidate's metrics for review
+        # The reviewer's decision is only meaningful if the numbers are in front of them,
+        # so the validation tags written by ModelValidation are surfaced here rather than
+        # left to be looked up in the workspace.
+        id: candidate
+        env:
+          MODEL: workspace.payments_prod.credit_risk_model
         run: |
-          if [ "${{ steps.train.outcome }}" = "success" ]; then
-            {
-              echo "### Model promoted to champion"
-              echo "The candidate carried a valid approval tag and is now serving."
-            } >> "$GITHUB_STEP_SUMMARY"
-          else
-            {
-              echo "### Candidate awaiting approval"
-              echo ""
-              echo "Training and validation completed; promotion is blocked pending review."
-              echo "Production continues to serve the existing champion."
-              echo ""
-              echo "To approve, set these tags on the new model version in Unity Catalog:"
-              echo '  approval_status = approved'
-              echo '  approved_by     = <reviewer>'
-              echo ""
-              echo "Then re-run only the gate:"
-              echo '  databricks bundle run model_training_job -t prod --only ApprovalGate'
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
+          # candidate_report.py appends candidate_version to $GITHUB_OUTPUT itself; read it
+          # back here rather than through steps.candidate.outputs, which is not populated
+          # until this step has finished.
+          METRICS=$(python scripts/candidate_report.py --model "$MODEL")
+          VERSION=$(grep '^candidate_version=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2)
+          {
+            echo "### Production candidate awaiting approval"
+            echo ""
+            echo "\`${MODEL}\` version **${VERSION}** is staged as \`@challenger\`."
+            echo "Production continues to serve the current champion — this candidate"
+            echo "receives no traffic until it is approved."
+            echo ""
+            echo "| metric | value |"
+            echo "|---|---|"
+            echo "$METRICS"
+            echo ""
+            echo "Approve the **production** environment below to promote this version"
+            echo "to \`@champion\`. Rejecting leaves production untouched."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+    outputs:
+      candidate_version: ${{ steps.candidate.outputs.candidate_version }}
+
+  # The human gate. GitHub holds this job until a required reviewer of the `production`
+  # environment approves, so nothing reaches @champion on a merge alone. The reviewer has
+  # the candidate's validation metrics in the step summary above before deciding.
+  #
+  # Configure Settings > Environments > production > Required reviewers to arm it. Without
+  # reviewers configured GitHub runs this job immediately, which makes the gate cosmetic —
+  # the in-pipeline ApprovalGate still holds, but the pause a reviewer expects will not happen.
+  promote:
+    needs: train_and_stage_candidate
+    runs-on: ubuntu-latest
+    concurrency: prod-promotion
+    environment: production
+    env:
+      MODEL: workspace.payments_prod.credit_risk_model
+    steps:
+      - uses: actions/checkout@v4
+      - uses: databricks/setup-cli@main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install --quiet -r requirements.txt
+
+      - name: Record the reviewer's approval in Unity Catalog
+        # The GitHub click is the decision; this makes it durable and auditable next to the
+        # model itself, naming the actor who approved rather than "CI".
+        run: |
+          python scripts/record_approval.py \
+            --model "$MODEL" \
+            --version challenger \
+            --approver "${{ github.actor }}"
+
+      - name: Promote the approved version to champion
+        # Re-runs only the tail of the workflow. ApprovalGate re-reads the tag and now
+        # passes, so ModelDeployment moves the alias. Promotion stays a single enforced
+        # path: nothing here moves an alias directly.
+        run: databricks bundle run model_training_job -t prod --only ApprovalGate,ModelDeployment
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "### Promotion complete"
+            echo ""
+            echo "\`$MODEL\` version ${{ needs.train_and_stage_candidate.outputs.candidate_version }}"
+            echo "was approved by \`${{ github.actor }}\` and now serves as \`@champion\`."
+            echo ""
+            echo "To roll back:"
+            echo '  databricks bundle run rollback_job -t prod'
+          } >> "$GITHUB_STEP_SUMMARY"
