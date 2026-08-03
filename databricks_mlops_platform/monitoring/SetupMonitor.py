@@ -77,7 +77,7 @@ print(f"{names.inference_log} has {row_count} rows")
 
 # DBTITLE 1,Create or refresh the Lakehouse Monitor
 from databricks.sdk import WorkspaceClient
-from databricks.sdk.errors import ResourceDoesNotExist
+from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist
 from databricks.sdk.service.catalog import MonitorInferenceLog, MonitorInferenceLogProblemType
 
 w = WorkspaceClient()
@@ -97,33 +97,62 @@ monitor_config = dict(
     baseline_table_name=names.baseline_table,
 )
 
-# Create-or-update on the typed exception, not on message text: the SDK signals "no
-# monitor yet" with ResourceDoesNotExist, whose message mentions a monitor ID rather than
-# any "not found" wording, so string matching silently misses the first-run case.
-try:
-    existing = w.quality_monitors.get(table_name=names.inference_log)
-except ResourceDoesNotExist:
-    existing = None
+# Lakehouse Monitoring is not available on every tier — Databricks Free Edition, for
+# instance, does not serve the quality-monitors API at all and answers "No API found".
+# That is a capability gap rather than a pipeline fault, so it must not fail the job: the
+# governance chain this platform demonstrates (train, validate, gate, promote, score) does
+# not depend on the managed monitor, and DriftCheck computes PSI from the UC function
+# registered above rather than from the monitor's metric tables. Treated as unsupported
+# only for the endpoint-absent case; permission and configuration errors still raise.
+def _monitoring_unsupported(err: DatabricksError) -> bool:
+    return "no api found" in str(err).lower()
 
-if existing is None:
-    # assets_dir is accepted only on create — update() rejects it with a TypeError, which
-    # is why it is passed here rather than in the shared config.
-    w.quality_monitors.create(
-        table_name=names.inference_log,
-        assets_dir=f"/Workspace/Shared/monitoring/{names.schema}/{names.model}",
-        **monitor_config,
+
+monitor_ready = True
+
+try:
+    # Create-or-update on the typed exception, not on message text: the SDK signals "no
+    # monitor yet" with ResourceDoesNotExist, whose message mentions a monitor ID rather
+    # than any "not found" wording, so string matching silently misses the first-run case.
+    try:
+        existing = w.quality_monitors.get(table_name=names.inference_log)
+    except ResourceDoesNotExist:
+        existing = None
+
+    if existing is None:
+        # assets_dir is accepted only on create — update() rejects it with a TypeError,
+        # which is why it is passed here rather than in the shared config.
+        w.quality_monitors.create(
+            table_name=names.inference_log,
+            assets_dir=f"/Workspace/Shared/monitoring/{names.schema}/{names.model}",
+            **monitor_config,
+        )
+        print(f"Created monitor on {names.inference_log}")
+    else:
+        print(f"Monitor already exists (status: {existing.status}); updating configuration.")
+        w.quality_monitors.update(table_name=names.inference_log, **monitor_config)
+except DatabricksError as err:
+    if not _monitoring_unsupported(err):
+        raise
+    monitor_ready = False
+    print(
+        "Lakehouse Monitoring is unavailable in this workspace "
+        f"({w.config.host}); skipping monitor attachment.\n"
+        f"  API response: {err}\n"
+        "  Drift detection still runs: DriftCheck computes PSI from "
+        f"{names.fn_calculate_psi} against the baseline table, and the retraining "
+        "branch is unaffected. Only the managed profile/drift metric tables are absent."
     )
-    print(f"Created monitor on {names.inference_log}")
-else:
-    print(f"Monitor already exists (status: {existing.status}); updating configuration.")
-    w.quality_monitors.update(table_name=names.inference_log, **monitor_config)
 
 # COMMAND ----------
 
 # DBTITLE 1,Report the generated metric tables
-print("Monitor will populate:")
-print(f"  profile metrics: {names.profile_metrics}")
-print(f"  drift metrics  : {names.drift_metrics}")
-print("\nThese appear after the monitor's first refresh, which may take several minutes.")
+if monitor_ready:
+    print("Monitor will populate:")
+    print(f"  profile metrics: {names.profile_metrics}")
+    print(f"  drift metrics  : {names.drift_metrics}")
+    print("\nThese appear after the monitor's first refresh, which may take several minutes.")
+else:
+    print("No managed metric tables will be produced in this workspace.")
 
-dbutils.notebook.exit("MONITOR_READY")
+dbutils.notebook.exit("MONITOR_READY" if monitor_ready else "MONITOR_UNSUPPORTED")

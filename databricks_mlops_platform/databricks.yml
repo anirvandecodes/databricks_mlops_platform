@@ -4,7 +4,7 @@
 # Everything that differs between environments is a variable, never a code branch —
 # so the artifact promoted to prod is the same code that passed staging.
 #
-# Governance model: a single Unity Catalog catalog (`paypay_demo_catalog`) with one schema
+# Governance model: a single Unity Catalog catalog (`workspace`) with one schema
 # per environment (payments_dev / payments_staging / payments_prod). Environment separation
 # is enforced by schema-level grants: open in dev, service-principal-only in staging/prod.
 #
@@ -18,7 +18,7 @@ bundle:
 variables:
   catalog_name:
     description: Unity Catalog catalog holding ML assets for all environments.
-    default: paypay_demo_catalog
+    default: workspace
   schema_name:
     description: Per-environment schema holding this target's ML assets.
   model_name:
@@ -57,7 +57,10 @@ targets:
       schema_name: payments_dev
       approval_required: "false"
     workspace:
-      host: https://fevm-paypay-demo.cloud.databricks.com
+      # Literal, not a ${var.*} reference: the workspace host is resolved during auth
+      # configuration, before variable interpolation runs, so a variable here fails with
+      # "cannot resolve bundle auth configuration".
+      host: https://dbc-aef35066-afa2.cloud.databricks.com
 
   # Tightly controlled. CI deploys here on PR; no local deploys. Integration tests
   # run end-to-end here before a merge is permitted.
@@ -67,7 +70,7 @@ targets:
       schema_name: payments_staging
       approval_required: "false"
     workspace:
-      host: https://fevm-paypay-demo.cloud.databricks.com
+      host: https://dbc-aef35066-afa2.cloud.databricks.com
       # Deliberately NOT under /Workspace/Shared: that path is writable by every
       # workspace user, which would let anyone edit deployed staging code and defeat the
       # "CI/CD is the only way in" rule. In a real deployment this is the CI service
@@ -91,7 +94,7 @@ targets:
       schema_name: payments_prod
       approval_required: "true"
     workspace:
-      host: https://fevm-paypay-demo.cloud.databricks.com
+      host: https://dbc-aef35066-afa2.cloud.databricks.com
       # Restricted path — see the staging comment. Human access to prod is view-only and
       # changes arrive only through CD.
       root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}

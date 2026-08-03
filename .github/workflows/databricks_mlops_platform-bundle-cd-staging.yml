@@ -46,8 +46,10 @@ jobs:
       - name: Summarise
         if: always()
         run: |
-          echo "### Staging deployment" >> "$GITHUB_STEP_SUMMARY"
-          echo "Commit \`${{ github.sha }}\` deployed and exercised end to end." >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Promote to production by pushing to the \`release\` branch. Production" >> "$GITHUB_STEP_SUMMARY"
-          echo "requires explicit model approval before any version serves traffic." >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Staging deployment"
+            echo "Commit \`${{ github.sha }}\` deployed and exercised end to end."
+            echo ""
+            echo "Promote to production by pushing to the \`release\` branch. Production"
+            echo "requires explicit model approval before any version serves traffic."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -56,7 +56,7 @@ jobs:
     env:
       DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
       DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-      MLOPS_TEST_CATALOG: ${{ vars.MLOPS_TEST_CATALOG || 'paypay_demo_catalog' }}
+      MLOPS_TEST_CATALOG: ${{ vars.MLOPS_TEST_CATALOG || 'workspace' }}
       MLOPS_TEST_SCHEMA: ${{ vars.MLOPS_TEST_SCHEMA || 'payments_staging' }}
     steps:
       - uses: actions/checkout@v4
