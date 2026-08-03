@@ -1,116 +1,126 @@
-# databricks_mlops_platform
+# MLOps Reference Platform
 
-This directory contains an ML project based on the default
-[Databricks MLOps Stacks](https://github.com/databricks/mlops-stacks),
-defining a production-grade ML pipeline for automated retraining and batch inference of an ML model on tabular data.
-The "Getting Started" docs can be found at https://docs.databricks.com/dev-tools/bundles/mlops-stacks.html.
+An end-to-end, governed MLOps platform on Databricks, built around one claim:
 
-See the full pipeline structure below. The [MLOps Stacks README](https://github.com/databricks/mlops-stacks/blob/main/Pipeline.md)
-contains additional details on how ML pipelines are tested and deployed across each of the dev, staging, prod environments below.
+> **No model reaches production without passing an automated quality bar and a named
+> human's approval — and any model can be removed from production in seconds.**
 
-![MLOps Stacks diagram](docs/images/mlops-stack-summary.png)
+The reference workload is a credit-risk default-probability model (LightGBM on the public
+UCI Credit-G dataset), chosen because credit risk has the strictest governance
+requirements. The platform itself is workload-agnostic.
 
+For a guided walkthrough with real outputs, see **[docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md)**.
 
-## Code structure
-This project contains the following components:
+---
 
-| Component                  | Description                                                                                                                                                                                                                                                                                                                                             |
-|----------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| ML Code                    | Example ML project code, with unit tested Python modules and notebooks                                                                                                                                                                                                                                                                             |
-| ML Resources as Code | ML pipeline resources (training and batch inference jobs with schedules, etc) configured and deployed through [databricks CLI bundles](https://docs.databricks.com/dev-tools/cli/bundle-cli.html)                                                                                              |
-| CI/CD                      | [GitHub Actions](https://github.com/actions) workflows  to test and deploy ML code and resources
-                                |
+## What makes this different from a training pipeline
 
-contained in the following files:
+| Capability | How it works |
+|---|---|
+| **Two-stage gating** | Stage 1 (code): PR review, unit tests, bundle validation. Stage 2 (model): a reviewer must tag the specific trained version before it can serve traffic. |
+| **Alias-based promotion** | Inference resolves `models:/<model>@champion` at run time. Promotion moves an alias; nothing is redeployed. |
+| **Seconds-long rollback** | The same alias operation in reverse. Deliberately *not* gated on approval — a gate must not prolong an incident. |
+| **Audit evidence** | Every promotion and rollback writes an immutable JSON package to a UC Volume plus a queryable Delta row: metrics, training-data version, approver, timestamp. |
+| **Governed drift metrics** | PSI registered as a Unity Catalog function, so every team uses one audited formula. Integration tests assert the SQL matches the Python implementation. |
+| **Gated auto-retraining** | Drift triggers model *building*, never model *promotion*. Retrained models enter as challengers and face the same gate. |
+| **Decoupled decision layer** | The model outputs a probability; business rules (eligibility, risk bands, limit caps) are separate UC SQL functions. Policy changes ship without retraining. |
+
+## Pipeline
 
 ```
-databricks_mlops_platform        <- Root directory. Both monorepo and polyrepo are supported.
-│
-├── databricks_mlops_platform       <- Contains python code, notebooks and ML resources related to one ML project. 
-│   │
-│   ├── requirements.txt        <- Specifies Python dependencies for ML code (for example: model training, batch inference).
-│   │
-│   ├── databricks.yml          <- databricks.yml is the root bundle file for the ML project that can be loaded by databricks CLI bundles. It defines the bundle name, workspace URL and resource config component to be included.
-│   │
-│   ├── training                <- Training folder contains Notebook that trains and registers the model with feature store support.
-│   │
-│   ├── feature_engineering     <- Feature computation code (Python modules) that implements the feature transforms.
-│   │                              The output of these transforms get persisted as Feature Store tables. Most development
-│   │                              work happens here.
-│   │
-│   ├── validation              <- Optional model validation step before deploying a model.
-│   │
-│   ├── monitoring              <- Model monitoring, feature monitoring, etc.
-│   │
-│   ├── deployment              <- Deployment and Batch inference workflows
-│   │   │
-│   │   ├── batch_inference     <- Batch inference code that will run as part of scheduled workflow.
-│   │   │
-│   │   ├── model_deployment    <- As part of CD workflow, deploy the registered model by assigning it the appropriate alias.
-│   │
-│   │
-│   ├── tests                   <- Unit tests for the ML project, including the modules under `features`.
-│   │
-│   ├── resources               <- ML resource (ML jobs, MLflow models) config definitions expressed as code, across dev/staging/prod/test.
-│       │
-│       ├── model-workflow-resource.yml                <- ML resource config definition for model training, validation, deployment workflow
-│       │
-│       ├── batch-inference-workflow-resource.yml      <- ML resource config definition for batch inference workflow
-│       │
-│       ├── feature-engineering-workflow-resource.yml  <- ML resource config definition for feature engineering workflow
-│       │
-│       ├── ml-artifacts-resource.yml                  <- ML resource config definition for model and experiment
-│       │
-│       ├── monitoring-resource.yml           <- ML resource config definition for quality monitoring workflow
-│
-├── .github                     <- Configuration folder for CI/CD using GitHub Actions.  The CI/CD workflows deploy ML resources defined in the `./resources/*` folder with databricks CLI bundles.
-│
-├── docs                        <- Contains documentation for the repo.
-│
-├── cicd.tar.gz                 <- Contains CI/CD bundle that should be deployed by deploy-cicd.yml to set up CI/CD for projects.
+feature engineering  →  train  →  validate  →  APPROVAL GATE  →  promote  →  score  →  decide
+      (07:00)          (09:00)                                                (11:00)
+                                        ↑                                        │
+                                   blocks here                                   ↓
+                                   in production                          inference log
+                                        │                                        │
+                                   retraining  ←──  drift breach  ←────  monitoring (18:00)
 ```
 
-## Using this repo
+## Layout
 
-The table below links to detailed docs explaining how to use this repo for different use cases.
+```
+databricks_mlops_platform/
+├── databricks.yml              # 3 targets (dev/staging/prod); all env differences are variables
+├── platform_utils/             # shared platform layer — the reusable part
+│   ├── naming.py               #   asset addressing; one place to change the UC layout
+│   ├── promotion.py            #   approval gate, promotion, rollback
+│   ├── audit.py                #   evidence packages
+│   ├── metrics.py              #   PSI (Python + UC SQL function)
+│   └── task_values.py          #   safe task-value access across single-task re-runs
+├── feature_engineering/        # transforms — pure functions, unit tested
+├── training/                   # LightGBM training; registers a CHALLENGER only
+├── validation/                 # quality thresholds; risk-owned parameters
+├── deployment/
+│   ├── approval/               #   Stage-2 model gate
+│   ├── model_deployment/       #   promotion + rollback
+│   └── batch_inference/        #   alias-resolved scoring + inference logging
+├── monitoring/                 # monitor setup, PSI drift check, gated retraining
+├── decision_layer/             # business policy as UC SQL functions
+├── resources/                  # 5 workflows as declarative YAML
+├── scripts/bootstrap_uc.py     # one-time UC setup (idempotent)
+└── tests/{unit,integration}/   # 83 offline + 19 workspace tests
+```
 
+## Quick start
 
-This project comes with example ML code to train, validate and deploy a regression model to predict NYC taxi fares.
-If you're a data scientist just getting started with this repo for a brand new ML project, we recommend 
-adapting the provided example code to your ML problem. Then making and 
-testing ML code changes on Databricks or your local machine. Follow the instructions from
-the [project README](./databricks_mlops_platform/README.md).
- 
+```bash
+# 1. One-time UC setup (needs CREATE SCHEMA on the catalog — may require an admin)
+python databricks_mlops_platform/scripts/bootstrap_uc.py --profile <profile>
 
-When you're ready to deploy production training/inference
-pipelines, ask your ops team to follow the [MLOps setup guide](docs/mlops-setup.md) to configure CI/CD and deploy 
-production ML pipelines.
+# 2. Deploy and run
+cd databricks_mlops_platform
+databricks bundle deploy -t dev
+databricks bundle run write_feature_table_job -t dev
+databricks bundle run model_training_job -t dev
+databricks bundle run batch_inference_job -t dev
+databricks bundle run monitoring_job -t dev
 
-After that, follow the [ML pull request guide](docs/ml-pull-request.md)
- and [ML resource config guide](databricks_mlops_platform/resources/README.md)  to propose, test, and deploy changes to production ML code (e.g. update model parameters)
-or pipeline resources (e.g. use a larger instance type for model training) via pull request.
+# Roll back if needed
+databricks bundle run rollback_job -t dev
+```
 
-| Role                          | Goal                                                                         | Docs                                                                                                                                                                |
-|-------------------------------|------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Data Scientist                | Get started writing ML code for a brand new project                          | [project README](./databricks_mlops_platform/README.md) |
-| MLOps / DevOps                | Set up CI/CD for the current ML project   | [MLOps setup guide](docs/mlops-setup.md)                                                                                                                            |
-| Data Scientist                | Update production ML code (e.g. model training logic) for an existing project | [ML pull request guide](docs/ml-pull-request.md)                                                                                                                    |
-| Data Scientist                | Modify production model ML resources, e.g. model training or inference jobs  | [ML resource config guide](databricks_mlops_platform/resources/README.md)  |
+## Testing
 
-## Setting up CI/CD
-This stack comes with a workflow to set up CI/CD for projects that can be found in
+Three tiers, matching where each class of defect actually surfaces:
 
-`.github/workflows/deploy-cicd.yml`.
+```bash
+pytest tests/unit -q          # offline; transforms, PSI, gate logic, policy rules
+pytest tests/integration -q   # real UC; needs MLOPS_TEST_PROFILE
+```
 
+The third tier is the staging integration run in CI, which executes the whole pipeline on
+every pull request. That tier caught defects the others structurally cannot — an MLflow API
+rename, a baseline/inference schema mismatch, and an SDK argument valid on create but
+rejected on update.
 
-To set up CI/CD for projects that were created through MLOps Stacks with the `Project_Only` parameter, 
-run the above mentioned workflow, specifying the `project_name` as a parameter. For example, for the monorepo case:
+**Local Spark note:** where `databricks-connect` is installed, its `pyspark` refuses local
+sessions. The `spark` fixture prefers a Connect session against serverless and falls back to
+local Spark, so both dev machines and CI work:
 
-1. Setup your repository by initializing MLOps Stacks via Databricks CLI with the `CICD_and_Project` or `CICD_Only` parameter.
-2. Follow the [MLOps Setup Guide](./docs/mlops-setup.md) to setup authentication and get the repo ready for CI/CD.
-3. Create a new project by initializing MLOps Stacks again but this time with the `Project_Only` parameter.
-4. Run the `deploy-cicd.yml` workflow with the `project_name` parameter set to the name of the project you want to set up CI/CD for.
+```bash
+MLOPS_TEST_PROFILE=<profile> pytest tests/unit -q
+```
 
+## Governance model
 
-NOTE: This project has already been initialized with an instantiation of the above workflow, so there's no
-need to run it again for project `databricks_mlops_platform`.
+Environment separation uses one catalog with a schema per environment
+(`mlops_dev` / `mlops_staging` / `mlops_prod`), enforced by schema-level grants.
+
+Catalog-per-environment is the stronger posture and is preferred where the metastore allows
+`CREATE CATALOG`. Because both layouts are addressed through the same
+`catalog_name` / `schema_name` variables, migrating is a variable change per target — no
+pipeline code moves.
+
+| | dev | staging | prod |
+|---|---|---|---|
+| Deploy path | local IDE | CI only | CD only |
+| Approval required | no | no | **yes** |
+| Human write access | yes | no | no |
+
+## Not implemented
+
+Stated plainly so scope is clear: distributed hyperparameter tuning, real-time serving and
+the online feature store, and FinOps tagging/budgets. Approval is recorded as a Unity Catalog
+tag rather than through a developer portal — the control is enforced; the portal integration
+is not built.

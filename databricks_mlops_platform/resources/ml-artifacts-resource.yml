@@ -1,28 +1,32 @@
-# Allow users to read the experiment
+# ML artifacts: the registered model and the MLflow experiment.
+#
+# Declared as bundle resources rather than created imperatively, so these governed objects
+# and their grants are reviewable in a pull request and identical across environments.
 common_permissions: &permissions
   permissions:
     - level: CAN_READ
       group_name: users
 
-# Allow users to execute models in Unity Catalog
-grants: &grants
-  grants:
-    - privileges:
-        - EXECUTE
-      principal: account users
-
-# Defines model and experiments
 resources:
   registered_models:
     model:
       name: ${var.model_name}
       catalog_name: ${var.catalog_name}
-      schema_name: databricks_mlops_platform
-      comment: Registered model in Unity Catalog for the "databricks_mlops_platform" ML Project for ${bundle.target} deployment target.
-      <<: *grants
+      schema_name: ${var.schema_name}
+      comment: >-
+        Credit-risk default-probability model for the ${bundle.target} environment.
+        Promotion is alias-based: @challenger is a candidate, @champion serves traffic.
+      grants:
+        # EXECUTE only. Nothing outside the deployment workflow should be able to move an
+        # alias — that restriction is what makes the approval gate binding rather than
+        # advisory.
+        - privileges:
+            - EXECUTE
+          principal: account users
 
   experiments:
     experiment:
       name: ${var.experiment_name}
+      # Every run records the training-data Delta version, so any registered model can be
+      # traced back to the exact input that produced it.
       <<: *permissions
-      description: MLflow Experiment used to track runs for databricks_mlops_platform project.

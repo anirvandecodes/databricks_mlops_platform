@@ -1,131 +1,131 @@
 # Databricks notebook source
 ##################################################################################
-# Generate and Write Features Notebook
+# Feature Engineering Notebook
 #
-# This notebook can be used to generate and write features to a Databricks Feature Store table.
-# It is configured and can be executed as the tasks in the write_feature_table_job workflow defined under
-# ``databricks_mlops_platform/resources/feature-engineering-workflow-resource.yml``
+# Computes credit-risk features from the raw applicant data and writes them to a Unity
+# Catalog feature table, plus a scoring-input table used by batch inference.
 #
-# Parameters:
+# The transform logic itself lives in feature_engineering/features/credit_features.py so
+# it can be unit-tested without a cluster. This notebook is only orchestration: read,
+# apply, write.
 #
-# * input_table_path (required)   - Path to input data.
-# * output_table_name (required)  - Fully qualified schema + Delta table name for the feature table where the features
-# *                                 will be written to. Note that this will create the Feature table if it does not
-# *                                 exist.
-# * primary_keys (required)       - A comma separated string of primary key columns of the output feature table.
-# *
-# * timestamp_column (optional)   - Timestamp column of the input data. Used to limit processing based on
-# *                                 date ranges. This column is used as the timestamp_key column in the feature table.
-# * input_start_date (optional)   - Used to limit feature computations based on timestamp_column values.
-# * input_end_date (optional)     - Used to limit feature computations based on timestamp_column values.
-# *
-# * features_transform_module (required) - Python module containing the feature transform logic.
+# Tasks of write_feature_table_job
+# (resources/feature-engineering-workflow-resource.yml).
 ##################################################################################
 
+# COMMAND ----------
 
-# List of input args needed to run this notebook as a job.
-# Provide them via DB widgets or notebook arguments.
-#
-# A Hive-registered Delta table containing the input data.
-dbutils.widgets.text(
-    "input_table_path",
-    "/databricks-datasets/nyctaxi-with-zipcodes/subsampled",
-    label="Input Table Name",
-)
-# Input start date.
-dbutils.widgets.text("input_start_date", "", label="Input Start Date")
-# Input end date.
-dbutils.widgets.text("input_end_date", "", label="Input End Date")
-# Timestamp column. Will be used to filter input start/end dates.
-# This column is also used as a timestamp key of the feature table.
-dbutils.widgets.text(
-    "timestamp_column", "tpep_pickup_datetime", label="Timestamp column"
-)
-
-# Feature table to store the computed features.
-dbutils.widgets.text(
-    "output_table_name",
-    "dev.databricks_mlops_platform.trip_pickup_features",
-    label="Output Feature Table Name",
-)
-
-# Feature transform module name.
-dbutils.widgets.text(
-    "features_transform_module", "pickup_features", label="Features transform file."
-)
-# Primary Keys columns for the feature table;
-dbutils.widgets.text(
-    "primary_keys",
-    "zip",
-    label="Primary keys columns for the feature table, comma separated.",
-)
+# MAGIC %pip install -r ../requirements.txt
 
 # COMMAND ----------
 
-# DBTITLE 1,Define input and output variables
-input_table_path = dbutils.widgets.get("input_table_path")
-output_table_name = dbutils.widgets.get("output_table_name")
-input_start_date = dbutils.widgets.get("input_start_date")
-input_end_date = dbutils.widgets.get("input_end_date")
-ts_column = dbutils.widgets.get("timestamp_column")
-features_module = dbutils.widgets.get("features_transform_module")
-pk_columns = dbutils.widgets.get("primary_keys")
-
-assert input_table_path != "", "input_table_path notebook parameter must be specified"
-assert output_table_name != "", "output_table_name notebook parameter must be specified"
-
-# Extract database name. Needs to be updated for Unity Catalog to the Schema name.
-output_database = output_table_name.split(".")[1]
+dbutils.library.restartPython()
 
 # COMMAND ----------
 
-# DBTITLE 1,Create database.
-spark.sql("CREATE DATABASE IF NOT EXISTS " + output_database)
+# DBTITLE 1,Notebook arguments
+import sys
 
-# COMMAND ----------
+sys.path.append("..")
 
-# DBTITLE 1, Read input data.
-raw_data = spark.read.format("delta").load(input_table_path)
+dbutils.widgets.dropdown("env", "dev", ["dev", "staging", "prod"], "Environment")
+dbutils.widgets.text("catalog_name", "workspace", "UC catalog")
+dbutils.widgets.text("schema_name", "mlops_dev", "UC schema")
+dbutils.widgets.text("scoring_sample_fraction", "0.2", "Scoring sample fraction")
 
-# COMMAND ----------
+env = dbutils.widgets.get("env")
+scoring_fraction = float(dbutils.widgets.get("scoring_sample_fraction"))
 
-# DBTITLE 1,Compute features.
-# Compute the features. This is done by dynamically loading the features module.
-from importlib import import_module
+from platform_utils.naming import AssetNames
 
-mod = import_module(f"features.{features_module}")
-compute_features_fn = getattr(mod, "compute_features_fn")
-
-features_df = compute_features_fn(
-    input_df=raw_data,
-    timestamp_column=ts_column,
-    start_date=input_start_date,
-    end_date=input_end_date,
+names = AssetNames(
+    catalog=dbutils.widgets.get("catalog_name"),
+    schema=dbutils.widgets.get("schema_name"),
 )
 
-# COMMAND ----------
-
-# DBTITLE 1, Write computed features.
-from databricks.feature_engineering import FeatureEngineeringClient
-
-fe = FeatureEngineeringClient()
-
-# Create the feature table if it does not exist first.
-# Note that this is a no-op if a table with the same name and schema already exists.
-fe.create_table(
-    name=output_table_name,
-    primary_keys=[x.strip() for x in pk_columns.split(",")] + [ts_column],
-    timestamp_keys=[ts_column],
-    df=features_df,
-)
-
-# Write the computed features dataframe.
-fe.write_table(
-    name=output_table_name,
-    df=features_df,
-    mode="merge",
-)
+print(f"env            = {env}")
+print(f"feature table  = {names.credit_features}")
+print(f"scoring input  = {names.scoring_input}")
 
 # COMMAND ----------
 
-dbutils.notebook.exit(0)
+# DBTITLE 1,Load the source data
+from sklearn.datasets import fetch_openml
+from sklearn.preprocessing import LabelEncoder
+
+# In a real deployment this reads from the gold layer of the medallion ETL. The public
+# Credit-G dataset stands in for that source so the pipeline is runnable end-to-end
+# without customer data.
+data = fetch_openml("credit-g", version=1, as_frame=True, parser="auto")
+df = data.frame.copy()
+df["class"] = (df["class"] == "bad").astype(int)
+
+for column in df.select_dtypes(include="category").columns:
+    df[column] = LabelEncoder().fit_transform(df[column].astype(str))
+
+print(f"Loaded {len(df)} applicant records")
+
+# COMMAND ----------
+
+# DBTITLE 1,Compute features
+from pyspark.sql import functions as F
+
+from feature_engineering.features.credit_features import compute_features_fn
+
+raw_sdf = spark.createDataFrame(df).withColumn(
+    # Credit-G has no natural key; a stable synthetic id lets predictions be joined back
+    # to applicants and to ground-truth outcomes later.
+    "customer_id",
+    F.concat(F.lit("C"), F.lpad(F.monotonically_increasing_id().cast("string"), 6, "0")),
+)
+
+features_sdf = compute_features_fn(raw_sdf).withColumn("computed_at", F.current_timestamp())
+
+# COMMAND ----------
+
+# DBTITLE 1,Write the feature table
+(
+    features_sdf.write.mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable(names.credit_features)
+)
+print(f"Wrote {features_sdf.count()} rows to {names.credit_features}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Write the scoring input
+# A held-out slice with the label dropped: batch inference must never see the outcome it
+# is predicting, or the demo would quietly be scoring on leaked labels.
+scoring_sdf = (
+    features_sdf.sample(fraction=scoring_fraction, seed=42)
+    .drop("class")
+    .withColumn("scoring_batch_date", F.current_date())
+)
+
+(
+    scoring_sdf.write.mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable(names.scoring_input)
+)
+print(f"Wrote {scoring_sdf.count()} rows to {names.scoring_input}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Write ground-truth outcomes
+# Held separately from the scoring input, mirroring reality: outcomes arrive weeks or
+# months after the decision. Monitoring joins them in once available to compute realised
+# default rates, which is what the challenger-promotion criteria depend on.
+ground_truth_sdf = features_sdf.select(
+    "customer_id",
+    F.col("class").alias("is_default"),
+    F.current_timestamp().alias("outcome_recorded_at"),
+)
+
+(
+    ground_truth_sdf.write.mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable(names.ground_truth)
+)
+print(f"Wrote {ground_truth_sdf.count()} rows to {names.ground_truth}")
+
+dbutils.notebook.exit("FEATURES_WRITTEN")

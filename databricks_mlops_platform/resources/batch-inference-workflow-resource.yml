@@ -1,3 +1,8 @@
+# Batch inference workflow.
+#
+# Scores with whatever version is currently @champion and appends to the inference log.
+# The job never names a model version, which is why promotion and rollback take effect
+# here with no redeployment.
 common_permissions: &permissions
   permissions:
     - level: CAN_VIEW
@@ -6,34 +11,45 @@ common_permissions: &permissions
 resources:
   jobs:
     batch_inference_job:
-      name: ${bundle.target}-databricks_mlops_platform-batch-inference-job
+      name: ${bundle.target}-mlops-platform-batch-inference-job
       tasks:
-        - task_key: batch_inference_job
+        - task_key: ScoreBatch
           environment_key: default
           notebook_task:
             notebook_path: ../deployment/batch_inference/BatchInference.py
             base_parameters:
               env: ${bundle.target}
-              input_table_name: ${bundle.target}.databricks_mlops_platform.feature_store_inference_input  # TODO: create input table for inference
-              output_table_name: ${var.catalog_name}.databricks_mlops_platform.predictions
-              model_name: ${var.catalog_name}.databricks_mlops_platform.${var.model_name}
-              # git source information of current ML resource deployment. It will be persisted as part of the workflow run
-              git_source_info: url:${bundle.git.origin_url}; branch:${bundle.git.branch}; commit:${bundle.git.commit}
+              catalog_name: ${var.catalog_name}
+              schema_name: ${var.schema_name}
+              model_name: ${var.model_name}
+              git_source_info: "url:${bundle.git.origin_url}; branch:${bundle.git.branch}; commit:${bundle.git.commit}"
+
+        # Business rules run as a separate task from scoring. Policy changes (risk bands,
+        # credit limits, eligibility) are then deployable without retraining or
+        # re-scoring — the decoupling that lets risk teams move at their own cadence.
+        - task_key: ApplyDecisionRules
+          environment_key: default
+          depends_on:
+            - task_key: ScoreBatch
+          notebook_task:
+            notebook_path: ../decision_layer/ApplyDecisions.py
+            base_parameters:
+              env: ${bundle.target}
+              catalog_name: ${var.catalog_name}
+              schema_name: ${var.schema_name}
+              model_name: ${var.model_name}
+              git_source_info: "url:${bundle.git.origin_url}; branch:${bundle.git.branch}; commit:${bundle.git.commit}"
 
       environments:
         - environment_key: default
           spec:
-            environment_version: "5"
+            environment_version: "3"
             dependencies:
               - -r ../requirements.txt
+
       schedule:
-        quartz_cron_expression: "0 0 11 * * ?" # daily at 11am
+        quartz_cron_expression: "0 0 11 * * ?" # daily 11:00 UTC, after training completes
         timezone_id: UTC
+        pause_status: PAUSED
+
       <<: *permissions
-      # If you want to turn on notifications for this job, please uncomment the below code,
-      # and provide a list of emails to the on_failure argument.
-      #
-      #  email_notifications:
-      #    on_failure:
-      #      - first@company.com
-      #      - second@company.com

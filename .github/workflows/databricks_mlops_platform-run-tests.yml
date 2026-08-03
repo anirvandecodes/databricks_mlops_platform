@@ -1,62 +1,78 @@
-name: Feature and Training Unit and Integration Tests for databricks_mlops_platform
+# Stage-1 code gate, part 1: tests.
+#
+# This and the bundle-validation workflow are what a branch protection rule requires
+# before a merge into main is allowed. Together they are the "code gate" — they establish
+# that the code is sound. They say nothing about whether a particular trained model should
+# serve traffic; that is the separate model gate enforced at deploy time.
+name: Tests for databricks_mlops_platform
+
 on:
   workflow_dispatch:
   pull_request:
     paths:
-      - 'databricks_mlops_platform/**'
-      - '.github/workflows/databricks_mlops_platform-run-tests.yml'
+      - "databricks_mlops_platform/**"
+      - ".github/workflows/databricks_mlops_platform-run-tests.yml"
 
 defaults:
   run:
-    working-directory: ./databricks_mlops_platform/
+    working-directory: ./databricks_mlops_platform
 
-env:
-  DATABRICKS_TOKEN: ${{ secrets.STAGING_WORKSPACE_TOKEN }}
-
-concurrency: databricks_mlops_platform-feature-training-integration-test-staging
+concurrency:
+  # Cancel superseded runs on the same PR: only the latest commit's verdict matters.
+  group: tests-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  # Level 1 — fast, offline. Feature transforms, PSI, promotion logic, policy rules.
+  # No workspace credentials required, so this runs on every PR including from forks.
   unit_tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
-      # Feature store tests bring up a local Spark session, so Java is required.
-      - uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '11'
+          python-version: "3.11"
+          cache: pip
+
       - name: Install dependencies
         run: |
-            python -m pip install --upgrade pip
-            pip install -r requirements.txt
-            pip install -r ../test-requirements.txt
-      - name: Run tests with pytest
-        run: |
-            pytest
+          python -m pip install --upgrade pip
+          # Vanilla pyspark (not databricks-connect) so the local Spark fixture works here.
+          pip install pyspark==3.5.3
+          pip install -r ../test-requirements.txt
+          pip install mlflow scikit-learn lightgbm pandas numpy
 
-  integration_test:
+      - name: Run unit tests
+        run: pytest tests/unit -v --tb=short
+
+  # Level 2 — against a real workspace. Verifies that what is deployed to Unity Catalog
+  # behaves as the unit tests assume: the approval gate actually blocks, aliases actually
+  # roll back, and the SQL functions match their Python mirrors.
+  integration_tests:
     needs: unit_tests
     runs-on: ubuntu-latest
+    # Skipped on forks, which cannot access repository secrets.
+    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'workflow_dispatch'
+    env:
+      DATABRICKS_HOST: ${{ secrets.STAGING_WORKSPACE_HOST }}
+      DATABRICKS_TOKEN: ${{ secrets.STAGING_WORKSPACE_TOKEN }}
+      MLOPS_TEST_CATALOG: ${{ vars.MLOPS_TEST_CATALOG || 'workspace' }}
+      MLOPS_TEST_SCHEMA: ${{ vars.MLOPS_TEST_SCHEMA || 'mlops_staging' }}
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-      - uses: databricks/setup-cli@v0.236.0
-      - name: Validate Bundle For Test Deployment Target in Staging Workspace
-        id: validate
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
         run: |
-          databricks bundle validate -t test
-      - name: Deploy Bundle to Test Deployment Target in Staging Workspace
-        id: deploy
-        run: |
-          databricks bundle deploy -t test
-      - name: Run Feature Engineering Workflow for Test Deployment Target in Staging Workspace
-        id: feature_engineering
-        run: |
-          databricks bundle run write_feature_table_job -t test
-      - name: Run Training Workflow for Test Deployment Target in Staging Workspace
-        id: training
-        run: |
-          databricks bundle run model_training_job -t test
+          python -m pip install --upgrade pip
+          # databricks-connect here (not pyspark): these tests must run against real
+          # compute, and Connect is also what developers use locally.
+          pip install databricks-connect==16.1.* databricks-sdk
+          pip install -r ../test-requirements.txt
+          pip install mlflow scikit-learn pandas numpy
+
+      - name: Run integration tests
+        run: pytest tests/integration -v --tb=short

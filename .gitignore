@@ -13,3 +13,8 @@ venv
 *.egg-info/
 build
 dist
+# Working documents and customer material — this repo is a generic reference platform and
+# must not carry customer-identifying or internal design documents.
+*.pdf
+*.docx
+*.pptx

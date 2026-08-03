@@ -1,80 +1,74 @@
-# Please complete all the TODOs in this file.
-# The regression monitor defined here works OOB with this example regression notebook: https://docs.databricks.com/_extras/notebooks/source/monitoring/regression-monitor.html
-# NOTE: Monitoring only works on Unity Catalog tables.
-
+# Monitoring workflow: drift detection and gated retraining.
+#
+# The governance principle encoded here: drift triggers model *building*, never model
+# *promotion*. The retraining branch runs model_training_job, which registers a
+# challenger and stops at the approval gate. Automated drift response is therefore never
+# an unreviewed path into production.
 common_permissions: &permissions
   permissions:
     - level: CAN_VIEW
       group_name: users
 
 resources:
-  quality_monitors:
-    databricks_mlops_platform_quality_monitor:
-      table_name: dev.databricks_mlops_platform.predictions
-      # TODO: Update the output schema name as per your requirements
-      output_schema_name: ${bundle.target}.databricks_mlops_platform
-      # TODO: Update the below parameters as per your requirements
-      assets_dir: /Users/${workspace.current_user.userName}/databricks_lakehouse_monitoring
-      inference_log:
-        granularities: [1 day]
-        model_id_col: model_id
-        prediction_col: prediction
-        label_col: price
-        problem_type: PROBLEM_TYPE_REGRESSION
-        timestamp_col: timestamp
-      schedule:
-        quartz_cron_expression: 0 0 8 * * ? # Run Every day at 8am
-        timezone_id: UTC
   jobs:
-    retraining_job:
-      name: ${bundle.target}-databricks_mlops_platform-monitoring-retraining-job
+    monitoring_job:
+      name: ${bundle.target}-mlops-platform-monitoring-job
       tasks:
-        - task_key: monitored_metric_violation_check
+        # 1. Register the PSI UC function and attach the Lakehouse Monitor. Idempotent, so
+        #    it is safe to leave in the scheduled path rather than needing a manual step.
+        - task_key: SetupMonitor
           environment_key: default
           notebook_task:
-            notebook_path: ../monitoring/MonitoredMetricViolationCheck.py
+            notebook_path: ../monitoring/SetupMonitor.py
             base_parameters:
               env: ${bundle.target}
-              table_name_under_monitor: dev.databricks_mlops_platform.predictions
-              # TODO: Update the metric to be monitored and violation threshold
-              metric_to_monitor: root_mean_squared_error
-              metric_violation_threshold: 100
-              num_evaluation_windows: 5
-              num_violation_windows: 2
-              # git source information of current ML resource deployment. It will be persisted as part of the workflow run
-              git_source_info: url:${bundle.git.origin_url}; branch:${bundle.git.branch}; commit:${bundle.git.commit}
+              catalog_name: ${var.catalog_name}
+              schema_name: ${var.schema_name}
+              model_name: ${var.model_name}
 
-        - task_key: is_metric_violated
+        # 2. Compute PSI per monitored feature against the training baseline.
+        - task_key: DriftCheck
+          environment_key: default
           depends_on:
-            - task_key: monitored_metric_violation_check
+            - task_key: SetupMonitor
+          notebook_task:
+            notebook_path: ../monitoring/DriftCheck.py
+            base_parameters:
+              env: ${bundle.target}
+              catalog_name: ${var.catalog_name}
+              schema_name: ${var.schema_name}
+              model_name: ${var.model_name}
+              psi_warn_threshold: ${var.psi_warn_threshold}
+              psi_retrain_threshold: ${var.psi_retrain_threshold}
+
+        # 3. Branch on the drift verdict.
+        - task_key: IsRetrainRequired
+          depends_on:
+            - task_key: DriftCheck
           condition_task:
             op: EQUAL_TO
-            left: "{{tasks.monitored_metric_violation_check.values.is_metric_violated}}"
+            left: "{{tasks.DriftCheck.values.retrain_required}}"
             right: "true"
-          git_source_info: url:${bundle.git.origin_url}; branch:${bundle.git.branch}; commit:${bundle.git.commit}
 
-        - task_key: trigger_retraining
+        # 4. Only on breach. Runs the full training workflow, so the retrained model still
+        #    faces validation and the approval gate.
+        - task_key: TriggerRetraining
           depends_on:
-            - task_key: is_metric_violated
+            - task_key: IsRetrainRequired
               outcome: "true"
           run_job_task:
             job_id: ${resources.jobs.model_training_job.id}
-            git_source_info: url:${bundle.git.origin_url}; branch:${bundle.git.branch}; commit:${bundle.git.commit}
 
       environments:
         - environment_key: default
           spec:
-            environment_version: "5"
+            environment_version: "3"
             dependencies:
               - -r ../requirements.txt
+
       schedule:
-        quartz_cron_expression: "0 0 18 * * ?" # daily at 6pm
+        quartz_cron_expression: "0 0 18 * * ?" # daily 18:00 UTC, after the day's scoring
         timezone_id: UTC
+        pause_status: PAUSED
+
       <<: *permissions
-      # If you want to turn on notifications for this job, please uncomment the below code,
-      # and provide a list of emails to the on_failure argument.
-      #
-      #  email_notifications:
-      #    on_failure:
-      #      - first@company.com
-      #      - second@company.com

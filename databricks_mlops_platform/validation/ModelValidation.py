@@ -1,313 +1,198 @@
 # Databricks notebook source
 ##################################################################################
 # Model Validation Notebook
-##
-# This notebook uses mlflow model validation API to run mode validation after training and registering a model
-# in model registry, before deploying it to the "champion" alias.
 #
-# It runs as part of CD and by an automated model training job -> validation -> deployment job defined under ``databricks_mlops_platform/resources/model-workflow-resource.yml``
+# Evaluates the freshly trained challenger against the thresholds in validation.py.
+# A candidate that fails never reaches the approval gate — this is the automated quality
+# bar that runs before any human is asked to review a model.
 #
+# "ModelValidation" task of model_training_job (resources/model-workflow-resource.yml).
 #
 # Parameters:
-#
-# * env                                     - Name of the environment the notebook is run in (staging, or prod). Defaults to "prod".
-# * `run_mode`                              - The `run_mode` defines whether model validation is enabled or not. It can be one of the three values:
-#                                             * `disabled` : Do not run the model validation notebook.
-#                                             * `dry_run`  : Run the model validation notebook. Ignore failed model validation rules and proceed to move
-#                                                            model to the "champion" alias.
-#                                             * `enabled`  : Run the model validation notebook. Move model to the "champion" alias only if all model validation
-#                                                            rules are passing.
-# * enable_baseline_comparison              - Whether to load the current registered "champion" model as baseline.
-#                                             Baseline model is a requirement for relative change and absolute change validation thresholds.
-# * validation_input                        - Validation input. Please refer to data parameter in mlflow.evaluate documentation https://mlflow.org/docs/latest/python_api/mlflow.html#mlflow.evaluate
-# * model_type                              - A string describing the model type. The model type can be either "regressor" and "classifier".
-#                                             Please refer to model_type parameter in mlflow.evaluate documentation https://mlflow.org/docs/latest/python_api/mlflow.html#mlflow.evaluate
-# * targets                                 - The string name of a column from data that contains evaluation labels.
-#                                             Please refer to targets parameter in mlflow.evaluate documentation https://mlflow.org/docs/latest/python_api/mlflow.html#mlflow.evaluate
-#
-# Custom metrics, validation thresholds, and evaluator config are defined in validation/validation.py.
-#
-# For details on mlflow evaluate API, see doc https://mlflow.org/docs/latest/python_api/mlflow.html#mlflow.evaluate
-# For details and examples about performing model validation, see the Model Validation documentation https://mlflow.org/docs/latest/models.html#model-validation
-#
+#   run_mode - disabled | dry_run | enabled
+#                disabled : skip validation entirely
+#                dry_run  : evaluate and report, but never block promotion
+#                enabled  : block promotion when a threshold is not met
 ##################################################################################
 
 # COMMAND ----------
 
-dbutils.widgets.text(
-    "experiment_name",
-    "/dev-databricks_mlops_platform-experiment",
-    "Experiment Name",
-)
-dbutils.widgets.dropdown("run_mode", "disabled", ["disabled", "dry_run", "enabled"], "Run Mode")
-dbutils.widgets.dropdown("enable_baseline_comparison", "false", ["true", "false"], "Enable Baseline Comparison")
-dbutils.widgets.text("validation_input", "SELECT * FROM delta.`dbfs:/databricks-datasets/nyctaxi-with-zipcodes/subsampled`", "Validation Input")
-dbutils.widgets.text("model_type", "regressor", "Model Type")
-dbutils.widgets.text("targets", "fare_amount", "Targets")
-dbutils.widgets.text("model_name", "dev.databricks_mlops_platform.databricks_mlops_platform-model", "Full (Three-Level) Model Name")
-
-dbutils.widgets.text("model_version", "", "Candidate Model Version")
+# MAGIC %pip install -r ../requirements.txt
 
 # COMMAND ----------
-run_mode = dbutils.widgets.get("run_mode").lower()
-assert run_mode == "disabled" or run_mode == "dry_run" or run_mode == "enabled"
+
+dbutils.library.restartPython()
+
+# COMMAND ----------
+
+# DBTITLE 1,Notebook arguments
+import sys
+
+sys.path.append("..")
+
+dbutils.widgets.dropdown("run_mode", "enabled", ["disabled", "dry_run", "enabled"], "Run Mode")
+dbutils.widgets.text("catalog_name", "workspace", "UC catalog")
+dbutils.widgets.text("schema_name", "mlops_dev", "UC schema")
+dbutils.widgets.text("model_name", "credit_risk_model", "Model name")
+dbutils.widgets.text("targets", "class", "Label column")
+
+run_mode = dbutils.widgets.get("run_mode")
+label_column = dbutils.widgets.get("targets")
+
+from platform_utils.naming import AssetNames
+
+names = AssetNames(
+    catalog=dbutils.widgets.get("catalog_name"),
+    schema=dbutils.widgets.get("schema_name"),
+    model=dbutils.widgets.get("model_name"),
+)
 
 if run_mode == "disabled":
-    print(
-        "Model validation is in DISABLED mode. Exit model validation without blocking model deployment."
-    )
-    dbutils.notebook.exit(0)
-dry_run = run_mode == "dry_run"
+    dbutils.notebook.exit("VALIDATION_SKIPPED")
 
-if dry_run:
-    print(
-        "Model validation is in DRY_RUN mode. Validation threshold validation failures will not block model deployment."
-    )
-else:
-    print(
-        "Model validation is in ENABLED mode. Validation threshold validation failures will block model deployment."
-    )
+from platform_utils.task_values import resolve_candidate_version
+
+# Falls back to the challenger alias when this task is re-run alone, which is how a data
+# scientist debugs a validation failure without repeating the training run.
+model_version = resolve_candidate_version(dbutils, names)
+
+print(f"run_mode = {run_mode}")
+print(f"model    = {names.model_name}")
+print(f"version  = {model_version}")
 
 # COMMAND ----------
 
+# DBTITLE 1,Prepare the evaluation set
 import mlflow
-import os
-import tempfile
-import traceback
+
+mlflow.set_registry_uri("databricks-uc")
+
+from validation import custom_metrics, evaluator_config, validation_thresholds
+
+# Validation runs against the same persisted training snapshot the model was fit on, so a
+# threshold breach reflects the model rather than a shifted evaluation set.
+eval_sdf = spark.table(names.training_data)
+
+DROP_COLUMNS = ["env", "ingested_at", "residence_band", "age_band"]
+eval_pdf = eval_sdf.drop(*[c for c in DROP_COLUMNS if c in eval_sdf.columns]).toPandas()
+
+model_uri = f"models:/{names.model_name}/{model_version}"
+thresholds = validation_thresholds()
+print(f"Evaluating {model_uri} against {len(thresholds)} threshold(s) on {len(eval_pdf)} rows")
+
+# COMMAND ----------
+
+# DBTITLE 1,Score the evaluation set
+# A LightGBM booster emits P(default) as a float. Threshold metrics (precision, recall,
+# F1) need discrete labels, while ROC-AUC must stay on the probability so it measures
+# ranking rather than a single operating point. Both are derived here from one scoring pass.
+#
+# The threshold is imported from validation.py, not defined here: it is a risk parameter
+# that belongs with the thresholds it interacts with.
+from validation import DECISION_THRESHOLD
+
+booster = mlflow.lightgbm.load_model(model_uri)
+
+features = eval_pdf.drop(columns=[label_column])
+y_true = eval_pdf[label_column].astype(int)
+y_proba = booster.predict(features)
+y_pred = (y_proba >= DECISION_THRESHOLD).astype(int)
+
+print(f"Scored {len(y_true)} rows at decision threshold {DECISION_THRESHOLD}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Compute metrics and enforce the thresholds
+from sklearn.metrics import (
+    average_precision_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+
+validation_failed = False
+failure_detail = ""
+metrics = {}
+
+with mlflow.start_run(run_name=f"validate_v{model_version}"):
+    metrics = {
+        # Probability-based: measures ranking quality independent of the cut-off.
+        "roc_auc": float(roc_auc_score(y_true, y_proba)),
+        "pr_auc": float(average_precision_score(y_true, y_proba)),
+        # Label-based: measures performance at the chosen operating point.
+        "precision_score": float(precision_score(y_true, y_pred, zero_division=0)),
+        "recall_score": float(recall_score(y_true, y_pred, zero_division=0)),
+        "f1_score": float(f1_score(y_true, y_pred, zero_division=0)),
+    }
+    for name, value in metrics.items():
+        mlflow.log_metric(f"validation_{name}", value)
+
+    # Extra metrics contributed by validation.py, if any.
+    for metric in custom_metrics():
+        print(f"  (custom metric declared: {getattr(metric, 'name', metric)})")
+
+    # Threshold enforcement. Done explicitly rather than via
+    # mlflow.validate_evaluation_results so the breach message names every failing metric
+    # with its actual and required value — that message is what a reviewer reads.
+    breaches = []
+    for metric_name, threshold in thresholds.items():
+        if metric_name not in metrics:
+            print(f"  WARNING: threshold set for {metric_name!r}, which was not computed")
+            continue
+        actual = metrics[metric_name]
+        required = threshold.threshold
+        if threshold.greater_is_better and actual < required:
+            breaches.append(f"{metric_name}={actual:.4f} < required {required}")
+        elif not threshold.greater_is_better and actual > required:
+            breaches.append(f"{metric_name}={actual:.4f} > allowed {required}")
+
+    for key, value in sorted(metrics.items()):
+        print(f"  {key} = {value:.4f}")
+
+    if breaches:
+        validation_failed = True
+        failure_detail = "; ".join(breaches)
+        print(f"Validation FAILED: {failure_detail}")
+    else:
+        print("Validation PASSED.")
+
+# COMMAND ----------
+
+# DBTITLE 1,Record the verdict on the model version
+# Tagged on the version itself so the approval reviewer sees the validation outcome on the
+# same object they are signing off, not buried in a separate job log.
 from mlflow import MlflowClient
 
 client = MlflowClient()
+verdict = "FAILED" if validation_failed else "PASSED"
+client.set_model_version_tag(names.model_name, str(model_version), "validation_status", verdict)
+for metric in ("roc_auc", "precision_score", "recall_score", "f1_score"):
+    if metric in metrics:
+        client.set_model_version_tag(
+            names.model_name,
+            str(model_version),
+            f"validation_{metric}",
+            f"{metrics[metric]:.4f}",
+        )
 
-# set experiment
-experiment_name = dbutils.widgets.get("experiment_name")
-mlflow.set_experiment(experiment_name)
-# set model evaluation parameters that can be inferred from the job
-model_uri = dbutils.jobs.taskValues.get("Train", "model_uri", debugValue="")
-model_name = dbutils.jobs.taskValues.get("Train", "model_name", debugValue="")
-model_version = dbutils.jobs.taskValues.get("Train", "model_version", debugValue="")
-
-if model_uri == "":
-    model_name = dbutils.widgets.get("model_name")
-    model_version = dbutils.widgets.get("model_version")
-    model_uri = "models:/" + model_name + "/" + model_version
-
-baseline_model_uri = "models:/" + model_name + "@champion"
-
-evaluators = "default"
-assert model_uri != "", "model_uri notebook parameter must be specified"
-assert model_name != "", "model_name notebook parameter must be specified"
-assert model_version != "", "model_version notebook parameter must be specified"
-
-# COMMAND ----------
-
-# take input
-enable_baseline_comparison = dbutils.widgets.get("enable_baseline_comparison")
-
-
-enable_baseline_comparison = "false" 
-print(
-    "Currently baseline model comparison is not supported for models registered with feature store. Please refer to "
-    "issue https://github.com/databricks/mlops-stacks/issues/70 for more details."
+dbutils.jobs.taskValues.set("validation_status", verdict)
+dbutils.jobs.taskValues.set(
+    "validation_metrics",
+    {k: float(v) for k, v in metrics.items() if isinstance(v, (int, float))},
 )
 
-assert enable_baseline_comparison == "true" or enable_baseline_comparison == "false"
-enable_baseline_comparison = enable_baseline_comparison == "true"
-
-validation_input = dbutils.widgets.get("validation_input")
-assert validation_input
-data = spark.sql(validation_input)
-
-model_type = dbutils.widgets.get("model_type")
-targets = dbutils.widgets.get("targets")
-
-assert model_type
-assert targets
-
-from validation import custom_metrics as _custom_metrics, validation_thresholds as _validation_thresholds, evaluator_config as _evaluator_config
-custom_metrics = _custom_metrics()
-validation_thresholds = _validation_thresholds()
-evaluator_config = _evaluator_config()
-
 # COMMAND ----------
 
-# helper methods
-def get_run_link(run_info):
-    return "[Run](#mlflow/experiments/{0}/runs/{1})".format(
-        run_info.experiment_id, run_info.run_id
+# DBTITLE 1,Enforce the verdict
+if validation_failed and run_mode == "enabled":
+    # Hard stop: the candidate never reaches the approval gate.
+    raise RuntimeError(
+        f"Model validation failed for {names.model_name} v{model_version} with "
+        f"run_mode='enabled', so promotion is blocked.\n{failure_detail}"
     )
 
+if validation_failed:
+    print(f"run_mode='{run_mode}': breach recorded but not enforced.")
 
-def get_training_run(model_name, model_version):
-    version = client.get_model_version(model_name, model_version)
-    if version.run_id:
-        return mlflow.get_run(run_id=version.run_id)
-    return None
-
-
-def generate_run_name(training_run):
-    return None if not training_run else training_run.info.run_name + "-validation"
-
-
-def generate_description(training_run):
-    return (
-        None
-        if not training_run
-        else "Model Training Details: {0}\n".format(get_run_link(training_run.info))
-    )
-
-
-def log_to_model_description(run, success):
-    run_link = get_run_link(run.info)
-    description = client.get_model_version(model_name, model_version).description
-    status = "SUCCESS" if success else "FAILURE"
-    if description != "":
-        description += "\n\n---\n\n"
-    description += "Model Validation Status: {0}\nValidation Details: {1}".format(
-        status, run_link
-    )
-    client.update_model_version(
-        name=model_name, version=model_version, description=description
-    )
-
-
-
-from datetime import timedelta, timezone
-import math
-import pyspark.sql.functions as F
-from pyspark.sql.types import IntegerType
-
-
-def rounded_unix_timestamp(dt, num_minutes=15):
-    """
-    Ceilings datetime dt to interval num_minutes, then returns the unix timestamp.
-    """
-    nsecs = dt.minute * 60 + dt.second + dt.microsecond * 1e-6
-    delta = math.ceil(nsecs / (60 * num_minutes)) * (60 * num_minutes) - nsecs
-    return int((dt + timedelta(seconds=delta)).replace(tzinfo=timezone.utc).timestamp())
-
-
-rounded_unix_timestamp_udf = F.udf(rounded_unix_timestamp, IntegerType())
-
-
-def rounded_taxi_data(taxi_data_df):
-    # Round the taxi data timestamp to 15 and 30 minute intervals so we can join with the pickup and dropoff features
-    # respectively.
-    taxi_data_df = (
-        taxi_data_df.withColumn(
-            "rounded_pickup_datetime",
-            F.to_timestamp(
-                rounded_unix_timestamp_udf(
-                    taxi_data_df["tpep_pickup_datetime"], F.lit(15)
-                )
-            ),
-        )
-        .withColumn(
-            "rounded_dropoff_datetime",
-            F.to_timestamp(
-                rounded_unix_timestamp_udf(
-                    taxi_data_df["tpep_dropoff_datetime"], F.lit(30)
-                )
-            ),
-        )
-        .drop("tpep_pickup_datetime")
-        .drop("tpep_dropoff_datetime")
-    )
-    taxi_data_df.createOrReplaceTempView("taxi_data")
-    return taxi_data_df
-
-
-data = rounded_taxi_data(data)
-
-
-
-
-# COMMAND ----------
-
-
-# Temporary fix as FS model can't predict as a pyfunc model
-# MLflow evaluate can take a lambda function instead of a model uri for a model
-# but id does not work for the baseline model as it requires a model_uri (baseline comparison is set to false)
-
-from databricks.feature_engineering import FeatureEngineeringClient
-
-def get_fs_model(df):
-    fe_client = FeatureEngineeringClient()
-    return (
-        fe_client.score_batch(model_uri=model_uri, df=spark.createDataFrame(df))
-        .select("prediction")
-        .toPandas()
-    )
-
-
-training_run = get_training_run(model_name, model_version)
-
-# run evaluate
-with mlflow.start_run(
-    run_name=generate_run_name(training_run),
-    description=generate_description(training_run),
-) as run, tempfile.TemporaryDirectory() as tmp_dir:
-    validation_thresholds_file = os.path.join(tmp_dir, "validation_thresholds.txt")
-    with open(validation_thresholds_file, "w") as f:
-        if validation_thresholds:
-            for metric_name in validation_thresholds:
-                f.write(
-                    "{0:30}  {1}\n".format(
-                        metric_name, str(validation_thresholds[metric_name])
-                    )
-                )
-    mlflow.log_artifact(validation_thresholds_file)
-
-    try:
-        eval_result = mlflow.evaluate(
-            
-            model=get_fs_model,
-            
-            data=data,
-            targets=targets,
-            model_type=model_type,
-            evaluators=evaluators,
-            validation_thresholds=validation_thresholds,
-            custom_metrics=custom_metrics,
-            baseline_model=None
-            if not enable_baseline_comparison
-            else baseline_model_uri,
-            evaluator_config=evaluator_config,
-        )
-        metrics_file = os.path.join(tmp_dir, "metrics.txt")
-        with open(metrics_file, "w") as f:
-            f.write(
-                "{0:30}  {1:30}  {2}\n".format("metric_name", "candidate", "baseline")
-            )
-            for metric in eval_result.metrics:
-                candidate_metric_value = str(eval_result.metrics[metric])
-                baseline_metric_value = "N/A"
-                if metric in eval_result.baseline_model_metrics:
-                    mlflow.log_metric(
-                        "baseline_" + metric, eval_result.baseline_model_metrics[metric]
-                    )
-                    baseline_metric_value = str(
-                        eval_result.baseline_model_metrics[metric]
-                    )
-                f.write(
-                    "{0:30}  {1:30}  {2}\n".format(
-                        metric, candidate_metric_value, baseline_metric_value
-                    )
-                )
-        mlflow.log_artifact(metrics_file)
-        log_to_model_description(run, True)
-        # Assign "challenger" alias to indicate model version has passed validation checks
-        print("Validation checks passed. Assigning 'challenger' alias to model version.")
-        client.set_registered_model_alias(model_name, "challenger", model_version)
-    except Exception as err:
-        log_to_model_description(run, False)
-        error_file = os.path.join(tmp_dir, "error.txt")
-        with open(error_file, "w") as f:
-            f.write("Validation failed : " + str(err) + "\n")
-            f.write(traceback.format_exc())
-        mlflow.log_artifact(error_file)
-        if not dry_run:
-            raise err
-        else:
-            print(
-                "Model validation failed in DRY_RUN. It will not block model deployment."
-            )
+dbutils.notebook.exit(verdict)

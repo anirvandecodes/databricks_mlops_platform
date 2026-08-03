@@ -1,7 +1,14 @@
+# Runtime dependencies for the ML pipeline notebooks.
+#
+# Installed into the serverless job environment via the `dependencies` block in
+# resources/*.yml. Kept deliberately small: everything here has to be resolvable inside
+# the workspace's egress policy, and each extra package is another supply-chain surface.
 mlflow>=3.1
 lightgbm
 numpy
 pandas
 scikit-learn>=1.1.1
-matplotlib>=3.5.2
-pillow>=10.0.1
+
+# databricks-sdk is used by the monitoring setup notebook (quality_monitors API). It ships
+# in the Databricks runtime, but pinning it here keeps serverless environments explicit.
+databricks-sdk>=0.40.0

@@ -1,13 +1,15 @@
-# This GitHub workflow deploys Bundle resources (ML resource config and more)
-# defined under databricks_mlops_platform/resources/*
-# and databricks_mlops_platform/databricks.yml with staging deployment target configs,
-# when PRs are merged into the default branch
-name: Bundle Deployment for databricks_mlops_platform Staging
+# Staging CD. Triggered by a merge into main.
+#
+# Staging sets approval_required=false, so the full chain — train, validate, gate, promote —
+# runs unattended here. That is intentional: staging is where the pipeline proves it works
+# end to end without a human in the loop, so that the only thing still to verify at release
+# time is the model itself.
+name: Staging CD for databricks_mlops_platform
 
 on:
   push:
     branches:
-      - 'main'
+      - main
   workflow_dispatch:
 
 defaults:
@@ -15,20 +17,37 @@ defaults:
     working-directory: ./databricks_mlops_platform
 
 env:
+  DATABRICKS_HOST: ${{ secrets.STAGING_WORKSPACE_HOST }}
   DATABRICKS_TOKEN: ${{ secrets.STAGING_WORKSPACE_TOKEN }}
 
 jobs:
-  staging:
-    concurrency: databricks_mlops_platform-staging-bundle-job
+  deploy:
     runs-on: ubuntu-latest
+    concurrency: staging-bundle-deploy
     steps:
       - uses: actions/checkout@v4
-      - uses: databricks/setup-cli@v0.236.0
-      - name: Validate Bundle For Staging
-        id: validate
+      - uses: databricks/setup-cli@main
+
+      - name: Validate bundle for staging
+        run: databricks bundle validate -t staging
+
+      - name: Deploy bundle to staging
+        run: databricks bundle deploy -t staging
+
+      - name: Refresh features
+        run: databricks bundle run write_feature_table_job -t staging
+
+      - name: Train, validate and promote
+        run: databricks bundle run model_training_job -t staging
+
+      - name: Score and decide
+        run: databricks bundle run batch_inference_job -t staging
+
+      - name: Summarise
+        if: always()
         run: |
-          databricks bundle validate -t staging
-      - name: Deploy Bundle to Staging
-        id: deploy
-        run: |
-          databricks bundle deploy -t staging
+          echo "### Staging deployment" >> "$GITHUB_STEP_SUMMARY"
+          echo "Commit \`${{ github.sha }}\` deployed and exercised end to end." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Promote to production by pushing to the \`release\` branch. Production" >> "$GITHUB_STEP_SUMMARY"
+          echo "requires explicit model approval before any version serves traffic." >> "$GITHUB_STEP_SUMMARY"

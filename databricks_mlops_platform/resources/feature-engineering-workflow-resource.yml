@@ -1,3 +1,8 @@
+# Feature engineering workflow.
+#
+# Produces the feature table, the scoring input, and the ground-truth outcomes table.
+# Scheduled ahead of training so features are always fresher than the model that consumes
+# them.
 common_permissions: &permissions
   permissions:
     - level: CAN_VIEW
@@ -6,54 +11,31 @@ common_permissions: &permissions
 resources:
   jobs:
     write_feature_table_job:
-      name: ${bundle.target}-databricks_mlops_platform-write-feature-table-job
+      name: ${bundle.target}-mlops-platform-feature-engineering-job
       tasks:
-        - task_key: PickupFeatures
+        - task_key: ComputeCreditFeatures
           environment_key: default
           notebook_task:
             notebook_path: ../feature_engineering/GenerateAndWriteFeatures.py
             base_parameters:
-              # TODO modify these arguments to reflect your setup.
-              input_table_path: /databricks-datasets/nyctaxi-with-zipcodes/subsampled
-              # TODO: Empty start/end dates will process the whole range. Update this as needed to process recent data.
-              input_start_date: ""
-              input_end_date: ""
-              timestamp_column: tpep_pickup_datetime
-              output_table_name: ${var.catalog_name}.databricks_mlops_platform.trip_pickup_features
-              features_transform_module: pickup_features
-              primary_keys: zip
-              # git source information of current ML resource deployment. It will be persisted as part of the workflow run
-              git_source_info: url:${bundle.git.origin_url}; branch:${bundle.git.branch}; commit:${bundle.git.commit}
-        - task_key: DropoffFeatures
-          environment_key: default
-          notebook_task:
-            notebook_path: ../feature_engineering/GenerateAndWriteFeatures.py
-            base_parameters:
-              # TODO: modify these arguments to reflect your setup.
-              input_table_path: /databricks-datasets/nyctaxi-with-zipcodes/subsampled
-              # TODO: Empty start/end dates will process the whole range. Update this as needed to process recent data.
-              input_start_date: ""
-              input_end_date: ""
-              timestamp_column: tpep_dropoff_datetime
-              output_table_name: ${var.catalog_name}.databricks_mlops_platform.trip_dropoff_features
-              features_transform_module: dropoff_features
-              primary_keys: zip
-              # git source information of current ML resource deployment. It will be persisted as part of the workflow run
-              git_source_info: url:${bundle.git.origin_url}; branch:${bundle.git.branch}; commit:${bundle.git.commit}
+              env: ${bundle.target}
+              catalog_name: ${var.catalog_name}
+              schema_name: ${var.schema_name}
+              # Fraction held out for batch scoring. Labels are stripped from this slice so
+              # inference can never see the outcome it predicts.
+              scoring_sample_fraction: "0.2"
+              git_source_info: "url:${bundle.git.origin_url}; branch:${bundle.git.branch}; commit:${bundle.git.commit}"
+
       environments:
         - environment_key: default
           spec:
-            environment_version: "5"
+            environment_version: "3"
             dependencies:
-              - -r "../requirements.txt"
+              - -r ../requirements.txt
+
       schedule:
-        quartz_cron_expression: "0 0 7 * * ?" # daily at 7am
+        quartz_cron_expression: "0 0 7 * * ?" # daily 07:00 UTC, two hours before training
         timezone_id: UTC
+        pause_status: PAUSED
+
       <<: *permissions
-      # If you want to turn on notifications for this job, please uncomment the below code,
-      # and provide a list of emails to the on_failure argument.
-      #
-      #  email_notifications:
-      #    on_failure:
-      #      - first@company.com
-      #      - second@company.com
