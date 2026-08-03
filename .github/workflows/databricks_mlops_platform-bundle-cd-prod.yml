@@ -72,18 +72,22 @@ jobs:
       - name: Report promotion status
         run: |
           if [ "${{ steps.train.outcome }}" = "success" ]; then
-            echo "### Model promoted to champion" >> "$GITHUB_STEP_SUMMARY"
-            echo "The candidate carried a valid approval tag and is now serving." >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "### Model promoted to champion"
+              echo "The candidate carried a valid approval tag and is now serving."
+            } >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "### Candidate awaiting approval" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "Training and validation completed; promotion is blocked pending review." >> "$GITHUB_STEP_SUMMARY"
-            echo "Production continues to serve the existing champion." >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "To approve, set these tags on the new model version in Unity Catalog:" >> "$GITHUB_STEP_SUMMARY"
-            echo '  approval_status = approved' >> "$GITHUB_STEP_SUMMARY"
-            echo '  approved_by     = <reviewer>' >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "Then re-run only the gate:" >> "$GITHUB_STEP_SUMMARY"
-            echo '  databricks bundle run model_training_job -t prod --only ApprovalGate' >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "### Candidate awaiting approval"
+              echo ""
+              echo "Training and validation completed; promotion is blocked pending review."
+              echo "Production continues to serve the existing champion."
+              echo ""
+              echo "To approve, set these tags on the new model version in Unity Catalog:"
+              echo '  approval_status = approved'
+              echo '  approved_by     = <reviewer>'
+              echo ""
+              echo "Then re-run only the gate:"
+              echo '  databricks bundle run model_training_job -t prod --only ApprovalGate'
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
