@@ -18,6 +18,11 @@ defaults:
 
 env:
   DATABRICKS_HOST: ${{ secrets.STAGING_WORKSPACE_HOST }}
+  # Auth: OAuth (M2M) is preferred — no long-lived secret to rotate. The CLI uses the client
+  # id/secret when both are set and falls back to DATABRICKS_TOKEN otherwise, so either
+  # style works without editing this workflow.
+  DATABRICKS_CLIENT_ID: ${{ secrets.STAGING_CLIENT_ID }}
+  DATABRICKS_CLIENT_SECRET: ${{ secrets.STAGING_CLIENT_SECRET }}
   DATABRICKS_TOKEN: ${{ secrets.STAGING_WORKSPACE_TOKEN }}
 
 jobs:

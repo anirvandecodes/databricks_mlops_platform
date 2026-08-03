@@ -25,6 +25,9 @@ defaults:
 
 env:
   DATABRICKS_HOST: ${{ secrets.PROD_WORKSPACE_HOST }}
+  # See the staging workflow for the OAuth-vs-PAT note.
+  DATABRICKS_CLIENT_ID: ${{ secrets.PROD_CLIENT_ID }}
+  DATABRICKS_CLIENT_SECRET: ${{ secrets.PROD_CLIENT_SECRET }}
   DATABRICKS_TOKEN: ${{ secrets.PROD_WORKSPACE_TOKEN }}
 
 jobs:
