@@ -1,4 +1,4 @@
-# Production CD. Triggered by a push to the release branch.
+# Production CD. Triggered by a push to any release/** branch.
 #
 # Three jobs, so that the human decision sits between producing the evidence and acting
 # on it:
@@ -11,7 +11,7 @@
 #   promote  — gated on the GitHub `production` environment. Waits for a reviewer, then
 #              records their approval in Unity Catalog and moves @champion.
 #
-# So a push to release never silently changes what production serves: it stages a
+# So a release push never silently changes what production serves: it stages a
 # candidate, shows the metrics, and waits. The reviewer approves *after* seeing how the
 # model performed, which is the point — gating the training job instead would ask for
 # sign-off before any metric existed.
@@ -25,7 +25,10 @@ name: Prod CD for databricks_mlops_platform
 on:
   push:
     branches:
-      - release
+      # Namespaced so each production release is its own branch — release/2026-08-cutover
+      # rather than one long-lived `release` that gets force-pushed. The branch name then
+      # records which release a given promotion belonged to.
+      - "release/**"
   workflow_dispatch:
 
 defaults:
@@ -93,11 +96,20 @@ jobs:
         env:
           MODEL: workspace.payments_prod.credit_risk_model
         run: |
+          # Without pipefail a failure inside the command substitution below is swallowed:
+          # METRICS ends up empty, the step still succeeds, and the reviewer is asked to
+          # approve with no numbers in front of them. That happened on the first run.
+          set -o pipefail
           # candidate_report.py appends candidate_version to $GITHUB_OUTPUT itself; read it
           # back here rather than through steps.candidate.outputs, which is not populated
           # until this step has finished.
           METRICS=$(python scripts/candidate_report.py --model "$MODEL")
           VERSION=$(grep '^candidate_version=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2)
+          if [ -z "$VERSION" ] || [ -z "$METRICS" ]; then
+            echo "::error::Could not read the staged candidate's metrics; refusing to" \
+                 "request approval without them."
+            exit 1
+          fi
           {
             echo "### Production candidate awaiting approval"
             echo ""
@@ -112,6 +124,18 @@ jobs:
             echo "Approve the **production** environment below to promote this version"
             echo "to \`@champion\`. Rejecting leaves production untouched."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Annotate the run with the approval decision needed
+        # The step summary is only visible on the run's Summary page, but a reviewer opening
+        # the paused `promote` job does not see it there. A notice annotation surfaces the
+        # headline numbers on every page of the run, including the one with the Approve
+        # button, so the decision is never made blind.
+        run: |
+          VERSION=$(grep '^candidate_version=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2)
+          SUMMARY=$(python scripts/candidate_report.py --model "$MODEL" --format inline)
+          echo "::notice title=Awaiting approval: promote v${VERSION} to champion::${SUMMARY}"
+        env:
+          MODEL: workspace.payments_prod.credit_risk_model
 
     outputs:
       candidate_version: ${{ steps.candidate.outputs.candidate_version }}

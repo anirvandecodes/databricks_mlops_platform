@@ -18,7 +18,7 @@ requirements. The platform itself is workload-agnostic.
 
 | Capability | How it works |
 |---|---|
-| **Two-stage gating** | Stage 1 (code): PR review, unit tests, bundle validation. Stage 2 (model): a reviewer must tag the specific trained version before it can serve traffic. |
+| **Two-stage gating** | Stage 1 (code): PR review, unit tests, bundle validation. Stage 2 (model): production CD pauses on a GitHub environment approval *after* training and validation, so the reviewer decides with the candidate's metrics in front of them. Approving records `approval_status` on that specific version in Unity Catalog; the in-pipeline gate re-checks the tag before any alias moves. |
 | **Alias-based promotion** | Inference resolves `models:/<model>@champion` at run time. Promotion moves an alias; nothing is redeployed. |
 | **Seconds-long rollback** | The same alias operation in reverse. Deliberately *not* gated on approval — a gate must not prolong an incident. |
 | **Audit evidence** | Every promotion and rollback writes an immutable JSON package to a UC Volume plus a queryable Delta row: metrics, training-data version, approver, timestamp. |
@@ -115,13 +115,25 @@ pipeline code moves.
 
 | | dev | staging | prod |
 |---|---|---|---|
-| Deploy path | local IDE | CI only | CD only |
+| Deploy path | local IDE | CI on merge to `main` | CD on push to `release/**` |
 | Approval required | no | no | **yes** |
 | Human write access | yes | no | no |
+
+Production releases are namespaced branches — `release/2026-08-cutover` rather than one
+long-lived `release` — so the branch name records which release a given promotion belonged
+to. The `production` GitHub environment restricts deployments to that pattern and requires a
+named reviewer.
 
 ## Not implemented
 
 Stated plainly so scope is clear: distributed hyperparameter tuning, real-time serving and
-the online feature store, and FinOps tagging/budgets. Approval is recorded as a Unity Catalog
-tag rather than through a developer portal — the control is enforced; the portal integration
-is not built.
+the online feature store, and FinOps tagging/budgets. Approval is captured as a GitHub
+environment review plus a Unity Catalog tag rather than through a developer portal — the
+control is enforced; the portal integration is not built.
+
+**Lakehouse Monitoring is unavailable on Databricks Free Edition** — the quality-monitors API
+is not served there at all, even to a workspace admin. `SetupMonitor` detects that and exits
+`MONITOR_UNSUPPORTED` instead of failing the pipeline. Drift detection is unaffected:
+`DriftCheck` computes PSI from the UC function against the baseline table, so the
+drift-triggers-retraining path still works. Only the managed profile/drift metric tables are
+absent.

@@ -37,19 +37,15 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    import mlflow
-
-    mlflow.set_registry_uri("databricks-uc")
+    from mlflow import MlflowClient
 
     sys.path.insert(0, ".")
-    from platform_utils.promotion import (
-        APPROVAL_TAG,
-        APPROVED_VALUE,
-        get_alias_version,
-        get_client,
-    )
+    from platform_utils.promotion import APPROVAL_TAG, APPROVED_VALUE, get_alias_version
 
-    client = get_client()
+    # Both URIs are passed explicitly — see the note in candidate_report.py: a client built
+    # without them talks to a local sqlite registry, which here would mean recording an
+    # approval that never reaches Unity Catalog.
+    client = MlflowClient(tracking_uri="databricks", registry_uri="databricks-uc")
 
     version = args.version
     if not version.isdigit():
