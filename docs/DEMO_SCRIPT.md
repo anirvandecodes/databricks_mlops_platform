@@ -44,36 +44,32 @@ so the audience always knows where they are. It renders on GitHub, so you can sh
 itself.
 
 ```mermaid
-flowchart TD
+flowchart LR
     subgraph DEV["🟢 payments_dev · Priya, data scientist"]
-        D1["edit code<br/>locally"] --> D2["databricks bundle<br/>deploy -t dev"]
+        direction TB
+        D1["edit code locally"] --> D2["bundle deploy -t dev"]
         D2 --> D3["train → validate<br/>→ gate → promote"]
         D3 --> D4["@champion moves<br/><i>gate off: serves no one</i>"]
     end
-
-    D4 -.->|"open a pull request"| PR
-
     subgraph STG["🟡 payments_staging · Sam, reviewer"]
+        direction TB
         PR["PR checks<br/>83 unit · 25 integration<br/>validate dev/staging/prod"]
         PR --> S1["staging_integration<br/>runs the whole pipeline"]
         S1 --> S2["merge to main"]
-        S2 --> S3["Staging CD:<br/>@champion moves automatically"]
+        S2 --> S3["Staging CD:<br/>@champion moves<br/>automatically"]
     end
-
-    S3 -.->|"push release/2026-08-demo"| P1
-
     subgraph PRD["🔴 payments_prod · Dana cuts · Ravi approves"]
-        P1["deploy<br/><i>code only — no alias change</i>"]
+        direction TB
+        P1["deploy<br/><i>code only, no alias change</i>"]
         P1 --> P2["train → validate<br/>→ stage @challenger"]
-        P2 --> GATE{{"⛔ APPROVAL GATE<br/>pipeline STOPS here"}}
-        GATE -->|"Ravi sees metrics<br/>and clicks Approve"| P3["write UC tag<br/>approval_status=approved<br/>approved_by=ravi"]
-        P3 --> P4["@champion moves<br/>✅ now serving traffic"]
+        P2 --> GATE{{"⛔ APPROVAL GATE<br/>pipeline STOPS"}}
+        GATE -->|"Ravi approves"| P3["write UC tag<br/>approval_status=approved"]
+        P3 --> P4["@champion moves<br/>✅ serving traffic"]
         GATE -->|"no approval"| BLOCK["@challenger only<br/>production unchanged"]
+        P4 -.->|"incident"| RB["rollback_job<br/><i>ungated, seconds</i>"]
     end
-
-    P4 -.->|"incident"| RB["rollback_job<br/><i>ungated, seconds</i>"]
-    RB -.-> P4
-
+    D4 -.->|"pull request"| PR
+    S3 -.->|"push release/*"| P1
     style GATE fill:#ffe0e0,stroke:#c00,stroke-width:3px
     style BLOCK fill:#fff4e0,stroke:#e69500
     style P4 fill:#e0f5e0,stroke:#2a2
