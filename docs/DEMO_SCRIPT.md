@@ -37,6 +37,57 @@ customers. Ravi, who did not build it, is the only one who can.**
 
 ---
 
+## The flow — show this first
+
+Put this on screen before touching a keyboard, and refer back to it at the start of each act
+so the audience always knows where they are. It renders on GitHub, so you can share the doc
+itself.
+
+```mermaid
+flowchart TD
+    subgraph DEV["🟢 payments_dev · Priya, data scientist"]
+        D1["edit code<br/>locally"] --> D2["databricks bundle<br/>deploy -t dev"]
+        D2 --> D3["train → validate<br/>→ gate → promote"]
+        D3 --> D4["@champion moves<br/><i>gate off: serves no one</i>"]
+    end
+
+    D4 -.->|"open a pull request"| PR
+
+    subgraph STG["🟡 payments_staging · Sam, reviewer"]
+        PR["PR checks<br/>83 unit · 25 integration<br/>validate dev/staging/prod"]
+        PR --> S1["staging_integration<br/>runs the whole pipeline"]
+        S1 --> S2["merge to main"]
+        S2 --> S3["Staging CD:<br/>@champion moves automatically"]
+    end
+
+    S3 -.->|"push release/2026-08-demo"| P1
+
+    subgraph PRD["🔴 payments_prod · Dana cuts · Ravi approves"]
+        P1["deploy<br/><i>code only — no alias change</i>"]
+        P1 --> P2["train → validate<br/>→ stage @challenger"]
+        P2 --> GATE{{"⛔ APPROVAL GATE<br/>pipeline STOPS here"}}
+        GATE -->|"Ravi sees metrics<br/>and clicks Approve"| P3["write UC tag<br/>approval_status=approved<br/>approved_by=ravi"]
+        P3 --> P4["@champion moves<br/>✅ now serving traffic"]
+        GATE -->|"no approval"| BLOCK["@challenger only<br/>production unchanged"]
+    end
+
+    P4 -.->|"incident"| RB["rollback_job<br/><i>ungated, seconds</i>"]
+    RB -.-> P4
+
+    style GATE fill:#ffe0e0,stroke:#c00,stroke-width:3px
+    style BLOCK fill:#fff4e0,stroke:#e69500
+    style P4 fill:#e0f5e0,stroke:#2a2
+    style RB fill:#e8e8f5,stroke:#66c
+```
+
+**The three sentences to say over it:**
+
+1. "Left to right is the journey a model takes. Same code the whole way — only configuration changes."
+2. "Two of those three environments promote automatically. The third stops and waits for a person."
+3. "That red box is the entire point of the platform. Everything else supports it."
+
+---
+
 ## What each environment is for
 
 Worth drawing on a whiteboard before you touch a keyboard. It makes every later step obvious.
@@ -50,6 +101,66 @@ Gate   none                      none                        GitHub approval + U
 Speed  seconds                   ~7 min                      ~6 min, then waits for a human
 Point  iterate freely            prove the pipeline works     prove the model deserves traffic
 ```
+
+### What to actually click in each environment
+
+Verified against this workspace. Open **Catalog Explorer → `workspace` → `<schema>`** and
+show these, in this order.
+
+#### 🟢 `payments_dev` — "a data scientist's working environment"
+
+| Show | What is there | Say |
+|---|---|---|
+| **Models** | `credit_risk_model` (1 version, `@champion → v1`) | "One version, promoted instantly. No gate here." |
+| **Tables (9)** | `credit_features`, `training_data`, `scoring_input`, `raw_model_predictions`, `credit_decisions`, `inference_log`, `baseline_snapshot`, `ground_truth_outcomes`, `promotion_audit_log` | "The full lifecycle exists in dev — features through to decisions. Nothing is special about prod's *shape*." |
+| **Functions (3)** | `evaluate_eligibility`, `calculate_credit_limit`, `calculate_psi` | "Business policy and the drift metric are UC functions, not code buried in a notebook." |
+| **Volumes** | `audit_logs` | "Even dev writes audit evidence." |
+| **Jobs** | 5, prefixed `[dev <username>]` | "Per-user namespacing — two scientists cannot collide." |
+
+*The point of dev is that it looks complete and moves fast.*
+
+#### 🟡 `payments_staging` — "the pipeline's proving ground"
+
+| Show | What is there | Say |
+|---|---|---|
+| **Models** | `credit_risk_model` — **9 versions**, `@champion → v9` | ★ "Nine versions. Every merge to `main` trains and promotes one. This is CI exercising the pipeline over and over." |
+| **Tables (9)** | same nine as dev | "Identical schema to dev and prod. One code path." |
+| **Functions (3)** | same three | — |
+| **Jobs** | 5, prefixed `staging-` | "No user prefix — these are CI's jobs, not a person's." |
+
+*The version count is the story here.* Put dev (1 version) and staging (9 versions) side by
+side: staging churns because proving the pipeline is cheap and automatic.
+
+#### 🔴 `payments_prod` — "deliberately sparse"
+
+| Show | What is there | Say |
+|---|---|---|
+| **Models** | `credit_risk_model` — 2 versions, `@champion → v2` | ★★ "Two versions in production against nine in staging. Getting into production is *rare*, and every one of those two had a named approver." |
+| **Tables (3)** | only `training_data`, `baseline_snapshot`, `promotion_audit_log` | ★ "Notice what is **missing** — no `credit_decisions`, no `inference_log`. Production has been deployed and gated, but batch scoring has not been run here. The absence is honest: nothing writes to production until it is asked to." |
+| **Functions (1)** | only `credit_risk_model` | "The policy functions land when the decision layer first runs." |
+| **Volumes** | `audit_logs` — holds the approval evidence JSON | "This is the auditor's artifact." |
+| **Jobs** | 5, prefixed `prod-` | "Same five jobs as everywhere else. Same code." |
+
+*The sparseness is a feature to narrate, not a gap to hide.* If you would rather prod look
+fully populated, run `databricks bundle run batch_inference_job -t prod` during setup — but
+the contrast is more interesting than the completeness.
+
+#### The comparison slide
+
+Put all three Models tabs side by side. This one table makes the governance argument
+without a word of explanation:
+
+| | dev | staging | prod |
+|---|---|---|---|
+| Model versions | 1 | **9** | **2** |
+| Tables | 9 | 9 | 3 |
+| UC functions | 3 | 3 | 1 |
+| Who promoted | Priya, instantly | CI, automatically | **Ravi, deliberately** |
+
+> "Nine models proved the pipeline. Two reached customers. That ratio is what governance
+> looks like when it is enforced rather than documented."
+
+---
 
 All three are **schemas in one catalog** (`workspace`), separated by grants. One code path,
 three targets, and the only differences are variables in `databricks.yml`:
