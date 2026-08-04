@@ -3,7 +3,7 @@
 # Batch Inference Notebook
 #
 # Scores the current applicant batch with whichever version is @champion, writes the
-# predictions, and appends to the inference log that Lakehouse Monitoring watches.
+# predictions, and appends to the inference log that the data profiling monitor watches.
 #
 # Note what this notebook does NOT do: it never names a model version. It resolves
 # models:/<model>@champion at run time, which is why a promotion or a rollback takes

@@ -14,7 +14,7 @@ resources:
     monitoring_job:
       name: ${bundle.target}-mlops-platform-monitoring-job
       tasks:
-        # 1. Register the PSI UC function and attach the Lakehouse Monitor. Idempotent, so
+        # 1. Register the PSI UC function and attach the data profiling monitor. Idempotent, so
         #    it is safe to leave in the scheduled path rather than needing a manual step.
         - task_key: SetupMonitor
           environment_key: default

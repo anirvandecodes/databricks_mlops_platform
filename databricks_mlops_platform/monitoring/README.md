@@ -4,7 +4,7 @@ Drift detection and gated retraining. Enabled by default — there are no TODOs 
 
 | File | Purpose |
 |---|---|
-| `SetupMonitor.py` | Registers the PSI Unity Catalog function and attaches a Lakehouse Monitor to the inference log. Idempotent. |
+| `SetupMonitor.py` | Registers the PSI Unity Catalog function and attaches a data profiling monitor to the inference log. Idempotent. |
 | `DriftCheck.py` | Computes PSI per monitored feature against the training baseline and decides whether retraining is warranted. |
 
 ## Running it
@@ -19,7 +19,7 @@ cannot attach to a table that does not yet exist.
 ## How drift is measured
 
 PSI (Population Stability Index) is the metric credit-risk teams govern on, and it is not a
-built-in Lakehouse Monitoring metric. It is implemented twice, deliberately:
+built-in data profiling metric. It is implemented twice, deliberately:
 
 - `platform_utils/metrics.py` — a pure Python function, unit tested offline.
 - The same formula registered as a **Unity Catalog SQL function**, so every team computes
@@ -45,7 +45,7 @@ response must not become an unreviewed path into production.
 ## Gotcha
 
 The drift baseline and the inference log must use the same label column name
-(`ground_truth`). Lakehouse Monitoring rejects a mismatch with `label_col cannot be found`.
+(`ground_truth`). Data profiling rejects a mismatch with `label_col cannot be found`.
 
 This platform monitors batch inference tables directly. Real-time serving inference tables
 require unpacking before a monitor can attach.

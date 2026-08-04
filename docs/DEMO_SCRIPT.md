@@ -793,35 +793,71 @@ Then re-run `batch_inference_job -t dev` to repopulate it with honest data.
 > keeps the *decision* with a person. Automated drift response is never an unreviewed path
 > into production."
 
-### 7h. Lakehouse Monitoring — state the gap plainly
+### 7h. The managed layer — data profiling
 
-`SetupMonitor` also attaches a **Lakehouse Monitor** of type `InferenceLog` to the inference
-table, which would produce managed profile and drift metric tables plus a built-in dashboard.
+`SetupMonitor` also attaches a **data profiling monitor** with an **Inference profile** to the
+inference log table. (Data profiling is the current name for what was called Lakehouse
+Monitoring; the SDK namespace is still `w.quality_monitors`, and Databricks groups it under
+"data quality monitoring" alongside anomaly detection.)
 
-**On Databricks Free Edition this API is not served at all** — it returns `No API found`,
-even to a workspace admin. The notebook detects exactly that response and logs:
+Verified working on this workspace — the job reports:
 
 ```
-Lakehouse Monitoring is unavailable in this workspace; skipping monitor attachment.
-  Drift detection still runs: DriftCheck computes PSI from
-  workspace.payments_dev.calculate_psi against the baseline table, and the retraining
-  branch is unaffected. Only the managed profile/drift metric tables are absent.
+Task SetupMonitor: MONITOR_READY
+
+Monitor will populate:
+  profile metrics: workspace.payments_dev.inference_log_profile_metrics
+  drift metrics  : workspace.payments_dev.inference_log_drift_metrics
 ```
 
-...then exits `MONITOR_UNSUPPORTED` rather than failing the pipeline.
+Confirm the monitor is live:
 
-> "Two layers of monitoring were designed here. The managed one — Lakehouse Monitoring, with
-> its own dashboard — is not available on this tier, so you are seeing the custom layer: PSI
-> as a governed UC function with an explicit retraining branch. On your paid workspace both
-> run, and the managed metric tables sit alongside these results."
+```bash
+databricks quality-monitors get \
+  workspace.payments_dev.inference_log \
+  --profile real-anirvan
+```
 
-**Why it degrades rather than fails:** a capability gap in the workspace is not a fault in
-the pipeline. Permission and configuration errors still raise — only the specific
-endpoint-absent response is treated as unsupported, so this cannot mask a real problem.
+This reports `"status": "MONITOR_STATUS_ACTIVE"`. Refresh history is
+`databricks quality-monitors list-refreshes <table>`. (The older
+`/api/2.0/lakehouse-monitoring/...` REST path no longer resolves and returns `Not Found`;
+the equivalent REST call is now `/api/2.1/unity-catalog/tables/<table>/monitor`.)
 
-If asked what the managed layer would add: automatic profile metrics per column and time
-window, drift metrics against a baseline, a generated dashboard, and expectation-style
-alerting — none of which the custom PSI path provides.
+One caveat when demoing a freshly seeded schema: **profile** metrics appear after the first
+refresh, but the **drift** table stays empty until there are two windows to compare. A single
+scoring run writes one `scored_at` value, so it produces one `1 day` window and nothing to
+diff — and if `ground_truth` is still NULL, label-dependent metrics cannot compute either.
+Score a second batch on a later day and join in `ground_truth_outcomes` before relying on the
+drift table on screen. The custom PSI layer below has no such dependency and is what section
+7g demonstrates.
+
+Or in the UI: **Catalog Explorer → `inference_log` → Quality** tab, which shows the monitor
+status and links to the generated dashboard.
+
+> "So there are two layers of monitoring, and they answer different questions. Data profiling
+> is the managed layer: it profiles every column, computes drift against the baseline, and
+> generates a dashboard without anyone writing SQL. The custom PSI layer is the *governed*
+> one: a single audited formula in Unity Catalog with an explicit, thresholded retraining
+> branch that a risk owner tunes by pull request."
+
+**Timing note for the demo:** the metric tables are declared as soon as the monitor is
+created, but they are not materialised until the monitor's first refresh — several minutes,
+sometimes longer on a small serverless warehouse. Querying them too early returns
+`TABLE_OR_VIEW_NOT_FOUND`. Check before you present:
+
+```sql
+SELECT count(*) FROM workspace.payments_dev.inference_log_profile_metrics;
+```
+
+If it errors, either wait for the refresh or show the **Quality** tab and the custom
+`drift_check_results` table instead — the governance story does not depend on the managed
+tables.
+
+**Why the code tolerates the feature being absent:** `SetupMonitor` catches the
+endpoint-absent response and exits `MONITOR_UNSUPPORTED` rather than failing, because a
+capability gap in a workspace is not a fault in the pipeline. Permission and configuration
+errors still raise, so this cannot hide a real misconfiguration. On this workspace the path
+is not exercised — the monitor is created successfully.
 
 ---
 
@@ -849,11 +885,11 @@ Then the persona point:
 
 Volunteering limitations builds far more credibility than being caught by them.
 
-**Lakehouse Monitoring is unavailable on Databricks Free Edition.** The quality-monitors API
-is not served there at all, even to a workspace admin. `SetupMonitor` detects this and exits
-`MONITOR_UNSUPPORTED` rather than failing the pipeline. Drift detection still works — PSI is
-computed from the UC function against the baseline table — but the *managed* profile and
-drift metric tables are absent. On a paid workspace this gap disappears.
+**The monitoring jobs are deployed paused and are not run by CI/CD.** The monitoring job's
+schedule (`0 0 18 * * ?`) ships with `pause_status: PAUSED`, and no CD workflow invokes it —
+so on a fresh deployment it has never run, and neither `calculate_psi` nor
+`drift_check_results` exists yet. Run it once during setup. In production you unpause the
+schedule; that is a deliberate deployment decision rather than something CI should force.
 
 **Separation of duties is demonstrated, not enforced, in this instance.** The repo has a
 single owner, so the same person plays every persona. The *mechanism* is real — the pipeline

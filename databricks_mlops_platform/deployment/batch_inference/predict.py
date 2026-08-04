@@ -5,8 +5,8 @@ matter here and are asserted by the integration tests:
 
 * The model is resolved by **alias**, so scoring always follows whatever version is
   currently champion — including immediately after a rollback.
-* Every scored row is appended to an inference log, which is the table Lakehouse
-  Monitoring attaches to. Scoring without logging would leave the platform blind to drift.
+* Every scored row is appended to an inference log, which is the table the data profiling
+  monitor attaches to. Scoring without logging would leave the platform blind to drift.
 """
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
