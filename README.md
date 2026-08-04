@@ -9,7 +9,7 @@ The reference workload is a credit-risk default-probability model (LightGBM on t
 UCI Credit-G dataset), chosen because credit risk has the strictest governance
 requirements. The platform itself is workload-agnostic.
 
-- **[docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md)** — guided walkthrough with real outputs
+- **[docs/CUJ_DEMO.md](docs/CUJ_DEMO.md)** — guided walkthrough with real outputs
 - **[docs/GITHUB_ACTIONS_SETUP.md](docs/GITHUB_ACTIONS_SETUP.md)** — CI/CD configuration
 
 ---

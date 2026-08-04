@@ -1,4 +1,4 @@
-# MLOps Platform — Customer Demo Script
+# CUJ Demo — MLOps Platform Critical User Journey
 
 A walkthrough organised as a **user journey**: four people, one model, and the question of
 whether it is allowed to reach production.
