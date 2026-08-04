@@ -1,426 +1,586 @@
 # MLOps Platform — Customer Demo Script
 
-A step-by-step walkthrough of the end-to-end platform, with the narrative to use at each
-step. Every command below was run against a live workspace while building this; the
-outputs quoted are real.
+A walkthrough organised as a **user journey**: four people, one model, and the question of
+whether it is allowed to reach production.
 
-**Total runtime:** ~25 minutes of pipeline execution. Budget 45 minutes with narration,
-or run the setup phase beforehand and demo only Acts 2–4 in ~20 minutes.
+Structured by persona rather than by feature, because the interesting part of this platform
+is not that it trains a model — anyone can do that — but **who is allowed to do what, and
+where the system says no.**
 
----
-
-## The story in one sentence
-
-Any team can train a model. What a regulated credit-risk platform has to prove is that
-**no model can reach production without passing an automated quality bar and a named
-human's approval — and that any model can be taken out of production in seconds.**
-
-Everything else in the demo supports that sentence.
+- **Total runtime:** ~35 min with narration. The setup phase runs beforehand.
+- **Workspace:** `https://dbc-aef35066-afa2.cloud.databricks.com`, catalog `workspace`
+- **Repo:** `github.com/anirvandecodes/databricks_mlops_platform`
 
 ---
 
-## Before the demo
+## The one sentence to open and close with
 
-### 1. Confirm the environment schemas exist (one-time)
+> **No model reaches production without passing an automated quality bar and a named
+> human's approval — and any model can be taken out of production in seconds.**
 
-```bash
-python scripts/bootstrap_uc.py --profile <profile> \
-  --catalog paypay_demo_catalog --prefix payments
+Say it at the start. Prove it in Act 3 and 4. Repeat it at the end. Every other detail
+supports that sentence; if you are short on time, cut anything else.
+
+---
+
+## The cast
+
+| Persona | Environment | Deploys how | Can promote to champion? |
+|---|---|---|---|
+| **Priya** — data scientist | `payments_dev` | `bundle deploy` from her laptop | Yes, instantly — dev serves no one |
+| **Sam** — reviewer | `payments_staging` | Merge a PR; CI deploys | Automatic, once CI proves the pipeline |
+| **Dana** — release manager | `payments_prod` | Push a `release/*` branch | **No — this is the point** |
+| **Ravi** — risk owner | `payments_prod` | Clicks Approve in GitHub | Yes, and only he can |
+
+The punchline of the whole demo: **Priya, who built the model, cannot put it in front of
+customers. Ravi, who did not build it, is the only one who can.**
+
+---
+
+## What each environment is for
+
+Worth drawing on a whiteboard before you touch a keyboard. It makes every later step obvious.
+
+```
+       payments_dev              payments_staging            payments_prod
+       ────────────              ────────────────            ─────────────
+Who    data scientists           nobody (CI only)            nobody (CD only)
+Deploy local laptop              GitHub Actions on merge      GitHub Actions on release/*
+Gate   none                      none                        GitHub approval + UC tag
+Speed  seconds                   ~7 min                      ~6 min, then waits for a human
+Point  iterate freely            prove the pipeline works     prove the model deserves traffic
 ```
 
-Idempotent: it creates `payments_dev`, `payments_staging`, `payments_prod` plus the audit
-Volume if missing, then verifies each is writable. Re-running it is the quickest way to check
-the environment is still sound.
+All three are **schemas in one catalog** (`workspace`), separated by grants. One code path,
+three targets, and the only differences are variables in `databricks.yml`:
 
-Requires `CREATE SCHEMA` on the catalog. If it reports `PERMISSION_DENIED`, have a workspace
-admin run the `CREATE SCHEMA` statements it prints.
+```yaml
+targets:
+  dev:      { variables: { schema_name: payments_dev,     approval_required: "false" } }
+  staging:  { variables: { schema_name: payments_staging, approval_required: "false" } }
+  prod:     { variables: { schema_name: payments_prod,    approval_required: "true"  } }
+```
 
-### 2. Deploy and prime dev
+> "The artifact promoted to production is the same code that passed staging. There is no
+> separate production branch of the pipeline, and no environment-specific `if` statements —
+> the difference is configuration, and configuration is reviewed in a pull request."
+
+---
+
+## Before the demo — setup checklist
+
+Run these **before the audience joins.** Nothing here is worth watching.
+
+### 1. Confirm the three schemas exist
 
 ```bash
 cd databricks_mlops_platform
+python scripts/bootstrap_uc.py --profile real-anirvan --catalog workspace --prefix payments
+```
+
+Idempotent. Creates `payments_dev` / `payments_staging` / `payments_prod` plus the audit
+Volume if missing, then verifies each is writable.
+
+Needs `CREATE SCHEMA` on the catalog — use an account that is in the workspace `admins`
+group. If it reports `PERMISSION_DENIED`, you are authenticated as the wrong user.
+
+### 2. Prime dev so the workspace looks alive
+
+```bash
 databricks bundle deploy -t dev
 databricks bundle run write_feature_table_job -t dev    # ~2 min
 databricks bundle run model_training_job -t dev         # ~4 min
 databricks bundle run batch_inference_job -t dev        # ~3 min
+databricks bundle run monitoring_job -t dev             # ~3 min, only if demoing Act 7
 ```
 
-You now have a champion model, a scored batch, decisions, and an audit trail — a system
-that already looks alive, which is a much better starting point than an empty workspace.
+An empty workspace is a bad opening. After this you have a champion, a scored batch,
+decisions and an audit trail.
 
-### 3. Have these tabs open
+The monitoring run is what creates `drift_check_results`, so skip it only if you are also
+skipping Act 7.
 
-1. **Workflows** — the five jobs
-2. **Models** → `credit_risk_model` → **Versions** (aliases and tags are the centrepiece)
-3. A **SQL editor** with the queries from Act 4 pasted in
-4. The repo in an editor, on `validation/validation.py`
+### 3. Check the production gate is armed
 
----
+**GitHub → Settings → Environments → production:**
 
-## Act 1 — Infrastructure as code (3 min)
+| Setting | Must be |
+|---|---|
+| Required reviewers | your account, added |
+| Prevent self-review | **unticked** — otherwise you cannot approve your own demo |
+| Wait timer | **unticked** — 15 minutes of dead air otherwise |
+| Deployment branches | `release/*` |
+| Allow administrators to bypass | **untick before demoing** — see the honesty note below |
 
-**Point:** the platform is a reviewable artifact, not a collection of clicked-together
-jobs.
-
-Show `databricks.yml`. Three targets, one code path. Everything environment-specific is a
-variable:
-
-```yaml
-dev:      schema_name: payments_dev      approval_required: "false"
-staging:  schema_name: payments_staging  approval_required: "false"
-prod:     schema_name: payments_prod     approval_required: "true"
-```
-
-> "The code that will run in production is the code that ran in staging. The only thing
-> that differs is configuration — and the configuration is in version control, so
-> tightening a governance rule is a pull request with an author and a reviewer, not a
-> console setting someone changed on a Tuesday."
-
-Then validate all three targets live:
+Verify from the terminal rather than trusting the UI:
 
 ```bash
-for t in dev staging prod; do databricks bundle validate -t $t; done
+gh api repos/anirvandecodes/databricks_mlops_platform/environments/production \
+  --jq '.protection_rules'
 ```
 
-> "A bad production variable fails here, on the pull request, not at release time."
+You want to see `required_reviewers` in that list.
+
+### 4. Decide your starting point for prod
+
+Check what production is currently serving:
+
+```bash
+databricks api get \
+  "/api/2.1/unity-catalog/models/workspace.payments_prod.credit_risk_model?include_aliases=true" \
+  --profile real-anirvan | python3 -c \
+  "import sys,json; print([(a['alias_name'],'v'+str(a['version_num'])) for a in json.load(sys.stdin).get('aliases',[])])"
+```
+
+If it already shows a `champion`, you have two honest options:
+
+- **Narrate it as a routine release** — "production is serving v2; we are shipping a
+  replacement." This is more realistic and needs no cleanup.
+- **Show a first deployment** — delete the `champion` alias so the gate demo starts from
+  nothing. The blocked message then reads *"production serves no champion yet (first
+  deployment)"*.
+
+Prefer the first. Real systems are never empty.
+
+### 5. Tabs to have open
+
+1. **GitHub → Actions** — the run list
+2. **GitHub → the open PR** (for Act 2)
+3. **Databricks → Catalog Explorer** → `workspace` → `payments_prod` → Models →
+   `credit_risk_model` → **Versions** ← *this tab is the centrepiece; the alias column is
+   where the story lands*
+4. **Databricks → Jobs & Pipelines**
+5. **SQL Editor** with the Act 5 queries pasted
+6. Editor open on `databricks_mlops_platform/validation/validation.py`
 
 ---
 
-## Act 2 — The governance chain (8 min) ★ the core of the demo
+# Act 1 — Priya works in dev (6 min)
 
-### 2a. Show the chain
+**Persona:** data scientist. **Message:** *fast, unceremonious, because dev serves nobody.*
 
-Open `resources/model-workflow-resource.yml`. Four tasks, strictly ordered:
+### 1a. Show that the environments are code
+
+Open `databricks_mlops_platform/databricks.yml`. Point at the `targets:` block from the
+table above.
+
+> "Three environments, one file. When Priya wants a new environment she adds six lines and
+> opens a pull request — she does not file a ticket with a platform team."
+
+### 1b. Change something a data scientist would actually change
+
+Open `validation/validation.py` and show the quality thresholds — the automated bar a model
+must clear before any human is even asked.
+
+> "These are the numbers a risk team argues about. They are in version control, so changing
+> the bar is a reviewed pull request, not a conversation someone half-remembers."
+
+### 1c. Deploy from the laptop
+
+```bash
+databricks bundle deploy -t dev
+```
 
 ```
-Train  →  ModelValidation  →  ApprovalGate  →  ModelDeployment
+Uploading bundle files to /Workspace/Users/.../.bundle/databricks_mlops_platform/dev/files...
+Deploying resources...
+Deployment complete!
 ```
 
-> "Each task can block the next but never skip it. There is no path from 'a model was
-> trained' to 'a model serves traffic' that bypasses validation and approval."
+Show **Jobs & Pipelines** — five jobs prefixed `[dev <username>]`.
 
-Point out what `Train` does **not** do:
+> "The prefix matters: development mode namespaces every asset per user, so two data
+> scientists deploying at once cannot collide. Same code, isolated workspaces."
 
-```python
-register_challenger(names.model_name, model_version)
-print("@champion is unchanged.")
-```
-
-> "Training registers a *candidate*. Nothing that serves traffic is touched. That
-> separation is what makes the next step meaningful."
-
-### 2b. Run it in dev — the happy path
+### 1d. Train, and watch dev promote immediately
 
 ```bash
 databricks bundle run model_training_job -t dev
 ```
 
-Real output:
+Open the run and show the four tasks:
 
 ```
-Task Train:            models:/paypay_demo_catalog.payments_dev.credit_risk_model/6
-Task ModelValidation:  PASSED
-Task ApprovalGate:     AUTO_APPROVED
-Task ModelDeployment:  PROMOTED:6
+Train           → SUCCESS
+ModelValidation → SUCCESS
+ApprovalGate    → SUCCESS   ← passes automatically here
+ModelDeployment → SUCCESS
 ```
 
-> "In dev the gate is deliberately open — `approval_required=false` — because data
-> scientists need to iterate without asking permission. Same code, different config."
+Then the Models tab: `champion` has moved to the new version.
 
-### 2c. Now the production behaviour ★ the moment that sells it
+> "In dev the gate is configured off, so Priya iterates at full speed. That is deliberate:
+> a gate that slows down experimentation gets worked around. Nothing in dev serves a
+> customer, so there is nothing to protect."
+
+**Contrast to plant now, because it pays off in Act 3:** *"Remember that ApprovalGate task
+succeeded. Watch what the identical task does in production."*
+
+---
+
+# Act 2 — Sam reviews the code, staging proves the pipeline (7 min)
+
+**Persona:** reviewer. **Message:** *this is the CODE gate. It says nothing about the model.*
+
+### 2a. Open the pull request
+
+Show the checks running on any PR:
+
+| Check | What it proves |
+|---|---|
+| `lint` | Workflow YAML and shell are valid |
+| `unit_tests` | 83 tests — transforms, PSI maths, gate logic, policy rules |
+| `integration_tests` | 25 tests against real Unity Catalog |
+| `validate (dev/staging/prod)` | The bundle resolves for **all three** targets |
+| `staging_integration` | Deploys to staging and runs the entire pipeline end to end |
+
+> "Notice prod is validated on every pull request. A bad production variable is caught while
+> the change is still reviewable, not at release time."
+
+### 2b. The check that earns its keep
+
+Point specifically at `staging_integration`.
+
+> "This deploys to staging and runs feature engineering, training, validation, the gate and
+> batch inference — about seven minutes. It is expensive, and it has caught every defect
+> that mattered while this platform was built: an MLflow API rename, a schema mismatch
+> between the baseline and inference tables, an SDK argument that is valid on create but
+> rejected on update. None were visible to unit tests."
+
+**A real example, if you want one** (it is a good story because it is unflattering):
+
+> "During development, 83 unit tests passed while Unity Catalog rejected every single model
+> registration — the test fixture logged models without a signature, which UC requires. Only
+> the integration tier caught it."
+
+### 2c. Merge, and staging promotes itself
+
+Merge the PR. Show **Actions** → *Staging CD* firing on `main`:
+
+```
+Deploy bundle to staging    → Deployment complete!
+Refresh features            → FEATURES_WRITTEN
+Train, validate and promote → TERMINATED SUCCESS
+Score and decide            → SCORED:199  DECISIONS:199
+```
+
+Show staging's Models tab — `champion` has moved.
+
+> "Staging runs the whole chain unattended, including promotion. The point of staging is to
+> prove the *pipeline* works. Production exists to decide whether the *model* deserves
+> traffic. Two different questions, two different gates."
+
+---
+
+# Act 3 — Dana cuts a release, and the system says no (7 min) ★★★
+
+**Persona:** release manager. **Message:** *this is the moment the platform earns its
+description.*
+
+### 3a. Cut the release branch
 
 ```bash
-databricks bundle deploy -t prod
-databricks bundle run model_training_job -t prod
+git checkout main && git pull
+git checkout -b release/2026-08-demo
+git push -u origin release/2026-08-demo
 ```
 
-The job **fails**, by design:
+> "Each release is its own branch, so the branch name records which release a given
+> promotion belonged to. Production CD triggers on `release/**` and nothing else."
+
+### 3b. Narrate while it runs (~6 min)
+
+Show **Actions** → *Prod CD*. Three jobs:
+
+```
+deploy                    ✅  pushes code + job definitions — changes no alias
+train_and_stage_candidate ✅  trains, validates, stages @challenger
+promote                   ⏸  WAITING FOR APPROVAL
+```
+
+Talk through why `deploy` is safe while the first two run:
+
+> "Deploying to production is not the same as changing what production serves. The deploy
+> step updates code and job definitions; the model alias is untouched, so production keeps
+> serving whatever it was serving. Those are separate operations on purpose."
+
+### 3c. The moment — GitHub stops
+
+The `promote` job shows:
+
+```
+Waiting for review: production needs approval to start deploying changes.
+Review pending deployments
+```
+
+> "The pipeline has trained a model, validated it against the thresholds, and staged it as
+> a challenger. And then it stopped. Dana cut this release. Dana cannot complete it."
+
+### 3d. Prove it in Unity Catalog ← do not skip this
+
+Switch to the **Catalog Explorer** tab. Refresh.
+
+```
+Version 3   validation_f1_...  +4   @challenger
+Version 2   validation_f1_...  +4   @champion
+```
+
+Point at the alias column and pause.
+
+> "The new version exists. It passed validation. It carries `@challenger`. It does **not**
+> carry `@champion`. Production is still serving version 2, and every scoring job resolves
+> `models:/credit_risk_model@champion` at run time — so not one prediction has changed."
+
+**This is the single most important screen in the demo.** Let it sit.
+
+### 3e. Show the gate is a technical control, not a convention
+
+Open the `train_and_stage_candidate` job log and find the `ApprovalGate` task failure:
 
 ```
 ======================================================================
 PROMOTION BLOCKED — approval required in environment 'prod'.
 ======================================================================
-Model  : paypay_demo_catalog.payments_prod.credit_risk_model
-Version: 5
-
-No 'approval_status' tag on version 5. A reviewer must set
+Model  : workspace.payments_prod.credit_risk_model
+Version: 3
+No 'approval_status' tag on version 3. A reviewer must set
 approval_status=approved on the model version to authorise promotion.
-
-Production keeps serving champion v4 until then.
 ======================================================================
 ```
 
-Switch to the Models tab and show the aliases:
+> "That is the job failing — deliberately. Remember the ApprovalGate task that succeeded in
+> dev? Identical code, identical task, one variable different: `approval_required=true`. The
+> gate is not documentation or a checklist. It is a pipeline that stops."
 
-| Alias | Version | Meaning |
-|---|---|---|
-| `@champion` | **v4** | still serving production traffic |
-| `@challenger` | **v5** | trained, validated, quarantined |
+**If someone asks about the red X:** the Databricks job genuinely failed; the workflow
+expects that and reports "Candidate awaiting approval" instead of a failure. The block is
+the feature.
 
-> "This is the whole design in one screen. The model trained fine and passed validation —
-> then stopped. Production is still serving the last approved model. Nobody had to
-> intervene to make that safe; it is the default."
+---
 
-### 2d. Approve as a reviewer
+# Act 4 — Ravi approves, with the evidence in front of him (6 min) ★★
 
-In the Models UI, on version 5, add tags:
+**Persona:** risk owner. **Message:** *an informed decision by a named human, recorded as a
+governed object.*
+
+### 4a. Show what the reviewer sees
+
+On the paused run, the candidate's metrics are surfaced with the approval request:
+
+```
+status PASSED | f1 score 0.6720 | precision score 0.5615 | recall score 0.8367 | roc auc 0.8712
+```
+
+> "Ravi is not asked to approve 'the deployment'. He is asked to approve *this version*, and
+> he can see how it performed before he decides. An approval request without the numbers is
+> a rubber stamp."
+
+### 4b. Approve
+
+Click **Review deployments** → tick `production` → **Approve and deploy**.
+
+### 4c. Show what the approval became
+
+The `promote` job runs three steps:
+
+```
+Record the reviewer's approval in Unity Catalog  ✅
+Promote the approved version to champion         ✅
+Summarise                                        ✅
+```
+
+Back in **Catalog Explorer**, refresh and open the version's **Tags**:
 
 ```
 approval_status = approved
-approved_by     = risk.reviewer
+approved_by     = anirvandecodes        ← the GitHub user who clicked
+validation_status = PASSED
+validation_roc_auc = 0.8712
 ```
 
-> "The approval is a Unity Catalog tag, so it is itself a governed object — versioned,
-> permissioned, and captured in lineage. It isn't a Slack message or a ticket comment."
+And the alias column now reads `@champion`.
 
-Re-run only the gate:
+> "The approval is a Unity Catalog tag — a governed object. It is versioned, permissioned
+> and visible in lineage. It is not a Slack message, a ticket comment, or a spreadsheet
+> someone maintains. An auditor asking 'who approved the model that made this decision' has
+> a queryable answer."
 
-```bash
-databricks bundle run model_training_job -t prod --only ApprovalGate
-```
+### 4d. The design point worth stating explicitly
 
-```
-APPROVED
-```
-
-> "Re-running one task, not the whole pipeline. The reviewer's decision is the only thing
-> that changed."
+> "The GitHub click and the Unity Catalog tag are **one decision recorded in two places**,
+> not two separate reviews. Approving writes the tag; the in-pipeline gate re-reads it before
+> moving any alias. So there is exactly one place that decides whether a version may serve
+> traffic, and it is enforced even if someone bypasses GitHub entirely and runs the job by
+> hand."
 
 ---
 
-## Act 3 — Rollback (3 min)
+# Act 5 — The audit trail (5 min)
 
-**Point:** promotion and rollback are the same cheap operation in opposite directions.
+**Message:** *every promotion is evidence, produced automatically.*
+
+### 5a. Query the promotion log
+
+```sql
+SELECT environment, promoted_version, approver, decision, git_commit
+FROM workspace.payments_prod.promotion_audit_log
+ORDER BY recorded_at DESC
+LIMIT 5;
+```
+
+Real output from this workspace:
+
+```
+prod | 2 | anirvandecodes | APPROVED_AND_PROMOTED |
+url:https://github.com/anirvandecodes/databricks_mlops_platform;
+branch:release; commit:eb2e6162d7cf81a21db2906a34f161e365b249f2
+```
+
+> "Environment, version, approver, decision, and the exact commit. From a production
+> prediction you can reach the model version, the approver, the training data version, and
+> the line of code — without asking anyone to remember anything."
+
+### 5b. The immutable evidence package
+
+```sql
+LIST '/Volumes/workspace/payments_prod/audit_logs';
+```
+
+```
+approval_workspace_payments_prod_credit_risk_model_v2_2026-08-03T18-01-39.259656+00-00.json
+```
+
+> "The Delta table is the queryable index; the Volume holds the full JSON evidence package.
+> Volumes are append-only governed storage, so the evidence cannot be quietly edited later."
+
+### 5c. Full column list, if asked
+
+`timestamp`, `model_name`, `promoted_version`, `environment`, `approver`, `decision`,
+`evaluation_summary`, `training_data_version`, `git_commit`, `mlflow_run_id`,
+`evidence_path`, `recorded_at`.
+
+---
+
+# Act 6 — Rollback: the gate must never prolong an incident (4 min)
+
+**Persona:** on-call engineer at 2am. **Message:** *controls are asymmetric on purpose.*
 
 ```bash
-databricks bundle run rollback_job -t dev
+databricks bundle run rollback_job -t prod
 ```
 
-```
-ROLLED_BACK:5
-```
+Champion reverts to the previous version in seconds. Show the alias moving back.
 
-Show the alias moving v6 → v5 in the Models tab.
+> "Rollback is deliberately **not** gated on approval. Requiring sign-off to *stop* serving
+> a bad model would extend the incident. The gate exists to control what goes live, not to
+> obstruct taking something down."
 
-> "Seconds. No redeployment, no retraining, no code change. Every scoring job resolves
-> `models:/…@champion` at run time, so re-pointing the alias is the rollback."
+> "And it is one alias write — no redeploy, no retraining. That is the payoff of alias-based
+> promotion: recovery is a metadata operation, so it takes seconds and cannot fail halfway."
 
-Then the deliberate design decision:
+Note it is still fully audited: the rollback writes its own audit row.
 
-> "Note that rollback is **not** gated on approval. Requiring sign-off to *stop* serving a
-> bad model would extend the incident. The gate controls what goes live; it must not
-> obstruct taking something down. The rollback is still fully audited."
-
-Target a specific version:
+**Target a specific version if asked:**
 
 ```bash
-databricks bundle run rollback_job -t dev \
-  --params target_version=4,reason="AUC decay observed in production"
+databricks bundle run rollback_job -t prod --params target_version=1
 ```
 
 ---
 
-## Act 4 — Audit, monitoring, and the decision layer (8 min)
+# Act 7 — Drift and gated retraining (5 min, optional)
 
-### 4a. The audit trail
+**Message:** *automation responds to drift, but automation never promotes.*
 
-```sql
-SELECT promoted_version, environment, approver, decision, evaluation_summary
-FROM paypay_demo_catalog.payments_dev.promotion_audit_log
-ORDER BY recorded_at DESC;
-```
-
-Real output:
-
-| version | environment | approver | decision |
-|---|---|---|---|
-| 5 | dev | rollback-operator:dev | ROLLED_BACK |
-| 6 | dev | service-principal:dev | APPROVED_AND_PROMOTED |
-| 4 | dev | service-principal:dev | APPROVED_AND_PROMOTED |
-| 3 | dev | service-principal:dev | APPROVED_AND_PROMOTED |
-
-> "Two things worth noticing. First, both directions of every alias move are recorded —
-> promotions and rollbacks. Second, look at which version is **missing**: v5 was blocked,
-> so it has no promotion record. The audit trail proves the gate held."
-
-Each row carries the metrics the approver actually saw:
-
-```json
-{"roc_auc": 0.871, "pr_auc": 0.738, "precision_score": 0.562,
- "recall_score": 0.837, "f1_score": 0.672}
-```
-
-And the immutable evidence files:
-
-```sql
-LIST '/Volumes/paypay_demo_catalog/payments_dev/audit_logs';
-```
-
-> "Unity Catalog system tables already track *what* happened. The Volume answers *on what
-> basis* — the metrics, the training-data Delta version, the approver, at the moment of
-> the decision. That's what an auditor asks for."
-
-### 4b. Drift monitoring and gated retraining
+**Setup required —** `drift_check_results` is created by the monitoring job, so it does not
+exist until that job has run at least once. Run this during setup, not live:
 
 ```bash
-databricks bundle run monitoring_job -t dev
+databricks bundle run monitoring_job -t dev      # ~3 min
 ```
 
-```
-Task SetupMonitor:  MONITOR_READY
-Task DriftCheck:    STABLE
-```
+Then the table is queryable:
 
 ```sql
-SELECT feature, round(psi, 4) AS psi, verdict
-FROM paypay_demo_catalog.payments_dev.drift_check_results
-ORDER BY psi DESC;
+SELECT * FROM workspace.payments_dev.drift_check_results ORDER BY checked_at DESC LIMIT 5;
 ```
 
-| feature | psi | verdict |
-|---|---|---|
-| age | 0.0663 | STABLE |
-| credit_amount | 0.0559 | STABLE |
-| monthly_instalment | 0.0284 | STABLE |
+The monitoring job computes PSI per feature against the training baseline:
 
-> "PSI is the metric credit-risk teams actually govern on, and it isn't built into
-> Lakehouse Monitoring. We register it once as a Unity Catalog function, so the credit team
-> and the fraud team compute drift with the identical audited formula. Our integration
-> tests assert the SQL matches the Python implementation — the tested logic *is* the
-> deployed logic."
+- PSI > 0.10 → warning
+- PSI > 0.25 → triggers retraining
 
-**If you want to show a breach** (adds ~6 min), inject a shifted cohort:
+> "PSI is registered as a Unity Catalog function, so every team computes drift with the same
+> audited formula rather than each re-implementing it. An integration test asserts the SQL
+> matches the Python reference."
 
-```sql
-INSERT INTO paypay_demo_catalog.payments_dev.inference_log
-SELECT customer_id, duration*3, credit_amount*5, age+35, installment_commitment,
-       monthly_instalment*4, credit_to_age_ratio*3, prediction, model_version,
-       scored_at, ground_truth
-FROM paypay_demo_catalog.payments_dev.inference_log LIMIT 150;
-```
+The critical point:
 
-Re-run `monitoring_job`. Real result:
-
-| feature | psi | verdict |
-|---|---|---|
-| age | 0.9432 | RETRAIN |
-| monthly_instalment | 0.5922 | RETRAIN |
-| duration | 0.4709 | RETRAIN |
-| installment_commitment | 0.0139 | STABLE |
-
-> "It caught the four features I shifted and left the one I didn't alone — the metric is
-> discriminating, not just alarming."
-
-Then the governance point:
-
-> "Drift triggered *retraining*, and the retrained model entered as a **challenger**. In
-> production it stops at the same approval gate. Automated drift response must never become
-> an unreviewed path into production — otherwise it's a back door around everything we just
-> showed."
-
-Afterwards, clean up: `TRUNCATE TABLE paypay_demo_catalog.payments_dev.inference_log;` then re-run
-`batch_inference_job`.
-
-### 4c. The decision layer
-
-```sql
-SELECT risk_band, count(*) AS applicants,
-       round(avg(prediction), 3) AS avg_pd,
-       round(avg(offered_credit_limit), 0) AS avg_limit
-FROM paypay_demo_catalog.payments_dev.credit_decisions
-GROUP BY risk_band ORDER BY risk_band;
-```
-
-| risk_band | applicants | avg_pd | avg_limit |
-|---|---|---|---|
-| BAND_B_MEDIUM_RISK | 73 | 0.212 | 2096 |
-| BAND_C_HIGH_RISK | 121 | 0.351 | 1846 |
-| BAND_D_EXCESSIVE_RISK | 5 | 0.505 | 0 |
-
-Open `decision_layer/policy.py`.
-
-> "The model predicts a probability of default. That is *all* it does — it does not decide
-> whether to grant credit. Eligibility rules, risk bands and limit caps are separate SQL
-> functions in Unity Catalog."
-
-> "That split matters because policy changes far more often than models. A regulator caps a
-> limit, or risk tightens a band — that ships as a function update, with no retraining, no
-> re-scoring, and no model risk review. And note the hard filters run *before* the
-> probability bands, so a very low PD can never override a KYC failure."
-
-```sql
-SELECT rejection_reason, count(*) FROM paypay_demo_catalog.payments_dev.credit_decisions
-GROUP BY rejection_reason;
-```
-
-> "Every rejection carries a deterministic reason code. When someone asks why an applicant
-> was declined, the answer is a value in a column, not a model interpretation exercise."
+> "A drift breach triggers model *building*, never model *promotion*. The retrained model
+> enters as a challenger and faces exactly the same gate Ravi just used. Automated drift
+> response is never an unreviewed path into production."
 
 ---
 
-## Act 5 — Testing (3 min)
+# Closing (2 min)
 
-```bash
-pytest tests/unit -q         # 83 tests, ~45s, no cluster needed
-pytest tests/integration -q  # 19 tests against a real workspace
-```
+Return to the opening sentence and show it was earned:
 
-> "Three tiers. Unit tests run offline on every commit — feature transforms, the PSI
-> formula, the promotion gate, the policy rules. Integration tests verify the same logic
-> against real Unity Catalog. And the staging integration test runs the entire pipeline on
-> every pull request."
-
-Worth saying plainly:
-
-> "That third tier is not ceremony. Building this platform, the staging run caught an MLflow
-> API rename, a schema mismatch between the drift baseline and the inference log, and an SDK
-> argument that is valid on create but rejected on update. None of those were visible to
-> unit tests or to bundle validation. The pipeline has to actually run."
-
----
-
-## Closing
-
-Return to the one sentence:
-
-> "No model reaches production without an automated quality bar and a named human's
-> approval, and any model can be removed in seconds. Everything else — the drift
-> monitoring, the decision layer, the audit Volume — exists to make that claim
-> defensible to an auditor."
-
-### What this maps to in the design document
-
-| Design section | Where it is in the repo |
+| Claim | Where you proved it |
 |---|---|
-| §3.3 Unity Catalog layout | `databricks.yml` variables, `platform_utils/naming.py` |
-| §3.4 Config-driven template | `platform_utils/` as a shared layer; project code stays thin |
-| §3.5 CI/CD golden path | `.github/workflows/*` |
-| §3.6 Two-stage approval + rollback | `deployment/approval/`, `deployment/model_deployment/` |
-| §3.7 Monitoring & retraining | `monitoring/`, `platform_utils/metrics.py` |
-| §3.11 Testing strategy | `tests/unit/`, `tests/integration/` |
-| §3.15 Decision layer | `decision_layer/` |
+| Automated quality bar | Act 2 — validation thresholds in code, tested |
+| Named human's approval | Act 4 — `approved_by` tag, `@champion` moved only after the click |
+| Cannot be bypassed | Act 3 — the pipeline failed rather than promoted |
+| Removed in seconds | Act 6 — one alias write, ungated |
+| Auditable | Act 5 — approver + commit + data version, queryable |
 
-### Known gaps — say these before you are asked
+Then the persona point:
 
-- **Distributed HPO (§3.14)** is not built. Training uses fixed hyperparameters. The
-  Optuna-with-Ray pattern is straightforward to add but was out of scope here.
-- **Real-time serving and the online feature store (§3.8/§3.9)** are not built. This is a
-  batch platform; the alias-based promotion design carries over to serving endpoints
-  unchanged.
-- **FinOps tagging and budgets (§3.12)** are not implemented.
-- **Approval is a UC tag**, not a portal click. Wiring it to an internal developer portal
-  is an integration exercise; the control itself is already enforced.
-- Schema-per-environment is a **weaker** isolation posture than catalog-per-environment.
-  It is used here because the demo workspace denies `CREATE CATALOG`. Because both are
-  addressed through the same variables, migrating is a config change per target — no
-  pipeline code moves.
+> "Priya built the model and cannot ship it. Dana can cut a release and cannot complete it.
+> Ravi did not build the model and is the only person who can put it in front of customers.
+> That separation is enforced by the platform, not by policy."
 
-### If the demo breaks
+---
+
+## Known gaps — say these before you are asked
+
+Volunteering limitations builds far more credibility than being caught by them.
+
+**Lakehouse Monitoring is unavailable on Databricks Free Edition.** The quality-monitors API
+is not served there at all, even to a workspace admin. `SetupMonitor` detects this and exits
+`MONITOR_UNSUPPORTED` rather than failing the pipeline. Drift detection still works — PSI is
+computed from the UC function against the baseline table — but the *managed* profile and
+drift metric tables are absent. On a paid workspace this gap disappears.
+
+**Separation of duties is demonstrated, not enforced, in this instance.** The repo has a
+single owner, so the same person plays every persona. The *mechanism* is real — the pipeline
+genuinely cannot promote without an approval, and the approver's identity is recorded. But in
+a real deployment the required reviewer would be a risk-owner team that excludes the model
+authors. Say this plainly; do not imply this instance proves independent review.
+
+**Admin bypass.** If "Allow administrators to bypass configured protection rules" is left
+ticked on the production environment, a repo admin can skip the approval gate. Untick it
+before demoing, or state that it is on.
+
+**Not built:** distributed hyperparameter tuning, real-time serving and the online feature
+store, FinOps tagging and budgets. Approval is a GitHub review plus a UC tag rather than a
+developer-portal integration — the control is enforced; the portal is not built.
+
+---
+
+## If the demo breaks
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `Schema ... does not exist` | bootstrap not run | `scripts/bootstrap_uc.py`, or pass `--var schema_name=<owned schema>` |
-| `No @champion alias` | scored before training | run `model_training_job` first |
-| Gate does not block | `approval_required` baked at deploy time | re-**deploy** with the variable set; `--var` on `run` alone will not change it |
-| Monitor task fails | inference log missing | run `batch_inference_job` first |
-| Token refresh timeout | transient | re-run the command |
+| `PERMISSION_DENIED` on schema or catalog | authenticated as a non-admin account | use an account in the workspace `admins` group |
+| Prod CD does not trigger | branch is not `release/*`, or the environment's deployment-branch rule does not match | check the rule is `release/*`, not the literal `release` |
+| `promote` runs without pausing | required reviewers not configured | Settings → Environments → production → Required reviewers |
+| Approval button greyed out | "Prevent self-review" is ticked | untick it, or approve from a second account |
+| Long pause before the approval prompt | wait timer is set | untick Wait timer |
+| `ApprovalGate` fails in dev or staging | `approval_required` accidentally `"true"` | check the target's variables in `databricks.yml` |
+| SQL query returns `PENDING` forever | serverless warehouse is cold | re-run; first query after idle takes ~30s |
+| Job fails on `mlflow` import | notebook `%pip install` step was skipped | re-run the job from the top, not a single task |
+
+**Recovering mid-demo:** the state that matters is the `@champion` alias. If a run leaves
+production in an odd state, `databricks bundle run rollback_job -t prod` restores the previous
+champion in seconds — and doing that in front of the audience is itself a good demo of Act 6.
