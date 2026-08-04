@@ -20,7 +20,7 @@
 # in two places, not two independent reviews: approving here writes the tag, and the
 # in-pipeline gate then re-checks it. That keeps a single enforcement point for "may this
 # version serve traffic" while leaving an audit trail next to the model.
-name: Prod CD for databricks_mlops_platform
+name: Release to production
 
 on:
   push:
@@ -45,6 +45,7 @@ env:
 
 jobs:
   deploy:
+    name: 1 · Deploy code (no model change)
     runs-on: ubuntu-latest
     concurrency: prod-bundle-deploy
     steps:
@@ -63,6 +64,7 @@ jobs:
   # production serves, so it needs no sign-off — and gating this job would ask a reviewer
   # to approve a model that does not exist yet, before any metric has been computed.
   train_and_stage_candidate:
+    name: 2 · Train and stage a candidate
     needs: deploy
     runs-on: ubuntu-latest
     concurrency: prod-training
@@ -124,6 +126,7 @@ jobs:
   # reviewers configured GitHub runs this job immediately, which makes the gate cosmetic —
   # the in-pipeline ApprovalGate still holds, but the pause a reviewer expects will not happen.
   promote:
+    name: 3 · Awaiting approval to promote
     needs: train_and_stage_candidate
     runs-on: ubuntu-latest
     concurrency: prod-promotion
