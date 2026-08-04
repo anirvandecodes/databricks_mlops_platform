@@ -207,6 +207,18 @@ decisions and an audit trail.
 The monitoring run is what creates `drift_check_results`, so skip it only if you are also
 skipping Act 7.
 
+If you are demoing Act 7h (the managed monitor), give its first refresh a few minutes and then
+confirm both of these before you present — details and fallbacks in 7h:
+
+```bash
+databricks quality-monitors get workspace.payments_dev.inference_log \
+  --profile real-anirvan | grep '"status"'          # want MONITOR_STATUS_ACTIVE
+```
+
+```sql
+SELECT count(*) FROM workspace.payments_dev.inference_log_profile_metrics;  -- want > 0
+```
+
 ### 3. Check the production gate is armed
 
 **GitHub → Settings → Environments → production:**
@@ -259,6 +271,9 @@ Prefer the first. Real systems are never empty.
 4. **Databricks → Jobs & Pipelines**
 5. **SQL Editor** with the Act 5 queries pasted
 6. Editor open on `databricks_mlops_platform/validation/validation.py`
+7. For Act 7: **Catalog Explorer → `payments_dev` → `inference_log` → Quality** tab, and the
+   generated `inference_log Monitoring` dashboard opened from it — loading that dashboard cold
+   in front of an audience is slow
 
 ---
 
@@ -595,7 +610,7 @@ databricks bundle run rollback_job -t prod --params target_version=1
 
 ---
 
-# Act 7 — Drift monitoring and gated retraining (8 min)
+# Act 7 — Drift monitoring and gated retraining (8 min, + 3 for 7h)
 
 **Message:** *automation notices drift and responds to it — but automation never promotes.*
 
@@ -800,17 +815,19 @@ inference log table. (Data profiling is the current name for what was called Lak
 Monitoring; the SDK namespace is still `w.quality_monitors`, and Databricks groups it under
 "data quality monitoring" alongside anomaly detection.)
 
-Verified working on this workspace — the job reports:
+**How to demo this — three beats, about 3 minutes.**
 
-```
-Task SetupMonitor: MONITOR_READY
+**Beat 1 — the monitor exists and is managed, not hand-built.** Start in the UI, because the
+point is that nobody wrote this: **Catalog Explorer → `workspace.payments_dev.inference_log`
+→ Quality** tab. It shows the monitor's status, its refresh history, and a link to a generated
+dashboard.
 
-Monitor will populate:
-  profile metrics: workspace.payments_dev.inference_log_profile_metrics
-  drift metrics  : workspace.payments_dev.inference_log_drift_metrics
-```
+> "I did not build this tab, and I did not write a line of SQL for it. The pipeline attached a
+> monitor to the inference table, and Databricks profiles every column, computes drift against
+> the training baseline, and generates a dashboard from that."
 
-Confirm the monitor is live:
+If someone asks whether it is really deployed rather than clicked together by hand, show it
+from the CLI — this is also your pre-demo health check:
 
 ```bash
 databricks quality-monitors get \
@@ -818,21 +835,51 @@ databricks quality-monitors get \
   --profile real-anirvan
 ```
 
-This reports `"status": "MONITOR_STATUS_ACTIVE"`. Refresh history is
-`databricks quality-monitors list-refreshes <table>`. (The older
-`/api/2.0/lakehouse-monitoring/...` REST path no longer resolves and returns `Not Found`;
-the equivalent REST call is now `/api/2.1/unity-catalog/tables/<table>/monitor`.)
+Read out three fields from the response: `"status": "MONITOR_STATUS_ACTIVE"`,
+`"baseline_table_name"` pointing at `baseline_snapshot`, and the `inference_log` block showing
+`problem_type`, `prediction_col`, `label_col` and `timestamp_col`.
 
-One caveat when demoing a freshly seeded schema: **profile** metrics appear after the first
-refresh, but the **drift** table stays empty until there are two windows to compare. A single
-scoring run writes one `scored_at` value, so it produces one `1 day` window and nothing to
-diff — and if `ground_truth` is still NULL, label-dependent metrics cannot compute either.
-Score a second batch on a later day and join in `ground_truth_outcomes` before relying on the
-drift table on screen. The custom PSI layer below has no such dependency and is what section
-7g demonstrates.
+> "It knows this is a classification model, which column is the prediction, which is the
+> label, and which is the timestamp. That is what makes it a *model* monitor rather than a
+> generic table profiler."
 
-Or in the UI: **Catalog Explorer → `inference_log` → Quality** tab, which shows the monitor
-status and links to the generated dashboard.
+**Beat 2 — open the generated dashboard.** From the Quality tab, click through to the
+dashboard (`inference_log Monitoring`, under `/Shared/monitoring/payments_dev/...`). This is
+the strongest single visual in the act — a dashboard the team gets for free.
+
+> "Six months after go-live, this is the page the model owner opens on a Monday morning. It
+> came with the pipeline."
+
+**Beat 3 — show the metric table underneath, for the technical audience.** The dashboard is
+backed by a plain Unity Catalog table, which is the part an engineer or an auditor cares
+about:
+
+```sql
+SELECT column_name, log_type, count, num_nulls, round(avg, 2) AS mean
+FROM workspace.payments_dev.inference_log_profile_metrics
+WHERE slice_key IS NULL
+  AND (log_type = 'BASELINE' OR model_version = '*')
+  AND column_name IN ('credit_amount', 'age')
+ORDER BY column_name, log_type;
+```
+
+Verified output on this workspace:
+
+```
+age            BASELINE  800  0    35.32
+age            INPUT     199  0    36.70
+credit_amount  BASELINE  800  0  3189.59
+credit_amount  INPUT     199  0  3154.38
+```
+
+> "`BASELINE` is the training distribution, `INPUT` is what production actually scored. Same
+> table, side by side, queryable by anyone with SELECT. Nothing here is locked inside a
+> monitoring product."
+
+Two filters in that query are worth knowing so a stray row does not confuse you on screen:
+`slice_key IS NULL` takes the whole-population rows rather than the per-slice breakdowns, and
+`model_version = '*'` takes the all-versions rollup — without it each live window appears
+twice, once per version and once for `*`.
 
 > "So there are two layers of monitoring, and they answer different questions. Data profiling
 > is the managed layer: it profiles every column, computes drift against the baseline, and
@@ -840,18 +887,47 @@ status and links to the generated dashboard.
 > one: a single audited formula in Unity Catalog with an explicit, thresholded retraining
 > branch that a risk owner tunes by pull request."
 
-**Timing note for the demo:** the metric tables are declared as soon as the monitor is
-created, but they are not materialised until the monitor's first refresh — several minutes,
-sometimes longer on a small serverless warehouse. Querying them too early returns
-`TABLE_OR_VIEW_NOT_FOUND`. Check before you present:
+#### Check these before you present
 
-```sql
-SELECT count(*) FROM workspace.payments_dev.inference_log_profile_metrics;
+Two states will embarrass you live. Both are expected on a freshly seeded schema, and both
+have a clean way to handle them on screen.
+
+**1. Metric tables not materialised yet.** The tables are declared when the monitor is
+created but only filled by its first refresh — several minutes, sometimes longer on a small
+serverless warehouse. Querying too early returns `TABLE_OR_VIEW_NOT_FOUND`.
+
+```bash
+databricks quality-monitors list-refreshes \
+  workspace.payments_dev.inference_log --profile real-anirvan
 ```
 
-If it errors, either wait for the refresh or show the **Quality** tab and the custom
-`drift_check_results` table instead — the governance story does not depend on the managed
-tables.
+Wait for a refresh with `"state": "SUCCESS"`. To force one rather than wait for the schedule:
+`databricks quality-monitors run-refresh <table>`. If it still is not ready, skip Beat 3 and
+stay on the Quality tab and `drift_check_results` — the governance story does not depend on
+the managed tables.
+
+(The CLI prints a deprecation notice pointing at a newer `/api/data-quality/v1/monitors` API.
+That endpoint is **not served on this workspace yet** — it answers "No API found" — so the
+`quality-monitors` commands above remain the ones to use here. Worth knowing if an audience
+member notices the notice.)
+
+**2. The drift metrics table is empty — expect this, and say so.** `inference_log_drift_metrics`
+has 0 rows on a fresh schema even though the monitor is healthy. Drift compares consecutive
+windows, and a single scoring run writes one `scored_at` value, so there is one `1 day` window
+and nothing to diff. Separately, if `ground_truth` is still NULL in the inference log, no
+label-dependent metric can compute.
+
+Do not open that table cold and improvise. Either avoid it, or use it as the honest point it
+actually is:
+
+> "Drift on the managed layer needs two time windows to compare, and this schema has been
+> scored once. In production it fills in overnight. That is exactly why the custom PSI layer
+> exists — it compares live against the training baseline, so it gives a verdict on day one
+> rather than on day two."
+
+To make it populate for a demo that needs it: score a second batch on a later day (or backdate
+`scored_at` across two days), join in `ground_truth_outcomes` to supply labels — it already
+holds 1000 rows in dev — then refresh the monitor.
 
 **Why the code tolerates the feature being absent:** `SetupMonitor` catches the
 endpoint-absent response and exits `MONITOR_UNSUPPORTED` rather than failing, because a
@@ -919,6 +995,9 @@ developer-portal integration — the control is enforced; the portal is not buil
 | `ApprovalGate` fails in dev or staging | `approval_required` accidentally `"true"` | check the target's variables in `databricks.yml` |
 | SQL query returns `PENDING` forever | serverless warehouse is cold | re-run; first query after idle takes ~30s |
 | Job fails on `mlflow` import | notebook `%pip install` step was skipped | re-run the job from the top, not a single task |
+| `Not Found` checking the monitor over REST | the `/api/2.0/lakehouse-monitoring/...` path is retired | use `databricks quality-monitors get <table>`, or REST `/api/2.1/unity-catalog/tables/<table>/monitor` |
+| `TABLE_OR_VIEW_NOT_FOUND` on a `*_profile_metrics` table | monitor's first refresh has not finished | `databricks quality-monitors list-refreshes <table>`; wait for `SUCCESS` or force one with `run-refresh` |
+| `inference_log_drift_metrics` is empty | only one scoring window exists, so there is nothing to compare | expected on a fresh schema — see 7h and narrate it rather than hiding it |
 
 **Recovering mid-demo:** the state that matters is the `@champion` alias. If a run leaves
 production in an odd state, `databricks bundle run rollback_job -t prod` restores the previous
