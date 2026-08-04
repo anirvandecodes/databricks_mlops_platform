@@ -87,10 +87,15 @@ print(f"Wrote {written} predictions to {names.raw_predictions}")
 # DBTITLE 1,Append to the inference log
 from feature_engineering.features.credit_features import MONITORED_FEATURE_COLUMNS
 
+# The same decision threshold validation gates on. Imported rather than restated so the
+# class the monitor scores is the class the model was approved on.
+from validation import DECISION_THRESHOLD
+
 logged = append_inference_log(
     predictions,
     inference_log_table=names.inference_log,
     monitored_columns=MONITORED_FEATURE_COLUMNS,
+    decision_threshold=DECISION_THRESHOLD,
 )
 print(f"Appended {logged} rows to {names.inference_log}")
 

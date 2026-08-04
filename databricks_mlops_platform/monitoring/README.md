@@ -57,10 +57,20 @@ Drift triggers model **building**, never model **promotion**. A retrained model 
 a challenger and faces the same approval gate as any other candidate. Automated drift
 response must not become an unreviewed path into production.
 
-## Gotcha
+## Gotchas
 
 The drift baseline and the inference log must use the same label column name
 (`ground_truth`). Data profiling rejects a mismatch with `label_col cannot be found`.
+
+**`prediction` must hold a class, not a probability.** With a classification problem type the
+monitor compares `prediction_col` against `label_col` for equality, so logging the raw
+probability yields accuracy `0.0` and an all-zero confusion matrix — *without any error*, since
+0.42 is a perfectly valid double. Batch inference therefore thresholds at `DECISION_THRESHOLD`
+(imported from `validation`, so the class scored is the class the model was approved on) and
+keeps the probability as `prediction_score` for score-distribution analysis.
+
+Both failure modes here are silent: an unlabelled log and a probability-valued `prediction`
+each leave the data-quality half of the dashboard looking perfectly healthy.
 
 This platform monitors batch inference tables directly. Real-time serving inference tables
 require unpacking before a monitor can attach.

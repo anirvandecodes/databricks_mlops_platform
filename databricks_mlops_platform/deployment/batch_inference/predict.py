@@ -72,6 +72,7 @@ def append_inference_log(
     predictions: DataFrame,
     inference_log_table: str,
     monitored_columns: list,
+    decision_threshold: float,
 ) -> int:
     """Append this batch to the append-only inference log.
 
@@ -79,18 +80,38 @@ def append_inference_log(
     every column would make the monitor expensive and its output hard to read, and drift
     on a column nobody governs is not actionable.
 
+    ``prediction`` is written as the **predicted class** (0/1) at ``decision_threshold``,
+    not as the raw probability. The monitor is configured with a classification problem
+    type, so it compares ``prediction_col`` against ``label_col`` directly: a probability
+    there never equals a 0/1 label, which silently yields accuracy 0.0 and a meaningless
+    confusion matrix rather than an error. The probability is kept alongside as
+    ``prediction_score``, since a drift investigation needs the score distribution and
+    thresholding throws that away.
+
+    The threshold is passed in rather than defaulted here: it is the same risk parameter
+    validation gates on, and a second copy would let the two drift apart.
+
     ``ground_truth`` is written as a typed null placeholder so the monitor's schema is
-    stable from day one; labels are joined in later as outcomes mature.
+    stable from day one; labels are joined in later as outcomes mature
+    (``monitoring.label_join``).
     """
     available = [c for c in monitored_columns if c in predictions.columns]
 
-    log_df = predictions.select(
-        *(["customer_id"] if "customer_id" in predictions.columns else []),
-        *available,
-        "prediction",
-        "model_version",
-        "scored_at",
-    ).withColumn("ground_truth", F.lit(None).cast("double"))
+    log_df = (
+        predictions.select(
+            *(["customer_id"] if "customer_id" in predictions.columns else []),
+            *available,
+            "prediction",
+            "model_version",
+            "scored_at",
+        )
+        .withColumn("prediction_score", F.col("prediction").cast("double"))
+        .withColumn(
+            "prediction",
+            (F.col("prediction") >= F.lit(decision_threshold)).cast("double"),
+        )
+        .withColumn("ground_truth", F.lit(None).cast("double"))
+    )
 
     (
         log_df.write.format("delta")
