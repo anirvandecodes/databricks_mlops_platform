@@ -5,7 +5,22 @@ Drift detection and gated retraining. Enabled by default — there are no TODOs 
 | File | Purpose |
 |---|---|
 | `SetupMonitor.py` | Registers the PSI Unity Catalog function and attaches a data profiling monitor to the inference log. Idempotent. |
+| `JoinGroundTruth.py` | Backfills matured outcomes into the log's `ground_truth` column. Idempotent. |
+| `label_join.py` | The merge logic behind that backfill, unit tested offline. |
 | `DriftCheck.py` | Computes PSI per monitored feature against the training baseline and decides whether retraining is warranted. |
+
+## Why the label join is a separate step
+
+Batch scoring cannot know the outcome of a credit decision, so it writes `ground_truth` as a
+typed null placeholder. The monitor's **model-quality** metrics — accuracy, precision, recall,
+confusion matrix — all derive from that column, and an all-null label column produces *empty
+panels rather than an error*, while the data-quality half (column profiles, drift) still looks
+healthy. That makes the omission easy to miss, which is why the backfill is an explicit task
+rather than an implicit side effect of scoring.
+
+The merge only fills rows whose label is still null, so it never revises a recorded outcome —
+settled labels are audit evidence. Rows awaiting outcomes are expected, and the task reports
+label coverage so "how much of the log is labelled" is visible rather than inferred.
 
 ## Running it
 
