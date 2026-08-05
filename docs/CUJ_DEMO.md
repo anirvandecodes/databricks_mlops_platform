@@ -7,7 +7,8 @@ Structured by persona rather than by feature, because the interesting part of th
 is not that it trains a model — anyone can do that — but **who is allowed to do what, and
 where the system says no.**
 
-- **Total runtime:** ~35 min with narration. The setup phase runs beforehand.
+- **Total runtime:** ~45 min with narration, setup run beforehand. For a 30-minute slot, cut
+  Act 5 and Act 7 beat 4 and keep Acts 3 and 4 intact — they are where the story lands.
 - **Workspace:** `https://dbc-aef35066-afa2.cloud.databricks.com`, catalog `workspace`
 - **Repo:** `github.com/anirvandecodes/databricks_mlops_platform`
 
@@ -207,8 +208,8 @@ decisions and an audit trail.
 The monitoring run is what creates `drift_check_results`, so skip it only if you are also
 skipping Act 7.
 
-If you are demoing Act 7h (the managed monitor), give its first refresh a few minutes and then
-confirm both of these before you present — details and fallbacks in 7h:
+Give the monitor's first refresh a few minutes, then confirm these three before you present.
+Full details and on-screen fallbacks are in Act 7, "Before you present":
 
 ```bash
 databricks quality-monitors get workspace.payments_dev.inference_log \
@@ -217,6 +218,10 @@ databricks quality-monitors get workspace.payments_dev.inference_log \
 
 ```sql
 SELECT count(*) FROM workspace.payments_dev.inference_log_profile_metrics;  -- want > 0
+
+-- want labelled > 0 and distinct_pred = 2; either wrong ⇒ re-run batch_inference_job
+SELECT count(ground_truth) AS labelled, count(DISTINCT prediction) AS distinct_pred
+FROM workspace.payments_dev.inference_log;
 ```
 
 ### 3. Check the production gate is armed
@@ -610,42 +615,53 @@ databricks bundle run rollback_job -t prod --params target_version=1
 
 ---
 
-# Act 7 — Drift monitoring and gated retraining (8 min, + 3 for 7h)
+# Act 7 — Drift monitoring and gated retraining (8 min)
 
 **Message:** *automation notices drift and responds to it — but automation never promotes.*
 
-This is the act that answers "what happens six months after go-live?", so do not skip it if
-the audience includes anyone who will own the model in production.
+This act answers "what happens six months after go-live?", so do not skip it if anyone in the
+room will own the model in production.
 
-### 7a. Show the monitoring workflow's shape first
+Four beats. Beat 3 is the one that lands; if you lose time, cut beat 4 and keep the rest.
 
-Open **Jobs & Pipelines → `dev-mlops-platform-monitoring-job`** and show the task graph.
-Four tasks, and the branch is the interesting part:
+| Beat | Show | Minutes |
+|---|---|---|
+| 1 | The workflow's shape — automation with a branch | 1 |
+| 2 | Data profiling — the metrics and dashboard you did not build | 3 |
+| 3 | Force a breach — the pipeline reacts ★ | 3 |
+| 4 | The governance point — retraining is not promotion | 1 |
+
+---
+
+### Beat 1 — the shape of the automation (1 min)
+
+**Jobs & Pipelines → `dev-mlops-platform-monitoring-job`.** Five tasks; the branch is the
+interesting part:
 
 ```
-SetupMonitor  →  DriftCheck  →  IsRetrainRequired  ──true──→  TriggerRetraining
-                                        │                     (runs model_training_job)
-                                        └──false──→  (ends, no action)
+SetupMonitor → JoinGroundTruth → DriftCheck → IsRetrainRequired ──true──→ TriggerRetraining
+                                                      │                  (runs model_training_job)
+                                                      └──false──→ ends, no action
 ```
 
-> "A condition task branches on the drift verdict. If nothing has drifted the workflow ends
-> quietly. If something has, it triggers the *training* job — and you have already seen where
-> that ends up in production."
+> "A condition task branches on the drift verdict. Nothing drifted, the workflow ends quietly.
+> Something drifted, it triggers the *training* job — and you have already seen where that
+> ends up."
 
-Point out the schedule: `0 0 18 * * ?` — daily at 18:00 UTC, after the day's scoring.
+Two details worth naming:
 
-> "It is deployed paused, so a demo workspace does not accumulate runs. In production you
-> unpause it and drift is checked every evening without anyone remembering to."
+- **`JoinGroundTruth`** backfills matured outcomes into the log's `ground_truth` column.
+  Scoring cannot know whether a loan defaulted, so it writes a null placeholder. Without this
+  task the model-quality metrics in beat 2 stay empty while everything else looks healthy.
+- **The schedule** is `0 0 18 * * ?`, daily after scoring, deployed **paused** so a demo
+  workspace does not accumulate runs.
 
-### 7b. Data profiling — one monitor, and the metrics come for free
+---
 
-**This is the part to spend time on.** The platform writes no drift-metric code of its own;
-it configures a
-[data profiling](https://docs.databricks.com/aws/en/data-governance/unity-catalog/data-quality-monitoring/data-profiling/)
-monitor and Unity Catalog does the rest.
+### Beat 2 — data profiling: the part you did not build (3 min)
 
-Show the configuration first — `monitoring/SetupMonitor.py`, the `MonitorInferenceLog` block.
-It is about ten lines:
+**Start in the config, not the UI** — the point is how little there is. Open
+`monitoring/SetupMonitor.py`:
 
 ```python
 inference_log=MonitorInferenceLog(
@@ -660,255 +676,28 @@ baseline_table_name=names.baseline_table,
 ```
 
 > "That is the entire drift implementation. An **Inference profile** — one of three profile
-> types, alongside snapshot and time series — is the one that understands that a table holds
-> predictions: it knows which column is the prediction, which is the label, and which model
-> version produced each row."
+> types, next to snapshot and time series — is the one that understands the table holds
+> predictions: which column is the prediction, which is the label, which model version
+> produced each row."
 
-Then show what those ten lines generated. **Catalog Explorer → `inference_log` → Quality**:
+**Then show what those ten lines generated.** Catalog Explorer →
+`workspace.payments_dev.inference_log` → **Quality** tab → open the generated dashboard.
 
-| Generated asset | What it holds |
+> "I did not build this dashboard and I wrote no SQL for it. Unity Catalog profiles every
+> column, computes drift against the training baseline, and generates this. Six months after
+> go-live, this is the page the model owner opens on a Monday morning."
+
+**Land the punchline — these metrics are free:**
+
+| Generated | Contains |
 |---|---|
 | `inference_log_profile_metrics` | per-column stats per window, **plus model quality** — accuracy, precision, recall, confusion matrix — under `column_name = ':table'` |
 | `inference_log_drift_metrics` | `population_stability_index`, `js_distance`, `ks_test`, `wasserstein_distance`, `chi_squared_test`, `tv_distance`, `l_infinity_distance` |
-| A dashboard | built automatically; `SetupMonitor` prints the deep link |
 
-> "PSI is a *built-in column*. So are the KS test, Jensen–Shannon distance, chi-squared,
-> Wasserstein. Nobody on this team implemented, tested, or maintains any of them — and the
-> model-quality half comes from the same one monitor, which is why the label backfill in 7a
-> matters so much."
+> "PSI is a *built-in column*. So are the KS test, Jensen–Shannon, chi-squared, Wasserstein.
+> Nobody here implemented, tested, or maintains any of them."
 
-Open the generated dashboard. This is the strongest single visual in the demo: a governance
-audience gets drift and model quality over time without anyone building a dashboard.
-
-Query the metrics directly to make the point that these are ordinary UC tables:
-
-```sql
-SELECT window.start, column_name, population_stability_index, ks_test.pvalue
-FROM workspace.payments_dev.inference_log_drift_metrics
-WHERE drift_type = 'BASELINE' AND column_name != ':table'
-ORDER BY population_stability_index DESC NULLS LAST;
-```
-
-```sql
--- model quality, from the same monitor
-SELECT window.start, accuracy_score, precision.macro, recall.macro
-FROM workspace.payments_dev.inference_log_profile_metrics
-WHERE column_name = ':table' AND log_type = 'INPUT'
-ORDER BY window.start DESC;
-```
-
-**Expect the drift table to be empty on a fresh demo, and say why — it is a good detail, not
-a gap:**
-
-| Drift type | Needs | On a fresh demo |
-|---|---|---|
-| `BASELINE` | a baseline table | configured, so these rows appear |
-| `CONSECUTIVE` | two populated windows at `1 day` | **empty until the log spans a second day** |
-
-> "A window needs a prior window to compare against. So consecutive drift is empty on day
-> one — that is arithmetic, not a broken monitor. `SetupMonitor` prints the day count so
-> nobody spends an afternoon debugging it."
-
-Also worth stating plainly: inference and time-series profiles compute over the **last 30
-days**.
-
-### 7b-ii. Why the retraining verdict is still computed in Python
-
-Open `platform_utils/metrics.py` and show `population_stability_index`.
-
-PSI = Σ (aᵢ − eᵢ) × ln(aᵢ / eᵢ) over distribution buckets, with the conventional
-credit-risk reading:
-
-| PSI | Meaning | Platform action |
-|---|---|---|
-| < 0.10 | no significant population shift | `STABLE` — nothing happens |
-| 0.10 – 0.25 | moderate shift, investigate | `WARN` — recorded, no retraining |
-| ≥ 0.25 | significant shift | `RETRAIN` — triggers the training job |
-
-The obvious question, and you should raise it before the audience does: *if the monitor
-already computes PSI, why compute it again?*
-
-> "Because the condition task has to branch on **every** run. The managed metrics land after
-> a monitor refresh, and consecutive drift needs two windows — so wiring the retraining
-> branch to that table would make retraining depend on refresh timing. The monitor is the
-> evidence a human reads; this function is the trigger a job acts on. Different jobs."
-
-It is a pure function, so it is unit tested offline with no cluster at all — the same tier
-that runs on every pull request.
-
-### 7c. The thresholds are configuration, not code
-
-Show them in `databricks.yml`:
-
-```yaml
-psi_warn_threshold:    { default: "0.10" }
-psi_retrain_threshold: { default: "0.25" }
-```
-
-> "The thresholds are bundle variables, so a risk owner tunes them per environment through a
-> reviewed pull request. Nobody edits a notebook to change when the platform retrains."
-
-### 7d. What is actually monitored
-
-Six features, from `MONITORED_FEATURE_COLUMNS`:
-
-`duration` · `credit_amount` · `age` · `installment_commitment` ·
-`monthly_instalment` · `credit_to_age_ratio`
-
-> "Not every column — the ones whose distribution shifting would actually invalidate the
-> model, including the two engineered features. Both distributions are bucketed on edges
-> derived from the *baseline*, which matters: comparing distributions bucketed on different
-> edges is the most common way a hand-rolled PSI silently goes wrong."
-
-### 7e. Run it and read the output
-
-```bash
-databricks bundle run monitoring_job -t dev
-```
-
-The `DriftCheck` task output is written to be read aloud:
-
-```
-baseline rows=1000, live rows=199
-PSI thresholds: warn >= 0.1, retrain >= 0.25
-  duration                     PSI=0.0142  STABLE
-  credit_amount                PSI=0.0231  STABLE
-  age                          PSI=0.0088  STABLE
-  installment_commitment       PSI=0.0195  STABLE
-  monthly_instalment           PSI=0.0176  STABLE
-  credit_to_age_ratio          PSI=0.0203  STABLE
-==================================================================
-Features checked : 6
-Warnings         : 0 []
-Retrain breaches : 0 []
-Worst drift      : credit_amount (PSI=0.0231)
-Decision         : NO ACTION
-==================================================================
-```
-
-(Exact PSI values vary by run; on a freshly scored batch they are all low, because the live
-data and the baseline come from the same population.)
-
-Then the persisted results:
-
-```sql
-SELECT feature, psi, verdict, checked_at
-FROM workspace.payments_dev.drift_check_results
-ORDER BY checked_at DESC, psi DESC;
-```
-
-> "Every check is a row, so drift is a time series you can chart and a regulator can query —
-> not a log line that scrolls away."
-
-### 7f. Force a breach — the demo that actually lands ★
-
-Describing a threshold is weak; showing the pipeline react is strong. Inject skewed rows into
-the inference log so PSI crosses 0.25:
-
-```sql
--- Skew the live population hard: triple the credit amounts and ages.
--- Columns are listed explicitly — Databricks SQL does not support SELECT * REPLACE (...).
-INSERT INTO workspace.payments_dev.inference_log
-SELECT
-  concat(customer_id, '_drift') AS customer_id,
-  duration,
-  credit_amount * 3             AS credit_amount,
-  age * 3                       AS age,
-  installment_commitment,
-  monthly_instalment,
-  credit_to_age_ratio,
-  prediction,
-  model_version,
-  scored_at,
-  ground_truth
-FROM workspace.payments_dev.inference_log
-LIMIT 150;
-```
-
-Re-run the monitoring job:
-
-```bash
-databricks bundle run monitoring_job -t dev
-```
-
-Now the output flips:
-
-```
-  credit_amount                PSI=0.3187  RETRAIN
-  age                          PSI=0.2941  RETRAIN
-Decision         : RETRAIN
-
-Triggering retraining. The retrained model will register as a CHALLENGER and
-must still pass validation and the approval gate before it can serve traffic.
-```
-
-Show the workflow graph: `IsRetrainRequired` took the **true** branch and
-`TriggerRetraining` fired the training job.
-
-**Clean up afterwards:**
-
-```sql
-TRUNCATE TABLE workspace.payments_dev.inference_log;
-```
-
-Then re-run `batch_inference_job -t dev` to repopulate it with honest data.
-
-### 7g. The governance point — do not rush this
-
-> "Drift triggered *retraining*, not *promotion*. The retrained model registered as a
-> challenger. To reach production it must clear validation and then the same approval gate
-> Ravi used — a named human looking at metrics."
-
-> "That is the distinction that matters in a regulated setting. Plenty of platforms will
-> automatically retrain and redeploy on drift. This one automates the *response* to drift and
-> keeps the *decision* with a person. Automated drift response is never an unreviewed path
-> into production."
-
-### 7h. The managed layer — data profiling
-
-`SetupMonitor` also attaches a **data profiling monitor** with an **Inference profile** to the
-inference log table. (Data profiling is the current name for what was called Lakehouse
-Monitoring; the SDK namespace is still `w.quality_monitors`, and Databricks groups it under
-"data quality monitoring" alongside anomaly detection.)
-
-**How to demo this — three beats, about 3 minutes.**
-
-**Beat 1 — the monitor exists and is managed, not hand-built.** Start in the UI, because the
-point is that nobody wrote this: **Catalog Explorer → `workspace.payments_dev.inference_log`
-→ Quality** tab. It shows the monitor's status, its refresh history, and a link to a generated
-dashboard.
-
-> "I did not build this tab, and I did not write a line of SQL for it. The pipeline attached a
-> monitor to the inference table, and Databricks profiles every column, computes drift against
-> the training baseline, and generates a dashboard from that."
-
-If someone asks whether it is really deployed rather than clicked together by hand, show it
-from the CLI — this is also your pre-demo health check:
-
-```bash
-databricks quality-monitors get \
-  workspace.payments_dev.inference_log \
-  --profile real-anirvan
-```
-
-Read out three fields from the response: `"status": "MONITOR_STATUS_ACTIVE"`,
-`"baseline_table_name"` pointing at `baseline_snapshot`, and the `inference_log` block showing
-`problem_type`, `prediction_col`, `label_col` and `timestamp_col`.
-
-> "It knows this is a classification model, which column is the prediction, which is the
-> label, and which is the timestamp. That is what makes it a *model* monitor rather than a
-> generic table profiler."
-
-**Beat 2 — open the generated dashboard.** From the Quality tab, click through to the
-dashboard (`inference_log Monitoring`, under `/Shared/monitoring/payments_dev/...`). This is
-the strongest single visual in the act — a dashboard the team gets for free.
-
-> "Six months after go-live, this is the page the model owner opens on a Monday morning. It
-> came with the pipeline."
-
-**Beat 3 — show the metric table underneath, for the technical audience.** The dashboard is
-backed by a plain Unity Catalog table, which is the part an engineer or an auditor cares
-about:
+For a technical audience, show it is an ordinary UC table anyone can query:
 
 ```sql
 SELECT column_name, log_type, count, num_nulls, round(avg, 2) AS mean
@@ -919,8 +708,6 @@ WHERE slice_key IS NULL
 ORDER BY column_name, log_type;
 ```
 
-Verified output on this workspace:
-
 ```
 age            BASELINE  800  0    35.32
 age            INPUT     199  0    36.70
@@ -929,67 +716,143 @@ credit_amount  INPUT     199  0  3154.38
 ```
 
 > "`BASELINE` is the training distribution, `INPUT` is what production actually scored. Same
-> table, side by side, queryable by anyone with SELECT. Nothing here is locked inside a
-> monitoring product."
+> table, side by side, queryable by anyone with SELECT. Nothing is locked inside a monitoring
+> product."
 
-Two filters in that query are worth knowing so a stray row does not confuse you on screen:
-`slice_key IS NULL` takes the whole-population rows rather than the per-slice breakdowns, and
-`model_version = '*'` takes the all-versions rollup — without it each live window appears
-twice, once per version and once for `*`.
+**Expect `inference_log_drift_metrics` to be empty, and say why — it is arithmetic, not a
+fault:**
 
-> "So there are two layers of monitoring, and they answer different questions. Data profiling
-> is the managed layer: it profiles every column, computes drift against the baseline, and
-> generates a dashboard without anyone writing SQL. The custom PSI layer is the *governed*
-> one: a single audited formula in Unity Catalog with an explicit, thresholded retraining
-> branch that a risk owner tunes by pull request."
+| Drift type | Needs | Fresh demo |
+|---|---|---|
+| `BASELINE` | a baseline table | configured — rows appear |
+| `CONSECUTIVE` | two windows at `1 day` | **empty until the log spans a second day** |
 
-#### Check these before you present
+> "A window needs a prior window to compare against. So consecutive drift is empty on day one.
+> That is also exactly why the next beat computes PSI itself — it compares live against the
+> training baseline, so there is a verdict on day one rather than day two."
 
-Two states will embarrass you live. Both are expected on a freshly seeded schema, and both
-have a clean way to handle them on screen.
+(Inference and time-series profiles compute over the **last 30 days**. `SetupMonitor` prints
+the dashboard link and the log's day count, so this is visible rather than debugged.)
 
-**1. Metric tables not materialised yet.** The tables are declared when the monitor is
-created but only filled by its first refresh — several minutes, sometimes longer on a small
-serverless warehouse. Querying too early returns `TABLE_OR_VIEW_NOT_FOUND`.
+---
+
+### Beat 3 — force a breach ★ (3 min)
+
+Describing a threshold is weak. Showing the pipeline react is the demo.
+
+**First, the honest baseline.** `databricks bundle run monitoring_job -t dev`:
+
+```
+  duration                     PSI=0.0142  STABLE
+  credit_amount                PSI=0.0231  STABLE
+  age                          PSI=0.0088  STABLE
+Decision         : NO ACTION
+```
+
+> "Live data and baseline come from the same population, so PSI is near zero. Now let me break
+> it."
+
+**Inject a skewed population:**
+
+```sql
+-- Triple credit amounts and ages. Columns listed explicitly: Databricks SQL has no
+-- SELECT * REPLACE (...).
+INSERT INTO workspace.payments_dev.inference_log
+SELECT
+  concat(customer_id, '_drift') AS customer_id,
+  duration,
+  credit_amount * 3             AS credit_amount,
+  age * 3                       AS age,
+  installment_commitment, monthly_instalment, credit_to_age_ratio,
+  prediction, model_version, scored_at, ground_truth
+FROM workspace.payments_dev.inference_log
+LIMIT 150;
+```
+
+Re-run `databricks bundle run monitoring_job -t dev`, and the verdict flips:
+
+```
+  credit_amount                PSI=0.3187  RETRAIN
+  age                          PSI=0.2941  RETRAIN
+Decision         : RETRAIN
+
+Triggering retraining. The retrained model will register as a CHALLENGER and
+must still pass validation and the approval gate before it can serve traffic.
+```
+
+Show the workflow graph: `IsRetrainRequired` took the **true** branch, `TriggerRetraining`
+fired the training job.
+
+Two supporting points, only if asked:
+
+- **Thresholds are configuration.** In `databricks.yml`: `psi_warn_threshold: "0.10"`,
+  `psi_retrain_threshold: "0.25"`. A risk owner tunes them by pull request; nobody edits a
+  notebook to change when the platform retrains.
+- **Every check is a row**, so drift is a queryable time series rather than a log line:
+  `SELECT feature, psi, verdict, checked_at FROM workspace.payments_dev.drift_check_results
+  ORDER BY checked_at DESC;`
+
+**Clean up:** `TRUNCATE TABLE workspace.payments_dev.inference_log;` then re-run
+`batch_inference_job -t dev` to repopulate with honest data.
+
+---
+
+### Beat 4 — the governance point (1 min)
+
+Do not rush this. It is the sentence the act exists for.
+
+> "Drift triggered *retraining*, not *promotion*. The retrained model registered as a
+> challenger. To reach production it must clear validation and then the same approval gate
+> Ravi used — a named human looking at metrics."
+
+> "Plenty of platforms retrain and redeploy automatically on drift. This one automates the
+> *response* and keeps the *decision* with a person. Automated drift response is never an
+> unreviewed path into production."
+
+---
+
+### Before you present: two states that will embarrass you
+
+**1. Stale inference log.** Check both of these, because each fails *silently* — the
+dashboard's data-quality half looks perfectly healthy either way:
+
+```sql
+SELECT count(*) AS total,
+       count(ground_truth) AS labelled,          -- 0 ⇒ model-quality panels empty
+       count(DISTINCT prediction) AS distinct_pred  -- >2 ⇒ probabilities, not classes
+FROM workspace.payments_dev.inference_log;
+```
+
+Want `labelled > 0` and `distinct_pred = 2`. If either is wrong, the log predates the current
+scoring code: re-run `batch_inference_job -t dev`, then `monitoring_job -t dev`.
+
+**2. Metric tables not refreshed.** They are declared at monitor creation but filled by the
+first refresh — several minutes.
 
 ```bash
 databricks quality-monitors list-refreshes \
   workspace.payments_dev.inference_log --profile real-anirvan
 ```
 
-Wait for a refresh with `"state": "SUCCESS"`. To force one rather than wait for the schedule:
-`databricks quality-monitors run-refresh <table>`. If it still is not ready, skip Beat 3 and
-stay on the Quality tab and `drift_check_results` — the governance story does not depend on
-the managed tables.
+Wait for `"state": "SUCCESS"`, or force one with `run-refresh`. Querying too early gives
+`TABLE_OR_VIEW_NOT_FOUND`. If it is still cold, skip the beat-2 SQL and stay on the Quality
+tab plus `drift_check_results` — the governance story does not depend on the managed tables.
 
-(The CLI prints a deprecation notice pointing at a newer `/api/data-quality/v1/monitors` API.
-That endpoint is **not served on this workspace yet** — it answers "No API found" — so the
-`quality-monitors` commands above remain the ones to use here. Worth knowing if an audience
-member notices the notice.)
+Health check in one command — want `MONITOR_STATUS_ACTIVE`:
 
-**2. The drift metrics table is empty — expect this, and say so.** `inference_log_drift_metrics`
-has 0 rows on a fresh schema even though the monitor is healthy. Drift compares consecutive
-windows, and a single scoring run writes one `scored_at` value, so there is one `1 day` window
-and nothing to diff. Separately, if `ground_truth` is still NULL in the inference log, no
-label-dependent metric can compute.
+```bash
+databricks quality-monitors get workspace.payments_dev.inference_log --profile real-anirvan
+```
 
-Do not open that table cold and improvise. Either avoid it, or use it as the honest point it
-actually is:
-
-> "Drift on the managed layer needs two time windows to compare, and this schema has been
-> scored once. In production it fills in overnight. That is exactly why the custom PSI layer
-> exists — it compares live against the training baseline, so it gives a verdict on day one
-> rather than on day two."
-
-To make it populate for a demo that needs it: score a second batch on a later day (or backdate
-`scored_at` across two days), join in `ground_truth_outcomes` to supply labels — it already
-holds 1000 rows in dev — then refresh the monitor.
+(The CLI prints a deprecation notice pointing at `/api/data-quality/v1/monitors`. That
+endpoint is **not served on this workspace yet** — it answers "No API found" — so the
+`quality-monitors` commands remain correct here. Worth knowing if someone notices.)
 
 **Why the code tolerates the feature being absent:** `SetupMonitor` catches the
 endpoint-absent response and exits `MONITOR_UNSUPPORTED` rather than failing, because a
-capability gap in a workspace is not a fault in the pipeline. Permission and configuration
-errors still raise, so this cannot hide a real misconfiguration. On this workspace the path
-is not exercised — the monitor is created successfully.
+workspace capability gap is not a pipeline fault. Permission and configuration errors still
+raise, so it cannot hide a real misconfiguration. On this workspace the monitor is created
+successfully, so that path is not exercised.
 
 ---
 
@@ -1053,7 +916,7 @@ developer-portal integration — the control is enforced; the portal is not buil
 | Job fails on `mlflow` import | notebook `%pip install` step was skipped | re-run the job from the top, not a single task |
 | `Not Found` checking the monitor over REST | the `/api/2.0/lakehouse-monitoring/...` path is retired | use `databricks quality-monitors get <table>`, or REST `/api/2.1/unity-catalog/tables/<table>/monitor` |
 | `TABLE_OR_VIEW_NOT_FOUND` on a `*_profile_metrics` table | monitor's first refresh has not finished | `databricks quality-monitors list-refreshes <table>`; wait for `SUCCESS` or force one with `run-refresh` |
-| `inference_log_drift_metrics` is empty | only one scoring window exists, so there is nothing to compare | expected on a fresh schema — see 7h and narrate it rather than hiding it |
+| `inference_log_drift_metrics` is empty | only one scoring window exists, so `CONSECUTIVE` drift has nothing to compare | expected on a fresh schema — see Act 7 beat 2 and narrate it rather than hiding it |
 
 **Recovering mid-demo:** the state that matters is the `@champion` alias. If a run leaves
 production in an odd state, `databricks bundle run rollback_job -t prod` restores the previous
