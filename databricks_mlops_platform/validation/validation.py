@@ -39,8 +39,6 @@ def validation_thresholds():
     Gating on precision *and* recall together is what makes the pair meaningful: either
     metric alone is trivially gamed by moving the threshold to an extreme.
     """
-    
-    
     return {
         "roc_auc": MetricThreshold(threshold=0.70, greater_is_better=True),
         "precision_score": MetricThreshold(threshold=0.40, greater_is_better=True),

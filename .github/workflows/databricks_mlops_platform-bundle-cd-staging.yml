@@ -51,6 +51,6 @@ jobs:
             echo "### Staging deployment"
             echo "Commit \`${{ github.sha }}\` deployed and exercised end to end."
             echo ""
-            echo "Promote to production by pushing to the \`release\` branch. Production"
+            echo "Promote to production by pushing a \`release/<name>\` branch. Production"
             echo "requires explicit model approval before any version serves traffic."
           } >> "$GITHUB_STEP_SUMMARY"
