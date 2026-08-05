@@ -89,7 +89,12 @@ from feature_engineering.features.credit_features import MONITORED_FEATURE_COLUM
 
 # The same decision threshold validation gates on. Imported rather than restated so the
 # class the monitor scores is the class the model was approved on.
-from validation import DECISION_THRESHOLD
+#
+# Fully qualified: this notebook runs from deployment/batch_inference with the repo root on
+# sys.path, so a bare `validation` binds the *directory* as a namespace package and the name
+# is not found. ModelValidation gets away with the short form only because it runs with
+# validation/ as its working directory.
+from validation.validation import DECISION_THRESHOLD
 
 logged = append_inference_log(
     predictions,
