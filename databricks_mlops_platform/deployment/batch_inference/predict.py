@@ -68,36 +68,38 @@ def write_predictions(predictions: DataFrame, output_table: str) -> int:
     return predictions.count()
 
 
-def append_inference_log(
+def build_inference_log(
     predictions: DataFrame,
-    inference_log_table: str,
     monitored_columns: list,
     decision_threshold: float,
-) -> int:
-    """Append this batch to the append-only inference log.
+) -> DataFrame:
+    """Shape a scored batch into the inference log's schema.
+
+    Split from the write so the log's content can be asserted without Delta on the
+    classpath — the properties below are the ones that silently broke the monitor, and
+    they belong in the offline test tier rather than one needing a workspace.
 
     The log is narrowed to the monitored feature set plus prediction metadata. Logging
     every column would make the monitor expensive and its output hard to read, and drift
     on a column nobody governs is not actionable.
 
-    ``prediction`` is written as the **predicted class** (0/1) at ``decision_threshold``,
-    not as the raw probability. The monitor is configured with a classification problem
-    type, so it compares ``prediction_col`` against ``label_col`` directly: a probability
-    there never equals a 0/1 label, which silently yields accuracy 0.0 and a meaningless
-    confusion matrix rather than an error. The probability is kept alongside as
-    ``prediction_score``, since a drift investigation needs the score distribution and
-    thresholding throws that away.
+    ``prediction`` is the **predicted class** (0/1) at ``decision_threshold``, not the raw
+    probability. The monitor is configured with a classification problem type, so it
+    compares ``prediction_col`` against ``label_col`` directly: a probability there never
+    equals a 0/1 label, which silently yields accuracy 0.0 and a meaningless confusion
+    matrix rather than an error. The probability is kept alongside as ``prediction_score``,
+    since a drift investigation needs the score distribution and thresholding throws that
+    away.
 
     The threshold is passed in rather than defaulted here: it is the same risk parameter
     validation gates on, and a second copy would let the two drift apart.
 
-    ``ground_truth`` is written as a typed null placeholder so the monitor's schema is
-    stable from day one; labels are joined in later as outcomes mature
-    (``monitoring.label_join``).
+    ``ground_truth`` is a typed null placeholder so the monitor's schema is stable from day
+    one; labels are joined in later as outcomes mature (``monitoring.label_join``).
     """
     available = [c for c in monitored_columns if c in predictions.columns]
 
-    log_df = (
+    return (
         predictions.select(
             *(["customer_id"] if "customer_id" in predictions.columns else []),
             *available,
@@ -112,6 +114,19 @@ def append_inference_log(
         )
         .withColumn("ground_truth", F.lit(None).cast("double"))
     )
+
+
+def append_inference_log(
+    predictions: DataFrame,
+    inference_log_table: str,
+    monitored_columns: list,
+    decision_threshold: float,
+) -> int:
+    """Append this batch to the append-only inference log.
+
+    See :func:`build_inference_log` for what the log carries and why.
+    """
+    log_df = build_inference_log(predictions, monitored_columns, decision_threshold)
 
     (
         log_df.write.format("delta")
