@@ -3,7 +3,7 @@
 # Validates the bundle against all three targets on every PR. Catching a bad prod variable
 # here — rather than at release time — is the point: the same config that will deploy to
 # prod is checked while the change is still reviewable.
-name: Bundle validation for databricks_mlops_platform
+name: Code gate — bundle config
 
 on:
   workflow_dispatch:
@@ -22,6 +22,7 @@ concurrency:
 
 jobs:
   validate:
+    name: Bundle config resolves (${{ matrix.target }})
     runs-on: ubuntu-latest
     if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'workflow_dispatch'
     strategy:
@@ -47,6 +48,7 @@ jobs:
   # baseline/inference schema mismatch, a create-only SDK argument. None were visible to
   # unit tests or to bundle validation.
   staging_integration:
+    name: Full pipeline runs end to end (staging)
     needs: validate
     runs-on: ubuntu-latest
     if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'workflow_dispatch'

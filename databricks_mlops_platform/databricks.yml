@@ -11,7 +11,7 @@
 # Where the metastore allows CREATE CATALOG, catalog-per-environment is the stronger posture
 # (blast-radius isolation, simpler binding rules). Because both layouts are addressed through
 # the same catalog_name/schema_name variables, migrating later is a variable change per
-# target — no pipeline code moves. See docs/DEMO_SCRIPT.md.
+# target — no pipeline code moves. See docs/CUJ_DEMO.md.
 bundle:
   name: databricks_mlops_platform
 

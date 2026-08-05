@@ -5,8 +5,8 @@ matter here and are asserted by the integration tests:
 
 * The model is resolved by **alias**, so scoring always follows whatever version is
   currently champion — including immediately after a rollback.
-* Every scored row is appended to an inference log, which is the table Lakehouse
-  Monitoring attaches to. Scoring without logging would leave the platform blind to drift.
+* Every scored row is appended to an inference log, which is the table the data profiling
+  monitor attaches to. Scoring without logging would leave the platform blind to drift.
 """
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -68,29 +68,65 @@ def write_predictions(predictions: DataFrame, output_table: str) -> int:
     return predictions.count()
 
 
-def append_inference_log(
+def build_inference_log(
     predictions: DataFrame,
-    inference_log_table: str,
     monitored_columns: list,
-) -> int:
-    """Append this batch to the append-only inference log.
+    decision_threshold: float,
+) -> DataFrame:
+    """Shape a scored batch into the inference log's schema.
+
+    Split from the write so the log's content can be asserted without Delta on the
+    classpath — the properties below are the ones that silently broke the monitor, and
+    they belong in the offline test tier rather than one needing a workspace.
 
     The log is narrowed to the monitored feature set plus prediction metadata. Logging
     every column would make the monitor expensive and its output hard to read, and drift
     on a column nobody governs is not actionable.
 
-    ``ground_truth`` is written as a typed null placeholder so the monitor's schema is
-    stable from day one; labels are joined in later as outcomes mature.
+    ``prediction`` is the **predicted class** (0/1) at ``decision_threshold``, not the raw
+    probability. The monitor is configured with a classification problem type, so it
+    compares ``prediction_col`` against ``label_col`` directly: a probability there never
+    equals a 0/1 label, which silently yields accuracy 0.0 and a meaningless confusion
+    matrix rather than an error. The probability is kept alongside as ``prediction_score``,
+    since a drift investigation needs the score distribution and thresholding throws that
+    away.
+
+    The threshold is passed in rather than defaulted here: it is the same risk parameter
+    validation gates on, and a second copy would let the two drift apart.
+
+    ``ground_truth`` is a typed null placeholder so the monitor's schema is stable from day
+    one; labels are joined in later as outcomes mature (``monitoring.label_join``).
     """
     available = [c for c in monitored_columns if c in predictions.columns]
 
-    log_df = predictions.select(
-        *(["customer_id"] if "customer_id" in predictions.columns else []),
-        *available,
-        "prediction",
-        "model_version",
-        "scored_at",
-    ).withColumn("ground_truth", F.lit(None).cast("double"))
+    return (
+        predictions.select(
+            *(["customer_id"] if "customer_id" in predictions.columns else []),
+            *available,
+            "prediction",
+            "model_version",
+            "scored_at",
+        )
+        .withColumn("prediction_score", F.col("prediction").cast("double"))
+        .withColumn(
+            "prediction",
+            (F.col("prediction") >= F.lit(decision_threshold)).cast("double"),
+        )
+        .withColumn("ground_truth", F.lit(None).cast("double"))
+    )
+
+
+def append_inference_log(
+    predictions: DataFrame,
+    inference_log_table: str,
+    monitored_columns: list,
+    decision_threshold: float,
+) -> int:
+    """Append this batch to the append-only inference log.
+
+    See :func:`build_inference_log` for what the log carries and why.
+    """
+    log_df = build_inference_log(predictions, monitored_columns, decision_threshold)
 
     (
         log_df.write.format("delta")

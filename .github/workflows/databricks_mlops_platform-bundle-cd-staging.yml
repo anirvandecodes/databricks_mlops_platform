@@ -4,7 +4,7 @@
 # runs unattended here. That is intentional: staging is where the pipeline proves it works
 # end to end without a human in the loop, so that the only thing still to verify at release
 # time is the model itself.
-name: Staging CD for databricks_mlops_platform
+name: Deploy to staging
 
 on:
   push:
@@ -22,6 +22,7 @@ env:
 
 jobs:
   deploy:
+    name: Deploy and exercise the pipeline
     runs-on: ubuntu-latest
     concurrency: staging-bundle-deploy
     steps:

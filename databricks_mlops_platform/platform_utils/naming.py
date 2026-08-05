@@ -73,7 +73,7 @@ class AssetNames:
 
     @property
     def inference_log(self) -> str:
-        """Append-only inference log; the table Lakehouse Monitoring is attached to."""
+        """Append-only inference log; the table the data profiling monitor is attached to."""
         return self.table("inference_log")
 
     @property
@@ -83,12 +83,12 @@ class AssetNames:
 
     @property
     def profile_metrics(self) -> str:
-        """Monitor-generated profile metrics (created by Lakehouse Monitoring)."""
+        """Monitor-generated profile metrics (created by data profiling)."""
         return f"{self.inference_log}_profile_metrics"
 
     @property
     def drift_metrics(self) -> str:
-        """Monitor-generated drift metrics (created by Lakehouse Monitoring)."""
+        """Monitor-generated drift metrics (created by data profiling)."""
         return f"{self.inference_log}_drift_metrics"
 
     # -- decision layer ---------------------------------------------------------

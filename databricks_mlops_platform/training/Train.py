@@ -204,12 +204,12 @@ print(f"Registered {names.model_name} version {model_version}")
 # COMMAND ----------
 
 # DBTITLE 1,Write the drift baseline
-# Lakehouse Monitoring compares live inference against this snapshot. It must be the
+# The data profiling monitor compares live inference against this snapshot. It must be the
 # training distribution of the version being promoted, so it is rewritten per training run
 # rather than created once.
 #
 # The label column is named `ground_truth`, matching the inference log rather than the
-# training table's `class`. Lakehouse Monitoring requires the baseline and monitored table
+# training table's `class`. Data profiling requires the baseline and monitored table
 # to share the label column name — a mismatch fails monitor creation with
 # "label_col cannot be found".
 baseline_pdf = X_train.copy()

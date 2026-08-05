@@ -3,7 +3,7 @@
 # Batch Inference Notebook
 #
 # Scores the current applicant batch with whichever version is @champion, writes the
-# predictions, and appends to the inference log that Lakehouse Monitoring watches.
+# predictions, and appends to the inference log that the data profiling monitor watches.
 #
 # Note what this notebook does NOT do: it never names a model version. It resolves
 # models:/<model>@champion at run time, which is why a promotion or a rollback takes
@@ -87,10 +87,20 @@ print(f"Wrote {written} predictions to {names.raw_predictions}")
 # DBTITLE 1,Append to the inference log
 from feature_engineering.features.credit_features import MONITORED_FEATURE_COLUMNS
 
+# The same decision threshold validation gates on. Imported rather than restated so the
+# class the monitor scores is the class the model was approved on.
+#
+# Fully qualified: this notebook runs from deployment/batch_inference with the repo root on
+# sys.path, so a bare `validation` binds the *directory* as a namespace package and the name
+# is not found. ModelValidation gets away with the short form only because it runs with
+# validation/ as its working directory.
+from validation.validation import DECISION_THRESHOLD
+
 logged = append_inference_log(
     predictions,
     inference_log_table=names.inference_log,
     monitored_columns=MONITORED_FEATURE_COLUMNS,
+    decision_threshold=DECISION_THRESHOLD,
 )
 print(f"Appended {logged} rows to {names.inference_log}")
 

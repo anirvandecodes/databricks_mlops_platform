@@ -3,7 +3,7 @@
 The ML code and resource definitions for the credit-risk reference workload.
 
 See the [repository README](../README.md) for the platform overview and
-[docs/DEMO_SCRIPT.md](../docs/DEMO_SCRIPT.md) for a walkthrough with real outputs.
+[docs/CUJ_DEMO.md](../docs/CUJ_DEMO.md) for a walkthrough with real outputs.
 
 ## Where things live
 

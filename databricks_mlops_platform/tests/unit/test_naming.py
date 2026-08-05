@@ -38,8 +38,8 @@ def test_environments_never_collide():
         assert getattr(dev, attr) != getattr(prod, attr)
 
 
-def test_monitor_metric_tables_match_lakehouse_monitoring_convention():
-    """Lakehouse Monitoring derives these names; we must not invent our own."""
+def test_monitor_metric_tables_match_data_profiling_convention():
+    """Data profiling derives these names; we must not invent our own."""
     names = _names()
     assert names.profile_metrics == f"{names.inference_log}_profile_metrics"
     assert names.drift_metrics == f"{names.inference_log}_drift_metrics"

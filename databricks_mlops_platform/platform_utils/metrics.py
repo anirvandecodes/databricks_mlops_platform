@@ -1,7 +1,7 @@
 """Drift and stability metrics.
 
 Population Stability Index (PSI) is the metric credit-risk teams actually govern on,
-and it is not a built-in Lakehouse Monitoring metric. Implementing it here as a pure
+and it is not a built-in data profiling metric. Implementing it here as a pure
 function gives it two properties that matter: it is unit-testable without a cluster,
 and it is registered once as a Unity Catalog function so every team computes drift
 with the identical, audited formula.

@@ -4,7 +4,7 @@
 # before a merge into main is allowed. Together they are the "code gate" — they establish
 # that the code is sound. They say nothing about whether a particular trained model should
 # serve traffic; that is the separate model gate enforced at deploy time.
-name: Tests for databricks_mlops_platform
+name: Code gate — tests
 
 on:
   workflow_dispatch:
@@ -26,6 +26,7 @@ jobs:
   # Level 1 — fast, offline. Feature transforms, PSI, promotion logic, policy rules.
   # No workspace credentials required, so this runs on every PR including from forks.
   unit_tests:
+    name: Unit tests (offline logic)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -49,6 +50,7 @@ jobs:
   # behaves as the unit tests assume: the approval gate actually blocks, aliases actually
   # roll back, and the SQL functions match their Python mirrors.
   integration_tests:
+    name: Integration tests (real Unity Catalog)
     needs: unit_tests
     runs-on: ubuntu-latest
     # Skipped on forks, which cannot access repository secrets.

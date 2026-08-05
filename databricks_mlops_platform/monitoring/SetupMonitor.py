@@ -6,7 +6,9 @@
 #   1. The PSI metric as a Unity Catalog SQL function. Registering it in UC — rather than
 #      importing a wheel per job — means every team computes drift with the identical,
 #      audited formula, and the definition is version-controlled in platform_utils.metrics.
-#   2. A Lakehouse Monitor of type InferenceLog attached to the inference log table.
+#   2. A data profiling monitor with an Inference profile attached to the inference log
+#      table. (Data profiling was formerly called Lakehouse Monitoring; the SDK namespace
+#      is still w.quality_monitors.)
 #
 # Run once per environment, and again after the monitored schema changes.
 #
@@ -75,7 +77,7 @@ print(f"{names.inference_log} has {row_count} rows")
 
 # COMMAND ----------
 
-# DBTITLE 1,Create or refresh the Lakehouse Monitor
+# DBTITLE 1,Create or refresh the data profiling monitor
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.errors import DatabricksError, ResourceDoesNotExist
 from databricks.sdk.service.catalog import MonitorInferenceLog, MonitorInferenceLogProblemType
@@ -97,13 +99,15 @@ monitor_config = dict(
     baseline_table_name=names.baseline_table,
 )
 
-# Lakehouse Monitoring is not available on every tier — Databricks Free Edition, for
-# instance, does not serve the quality-monitors API at all and answers "No API found".
-# That is a capability gap rather than a pipeline fault, so it must not fail the job: the
-# governance chain this platform demonstrates (train, validate, gate, promote, score) does
-# not depend on the managed monitor, and DriftCheck computes PSI from the UC function
-# registered above rather than from the monitor's metric tables. Treated as unsupported
-# only for the endpoint-absent case; permission and configuration errors still raise.
+# Data profiling is available on the tiers this platform targets, including Free Edition —
+# verified by creating an active monitor there. The fallback below exists only for tiers or
+# regions where the API is genuinely absent, which is a capability gap rather than a
+# pipeline fault: the governance chain (train, validate, gate, promote, score) does not
+# depend on the managed monitor, and DriftCheck computes PSI from the UC function registered
+# above rather than from the monitor's metric tables.
+#
+# Matched on the endpoint-absent response only. Permission and configuration errors still
+# raise, so this cannot mask a real misconfiguration as an unsupported feature.
 def _monitoring_unsupported(err: DatabricksError) -> bool:
     return "no api found" in str(err).lower()
 
@@ -136,7 +140,7 @@ except DatabricksError as err:
         raise
     monitor_ready = False
     print(
-        "Lakehouse Monitoring is unavailable in this workspace "
+        "Data profiling (data quality monitoring) is unavailable in this workspace "
         f"({w.config.host}); skipping monitor attachment.\n"
         f"  API response: {err}\n"
         "  Drift detection still runs: DriftCheck computes PSI from "
