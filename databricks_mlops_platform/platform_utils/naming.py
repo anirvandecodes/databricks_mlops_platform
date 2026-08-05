@@ -105,10 +105,6 @@ class AssetNames:
     def fn_calculate_credit_limit(self) -> str:
         return self.table("calculate_credit_limit")
 
-    @property
-    def fn_calculate_psi(self) -> str:
-        return self.table("calculate_psi")
-
     # -- audit ------------------------------------------------------------------
     @property
     def audit_volume(self) -> str:

@@ -22,7 +22,7 @@ requirements. The platform itself is workload-agnostic.
 | **Alias-based promotion** | Inference resolves `models:/<model>@champion` at run time. Promotion moves an alias; nothing is redeployed. |
 | **Seconds-long rollback** | The same alias operation in reverse. Deliberately *not* gated on approval — a gate must not prolong an incident. |
 | **Audit evidence** | Every promotion and rollback writes an immutable JSON package to a UC Volume plus a queryable Delta row: metrics, training-data version, approver, timestamp. |
-| **Governed drift metrics** | PSI registered as a Unity Catalog function, so every team uses one audited formula. Integration tests assert the SQL matches the Python implementation. |
+| **Governed drift metrics** | A [data profiling](https://docs.databricks.com/aws/en/data-governance/unity-catalog/data-quality-monitoring/data-profiling/) Inference profile on the inference log generates PSI, KS, Jensen–Shannon, chi-squared and model-quality metrics plus a dashboard — from ~10 lines of configuration, no metric code to maintain. |
 | **Gated auto-retraining** | Drift triggers model *building*, never model *promotion*. Retrained models enter as challengers and face the same gate. |
 | **Decoupled decision layer** | The model outputs a probability; business rules (eligibility, risk bands, limit caps) are separate UC SQL functions. Policy changes ship without retraining. |
 
@@ -47,7 +47,7 @@ databricks_mlops_platform/
 │   ├── naming.py               #   asset addressing; one place to change the UC layout
 │   ├── promotion.py            #   approval gate, promotion, rollback
 │   ├── audit.py                #   evidence packages
-│   ├── metrics.py              #   PSI (Python + UC SQL function)
+│   ├── metrics.py              #   PSI — the retraining verdict, unit tested offline
 │   └── task_values.py          #   safe task-value access across single-task re-runs
 ├── feature_engineering/        # transforms — pure functions, unit tested
 ├── training/                   # LightGBM training; registers a CHALLENGER only
@@ -131,9 +131,13 @@ the online feature store, and FinOps tagging/budgets. Approval is captured as a 
 environment review plus a Unity Catalog tag rather than through a developer portal — the
 control is enforced; the portal integration is not built.
 
-**Lakehouse Monitoring is unavailable on Databricks Free Edition** — the quality-monitors API
-is not served there at all, even to a workspace admin. `SetupMonitor` detects that and exits
-`MONITOR_UNSUPPORTED` instead of failing the pipeline. Drift detection is unaffected:
-`DriftCheck` computes PSI from the UC function against the baseline table, so the
-drift-triggers-retraining path still works. Only the managed profile/drift metric tables are
-absent.
+**Data profiling works on the tiers this platform targets, including Free Edition** — verified
+by creating an active monitor there. Where the quality-monitors API is genuinely absent (some
+tiers or regions), `SetupMonitor` exits `MONITOR_UNSUPPORTED` instead of failing the pipeline,
+and drift detection is unaffected: `DriftCheck` computes PSI in Python against the baseline
+table, so the drift-triggers-retraining path still works. Only the managed metric tables and
+generated dashboard are absent.
+
+Note that `inference_log_drift_metrics` stays empty until the log spans two windows at the
+configured granularity — `CONSECUTIVE` drift needs a prior window to compare against.
+`BASELINE` drift appears as soon as the baseline table is configured.
