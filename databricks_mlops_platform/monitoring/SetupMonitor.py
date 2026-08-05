@@ -2,13 +2,13 @@
 ##################################################################################
 # Monitor Setup Notebook
 #
-# Idempotently creates two things:
-#   1. The PSI metric as a Unity Catalog SQL function. Registering it in UC — rather than
-#      importing a wheel per job — means every team computes drift with the identical,
-#      audited formula, and the definition is version-controlled in platform_utils.metrics.
-#   2. A data profiling monitor with an Inference profile attached to the inference log
-#      table. (Data profiling was formerly called Lakehouse Monitoring; the SDK namespace
-#      is still w.quality_monitors.)
+# Idempotently attaches a data profiling monitor with an Inference profile to the inference
+# log table. (Data profiling was formerly called Lakehouse Monitoring; the SDK namespace is
+# still w.quality_monitors.)
+#
+# The monitor is what produces the profile and drift metric tables plus the generated
+# dashboard, and its drift table computes population_stability_index natively — so the
+# platform does not register a PSI SQL function of its own.
 #
 # Run once per environment, and again after the monitored schema changes.
 #
@@ -44,22 +44,6 @@ names = AssetNames(
     schema=dbutils.widgets.get("schema_name"),
     model=dbutils.widgets.get("model_name"),
 )
-
-# COMMAND ----------
-
-# DBTITLE 1,Register PSI as a Unity Catalog function
-from platform_utils.metrics import psi_function_ddl
-
-spark.sql(psi_function_ddl(names.fn_calculate_psi))
-print(f"Registered UC function {names.fn_calculate_psi}")
-
-# Verified against a known-divergent pair rather than assumed: a silently broken metric
-# would make the whole drift story untrustworthy.
-check = spark.sql(
-    f"SELECT {names.fn_calculate_psi}(array(400D,50D,25D,25D), array(100D,100D,100D,100D)) AS psi"
-).collect()[0]["psi"]
-print(f"  sanity check PSI (heavily shifted distributions) = {check:.4f}")
-assert check > 0.25, f"PSI function returned {check}, expected a large drift signal"
 
 # COMMAND ----------
 
@@ -103,8 +87,8 @@ monitor_config = dict(
 # verified by creating an active monitor there. The fallback below exists only for tiers or
 # regions where the API is genuinely absent, which is a capability gap rather than a
 # pipeline fault: the governance chain (train, validate, gate, promote, score) does not
-# depend on the managed monitor, and DriftCheck computes PSI from the UC function registered
-# above rather than from the monitor's metric tables.
+# depend on the managed monitor, and DriftCheck computes PSI in Python against the baseline
+# table rather than reading the monitor's metric tables.
 #
 # Matched on the endpoint-absent response only. Permission and configuration errors still
 # raise, so this cannot mask a real misconfiguration as an unsupported feature.
@@ -143,20 +127,41 @@ except DatabricksError as err:
         "Data profiling (data quality monitoring) is unavailable in this workspace "
         f"({w.config.host}); skipping monitor attachment.\n"
         f"  API response: {err}\n"
-        "  Drift detection still runs: DriftCheck computes PSI from "
-        f"{names.fn_calculate_psi} against the baseline table, and the retraining "
-        "branch is unaffected. Only the managed profile/drift metric tables are absent."
+        "  Drift detection still runs: DriftCheck computes PSI in Python against "
+        f"{names.baseline_table}, and the retraining branch is unaffected. Only the "
+        "managed profile/drift metric tables and the generated dashboard are absent."
     )
 
 # COMMAND ----------
 
-# DBTITLE 1,Report the generated metric tables
+# DBTITLE 1,Report the generated assets
 if monitor_ready:
+    monitor = w.quality_monitors.get(table_name=names.inference_log)
+
     print("Monitor will populate:")
     print(f"  profile metrics: {names.profile_metrics}")
     print(f"  drift metrics  : {names.drift_metrics}")
     print("\nThese appear after the monitor's first refresh, which may take several minutes.")
+
+    # The generated dashboard is the artefact worth showing an audience, so print a
+    # deep link rather than leaving them to find it under the table's Quality tab.
+    if monitor.dashboard_id:
+        print(f"\nGenerated dashboard: {w.config.host}/sql/dashboardsv3/{monitor.dashboard_id}")
+
+    # Drift rows have preconditions that are easy to mistake for a broken monitor:
+    #   BASELINE    drift needs baseline_table_name, set above.
+    #   CONSECUTIVE drift needs two populated windows at the configured granularity, so it
+    #               stays empty until the log spans a second day.
+    days = spark.sql(
+        f"SELECT count(DISTINCT date(scored_at)) AS days FROM {names.inference_log}"
+    ).collect()[0]["days"]
+    if days < 2:
+        print(
+            f"\nNote: {names.inference_log} spans {days} day(s) at '1 day' granularity, so "
+            "CONSECUTIVE drift rows cannot be computed yet — a window needs a prior window "
+            "to compare against. BASELINE drift is unaffected."
+        )
 else:
-    print("No managed metric tables will be produced in this workspace.")
+    print("No managed metric tables or dashboard will be produced in this workspace.")
 
 dbutils.notebook.exit("MONITOR_READY" if monitor_ready else "MONITOR_UNSUPPORTED")

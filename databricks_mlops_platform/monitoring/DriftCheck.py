@@ -71,22 +71,23 @@ def bucket_counts(df, column, edges):
     """Count rows per bucket using edges derived from the baseline.
 
     Both distributions must be bucketed on the *same* edges, otherwise the PSI comparison
-    is meaningless — this is the most common way a hand-rolled PSI goes wrong.
+    is meaningless — this is the most common way a hand-rolled PSI goes wrong, so the edges
+    are always passed in rather than recomputed per distribution.
+
+    The bucket index is the count of edges a value exceeds, which Spark can express
+    directly as a sum of boolean casts — no per-bucket ``when`` chain needed.
     """
     from pyspark.sql import functions as F
 
-    bucket_expr = F.lit(0)
-    for index, edge in enumerate(edges):
-        bucket_expr = F.when(F.col(column) > edge, F.lit(index + 1)).otherwise(bucket_expr)
+    bucket = sum((F.col(column) > edge).cast("int") for edge in edges)
 
     counts = (
         df.filter(F.col(column).isNotNull())
-        .withColumn("_bucket", bucket_expr)
-        .groupBy("_bucket")
+        .groupBy(bucket.alias("bucket"))
         .count()
         .collect()
     )
-    by_bucket = {row["_bucket"]: row["count"] for row in counts}
+    by_bucket = {row["bucket"]: row["count"] for row in counts}
     return [float(by_bucket.get(i, 0)) for i in range(len(edges) + 1)]
 
 
@@ -142,17 +143,17 @@ if results:
 
 # DBTITLE 1,Decide whether to retrain
 breaches = [(c, p) for c, p, v in results if v == "RETRAIN"]
-warnings = [(c, p) for c, p, v in results if v == "WARN"]
+warned = [c for c, _, v in results if v == "WARN"]
 
 retrain_required = bool(breaches)
-worst = max(results, key=lambda r: r[1]) if results else None
 
 print("=" * 66)
 print(f"Features checked : {len(results)}")
-print(f"Warnings         : {len(warnings)} {[c for c, _ in warnings]}")
+print(f"Warnings         : {len(warned)} {warned}")
 print(f"Retrain breaches : {len(breaches)} {[c for c, _ in breaches]}")
-if worst:
-    print(f"Worst drift      : {worst[0]} (PSI={worst[1]:.4f})")
+if results:
+    feature, psi, _ = max(results, key=lambda r: r[1])
+    print(f"Worst drift      : {feature} (PSI={psi:.4f})")
 print(f"Decision         : {'RETRAIN' if retrain_required else 'NO ACTION'}")
 print("=" * 66)
 

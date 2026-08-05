@@ -1,10 +1,13 @@
 """Drift and stability metrics.
 
-Population Stability Index (PSI) is the metric credit-risk teams actually govern on,
-and it is not a built-in data profiling metric. Implementing it here as a pure
-function gives it two properties that matter: it is unit-testable without a cluster,
-and it is registered once as a Unity Catalog function so every team computes drift
-with the identical, audited formula.
+Population Stability Index (PSI) is the metric credit-risk teams actually govern on.
+Implemented here as a pure function so it is unit-testable without a cluster, and so the
+formula the retraining decision rests on is version-controlled in one place.
+
+Note that data profiling also emits ``population_stability_index`` in the monitor's
+``_drift_metrics`` table. This module stays the source of the *retraining verdict* because
+``DriftCheck`` must return one on every run, whereas the managed metrics appear only after
+a monitor refresh and need two populated windows to compare.
 """
 from typing import Sequence
 
@@ -67,43 +70,3 @@ def psi_verdict(psi: float, warn: float = 0.10, retrain: float = 0.25) -> str:
     if psi >= warn:
         return "WARN"
     return "STABLE"
-
-
-# SQL body registered as a Unity Catalog function. Registering the metric in UC — rather
-# than importing a wheel into each job — means the CM and fraud teams compute PSI with
-# the same audited definition, and the formula itself is version-controlled here.
-PSI_UC_FUNCTION_TEMPLATE = """
-CREATE OR REPLACE FUNCTION {function_name}(
-  actual_counts ARRAY<DOUBLE>,
-  expected_counts ARRAY<DOUBLE>
-)
-RETURNS DOUBLE
-LANGUAGE SQL
-DETERMINISTIC
-COMMENT 'Population Stability Index between an observed and a baseline distribution.'
-RETURN (
-  SELECT COALESCE(
-    SUM(
-      (actual_pct - expected_pct) * LN(actual_pct / expected_pct)
-    ), 0.0)
-  FROM (
-    SELECT
-      GREATEST(a.count_value / NULLIF(totals.actual_total, 0), {epsilon}) AS actual_pct,
-      GREATEST(e.count_value / NULLIF(totals.expected_total, 0), {epsilon}) AS expected_pct
-    FROM
-      (SELECT posexplode(actual_counts) AS (idx, count_value)) a
-      JOIN (SELECT posexplode(expected_counts) AS (idx, count_value)) e
-        ON a.idx = e.idx
-      CROSS JOIN (
-        SELECT
-          aggregate(actual_counts, 0D, (acc, x) -> acc + x) AS actual_total,
-          aggregate(expected_counts, 0D, (acc, x) -> acc + x) AS expected_total
-      ) totals
-  )
-)
-"""
-
-
-def psi_function_ddl(function_name: str) -> str:
-    """Render the ``CREATE FUNCTION`` statement for the UC-registered PSI metric."""
-    return PSI_UC_FUNCTION_TEMPLATE.format(function_name=function_name, epsilon=_EPSILON)

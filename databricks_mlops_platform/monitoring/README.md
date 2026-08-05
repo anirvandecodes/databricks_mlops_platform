@@ -4,7 +4,7 @@ Drift detection and gated retraining. Enabled by default — there are no TODOs 
 
 | File | Purpose |
 |---|---|
-| `SetupMonitor.py` | Registers the PSI Unity Catalog function and attaches a data profiling monitor to the inference log. Idempotent. |
+| `SetupMonitor.py` | Attaches a [data profiling](https://docs.databricks.com/aws/en/data-governance/unity-catalog/data-quality-monitoring/data-profiling/) monitor to the inference log. Idempotent. |
 | `JoinGroundTruth.py` | Backfills matured outcomes into the log's `ground_truth` column. Idempotent. |
 | `label_join.py` | The merge logic behind that backfill, unit tested offline. |
 | `DriftCheck.py` | Computes PSI per monitored feature against the training baseline and decides whether retraining is warranted. |
@@ -31,17 +31,36 @@ databricks bundle run monitoring_job -t dev
 The inference log must exist first, so run `batch_inference_job` at least once — a monitor
 cannot attach to a table that does not yet exist.
 
-## How drift is measured
+## What data profiling gives you for free
 
-PSI (Population Stability Index) is the metric credit-risk teams govern on, and it is not a
-built-in data profiling metric. It is implemented twice, deliberately:
+`SetupMonitor` attaches an **Inference profile** to the inference log. Configuring that one
+monitor is what produces, with no metric code of our own:
 
-- `platform_utils/metrics.py` — a pure Python function, unit tested offline.
-- The same formula registered as a **Unity Catalog SQL function**, so every team computes
-  drift with one audited definition.
+| Asset | Contents |
+|---|---|
+| `inference_log_profile_metrics` | Per-column summary stats per window, plus table-level model quality (accuracy, precision, recall, confusion matrix) under `column_name = ':table'` |
+| `inference_log_drift_metrics` | `population_stability_index`, `js_distance`, `ks_test`, `wasserstein_distance`, `chi_squared_test`, `tv_distance`, `l_infinity_distance` |
+| Generated dashboard | Data-quality and model-quality panels over both tables; `SetupMonitor` prints the deep link |
 
-`tests/integration/test_uc_functions.py` asserts the two agree, which is what stops the
-tested logic from drifting away from the deployed logic.
+Two things gate whether drift rows appear, and both look like a broken monitor when they
+are not met:
+
+- **`BASELINE` drift** needs `baseline_table_name` — set, pointing at `baseline_snapshot`.
+- **`CONSECUTIVE` drift** needs two populated windows at the configured granularity (`1 day`),
+  so it stays empty until the log spans a second day. `SetupMonitor` reports the day count
+  for exactly this reason.
+
+Note that inference and time-series profiles only compute metrics over the **last 30 days**.
+
+## How the retraining verdict is measured
+
+The monitor's PSI is what you *show*; the retraining branch computes its own in
+`platform_utils/metrics.py` — a pure Python function, unit tested offline without a cluster.
+
+That is deliberate rather than duplicated by accident: `DriftCheck` must set
+`retrain_required` on **every** run, whereas the managed drift metrics land only after a
+monitor refresh and only once two windows exist. Making the condition task wait on refresh
+timing would make retraining silently dependent on it.
 
 Verdicts (thresholds are bundle variables, tunable per environment):
 

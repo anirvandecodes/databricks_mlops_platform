@@ -109,7 +109,7 @@ show these, in this order.
 |---|---|---|
 | **Models** | `credit_risk_model` (1 version, `@champion → v1`) | "One version, promoted instantly. No gate here." |
 | **Tables (9)** | `credit_features`, `training_data`, `scoring_input`, `raw_model_predictions`, `credit_decisions`, `inference_log`, `baseline_snapshot`, `ground_truth_outcomes`, `promotion_audit_log` | "The full lifecycle exists in dev — features through to decisions. Nothing is special about prod's *shape*." |
-| **Functions (2, or 3)** | `evaluate_eligibility`, `calculate_credit_limit` — plus `calculate_psi` once the monitoring job has run | "Business policy is a set of UC functions, not code buried in a notebook. The drift metric joins them when monitoring first runs." |
+| **Functions (2)** | `evaluate_eligibility`, `calculate_credit_limit` | "Business policy is a set of UC functions, not code buried in a notebook. Drift metrics are not here — data profiling generates those itself." |
 | **Volumes** | `audit_logs` | "Even dev writes audit evidence." |
 | **Jobs** | 5, prefixed `[dev <username>]` | "Per-user namespacing — two scientists cannot collide." |
 
@@ -121,7 +121,7 @@ show these, in this order.
 |---|---|---|
 | **Models** | `credit_risk_model` — **9 versions**, `@champion → v9` | ★ "Nine versions. Every merge to `main` trains and promotes one. This is CI exercising the pipeline over and over." |
 | **Tables (9)** | same nine as dev | "Identical schema to dev and prod. One code path." |
-| **Functions (2, or 3)** | same as dev | — |
+| **Functions (2)** | same as dev | — |
 | **Jobs** | 5, prefixed `staging-` | "No user prefix — these are CI's jobs, not a person's." |
 
 *The version count is the story here.* Put dev (1 version) and staging (9 versions) side by
@@ -637,7 +637,82 @@ Point out the schedule: `0 0 18 * * ?` — daily at 18:00 UTC, after the day's s
 > "It is deployed paused, so a demo workspace does not accumulate runs. In production you
 > unpause it and drift is checked every evening without anyone remembering to."
 
-### 7b. The PSI metric, and why it is a Unity Catalog function
+### 7b. Data profiling — one monitor, and the metrics come for free
+
+**This is the part to spend time on.** The platform writes no drift-metric code of its own;
+it configures a
+[data profiling](https://docs.databricks.com/aws/en/data-governance/unity-catalog/data-quality-monitoring/data-profiling/)
+monitor and Unity Catalog does the rest.
+
+Show the configuration first — `monitoring/SetupMonitor.py`, the `MonitorInferenceLog` block.
+It is about ten lines:
+
+```python
+inference_log=MonitorInferenceLog(
+    problem_type=MonitorInferenceLogProblemType.PROBLEM_TYPE_CLASSIFICATION,
+    prediction_col="prediction",
+    label_col="ground_truth",
+    timestamp_col="scored_at",
+    model_id_col="model_version",
+    granularities=["1 day"],
+),
+baseline_table_name=names.baseline_table,
+```
+
+> "That is the entire drift implementation. An **Inference profile** — one of three profile
+> types, alongside snapshot and time series — is the one that understands that a table holds
+> predictions: it knows which column is the prediction, which is the label, and which model
+> version produced each row."
+
+Then show what those ten lines generated. **Catalog Explorer → `inference_log` → Quality**:
+
+| Generated asset | What it holds |
+|---|---|
+| `inference_log_profile_metrics` | per-column stats per window, **plus model quality** — accuracy, precision, recall, confusion matrix — under `column_name = ':table'` |
+| `inference_log_drift_metrics` | `population_stability_index`, `js_distance`, `ks_test`, `wasserstein_distance`, `chi_squared_test`, `tv_distance`, `l_infinity_distance` |
+| A dashboard | built automatically; `SetupMonitor` prints the deep link |
+
+> "PSI is a *built-in column*. So are the KS test, Jensen–Shannon distance, chi-squared,
+> Wasserstein. Nobody on this team implemented, tested, or maintains any of them — and the
+> model-quality half comes from the same one monitor, which is why the label backfill in 7a
+> matters so much."
+
+Open the generated dashboard. This is the strongest single visual in the demo: a governance
+audience gets drift and model quality over time without anyone building a dashboard.
+
+Query the metrics directly to make the point that these are ordinary UC tables:
+
+```sql
+SELECT window.start, column_name, population_stability_index, ks_test.pvalue
+FROM workspace.payments_dev.inference_log_drift_metrics
+WHERE drift_type = 'BASELINE' AND column_name != ':table'
+ORDER BY population_stability_index DESC NULLS LAST;
+```
+
+```sql
+-- model quality, from the same monitor
+SELECT window.start, accuracy_score, precision.macro, recall.macro
+FROM workspace.payments_dev.inference_log_profile_metrics
+WHERE column_name = ':table' AND log_type = 'INPUT'
+ORDER BY window.start DESC;
+```
+
+**Expect the drift table to be empty on a fresh demo, and say why — it is a good detail, not
+a gap:**
+
+| Drift type | Needs | On a fresh demo |
+|---|---|---|
+| `BASELINE` | a baseline table | configured, so these rows appear |
+| `CONSECUTIVE` | two populated windows at `1 day` | **empty until the log spans a second day** |
+
+> "A window needs a prior window to compare against. So consecutive drift is empty on day
+> one — that is arithmetic, not a broken monitor. `SetupMonitor` prints the day count so
+> nobody spends an afternoon debugging it."
+
+Also worth stating plainly: inference and time-series profiles compute over the **last 30
+days**.
+
+### 7b-ii. Why the retraining verdict is still computed in Python
 
 Open `platform_utils/metrics.py` and show `population_stability_index`.
 
@@ -650,35 +725,16 @@ credit-risk reading:
 | 0.10 – 0.25 | moderate shift, investigate | `WARN` — recorded, no retraining |
 | ≥ 0.25 | significant shift | `RETRAIN` — triggers the training job |
 
-`SetupMonitor` registers this as a **UC SQL function** named `calculate_psi`. It does **not
-exist until the monitoring job has run** — that job is what creates it — so run the job during
-setup, then show the function in Catalog Explorer under Functions.
+The obvious question, and you should raise it before the audience does: *if the monitor
+already computes PSI, why compute it again?*
 
-> "PSI is registered in Unity Catalog rather than shipped in a wheel per job. That means
-> every team — data science, model risk, audit — computes drift with the identical audited
-> formula. It is also callable from a SQL dashboard by someone who has never opened the repo."
+> "Because the condition task has to branch on **every** run. The managed metrics land after
+> a monitor refresh, and consecutive drift needs two windows — so wiring the retraining
+> branch to that table would make retraining depend on refresh timing. The monitor is the
+> evidence a human reads; this function is the trigger a job acts on. Different jobs."
 
-And the guard that makes it trustworthy:
-
-> "An integration test asserts the SQL function returns the same value as the Python
-> reference implementation. A silently divergent metric would make the whole drift story
-> untrustworthy, so the platform tests that they agree."
-
-Once the monitoring job has run at least once, call the function live in the SQL editor:
-
-```sql
-SELECT workspace.payments_dev.calculate_psi(
-  array(400D, 50D, 25D, 25D),      -- live distribution, heavily shifted
-  array(100D, 100D, 100D, 100D)    -- training baseline, uniform
-) AS psi;
-```
-
-Returns a value well above 0.25 — a clear retrain signal. `SetupMonitor` runs this exact
-sanity check itself and asserts the result exceeds 0.25, so a broken metric fails the job
-rather than silently reporting no drift.
-
-**If it errors with `UNRESOLVED_ROUTINE`,** the monitoring job has not run in that schema yet.
-That is the expected state on a fresh workspace, not a fault.
+It is a pure function, so it is unit tested offline with no cluster at all — the same tier
+that runs on every pull request.
 
 ### 7c. The thresholds are configuration, not code
 
@@ -963,9 +1019,9 @@ Volunteering limitations builds far more credibility than being caught by them.
 
 **The monitoring jobs are deployed paused and are not run by CI/CD.** The monitoring job's
 schedule (`0 0 18 * * ?`) ships with `pause_status: PAUSED`, and no CD workflow invokes it —
-so on a fresh deployment it has never run, and neither `calculate_psi` nor
-`drift_check_results` exists yet. Run it once during setup. In production you unpause the
-schedule; that is a deliberate deployment decision rather than something CI should force.
+so on a fresh deployment it has never run, the monitor is not attached, and
+`drift_check_results` does not exist yet. Run it once during setup. In production you unpause
+the schedule; that is a deliberate deployment decision rather than something CI should force.
 
 **Separation of duties is demonstrated, not enforced, in this instance.** The repo has a
 single owner, so the same person plays every persona. The *mechanism* is real — the pipeline
