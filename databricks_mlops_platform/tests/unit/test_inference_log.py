@@ -61,3 +61,28 @@ def test_ground_truth_starts_null_and_typed(logged):
     """The placeholder keeps the monitor's schema stable before outcomes mature."""
     assert dict(logged.dtypes)["ground_truth"] == "double"
     assert logged.filter("ground_truth IS NOT NULL").count() == 0
+
+
+# -- A/B variant column (backward compatible) -------------------------------------
+
+
+def test_variant_column_is_omitted_when_absent(logged):
+    """A champion-only batch carries no variant, and the log must build without one."""
+    assert "variant" not in logged.columns
+
+
+def test_variant_column_is_carried_through_when_present(spark):
+    """An A/B batch stamps a variant, which the log must preserve for per-arm slicing."""
+    from pyspark.sql import functions as F
+
+    schema = "customer_id string, duration bigint, prediction double, model_version string, variant string"
+    rows = [
+        ("c1", 12, 0.05, "3", "A"),
+        ("c2", 24, 0.80, "4", "B"),
+    ]
+    scored = spark.createDataFrame(rows, schema).withColumn(
+        "scored_at", F.current_timestamp()
+    )
+    log = build_inference_log(scored, monitored_columns=["duration"], decision_threshold=0.30)
+    assert "variant" in log.columns
+    assert {r["variant"] for r in log.select("variant").collect()} == {"A", "B"}

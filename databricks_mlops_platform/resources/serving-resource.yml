@@ -1,0 +1,53 @@
+# Real-time serving workflow.
+#
+# Creates/updates a Model Serving endpoint that serves the credit-risk model, optionally
+# splitting traffic across two versions for an A/B experiment. On-demand (no schedule),
+# because the endpoint only needs re-syncing when an alias moves or the experiment config
+# changes:
+#
+#   databricks bundle run serving_endpoint_job -t dev
+#   # End an experiment (route 100% to champion) — ungated:
+#   databricks bundle run serving_endpoint_job -t prod --params ab_enabled=false
+#
+# The endpoint pins concrete versions, so wire this as a re-sync step downstream of
+# promotion/rollback in a real deployment. It degrades gracefully (SERVING_UNSUPPORTED)
+# where Model Serving is unavailable.
+common_permissions: &permissions
+  permissions:
+    - level: CAN_VIEW
+      group_name: users
+
+resources:
+  jobs:
+    serving_endpoint_job:
+      name: ${bundle.target}-mlops-platform-serving-endpoint-job
+
+      # Overridable at run time. ab_enabled defaults to the target's variable, but can be
+      # forced to "false" to end an experiment without a code change or approval.
+      parameters:
+        - name: ab_enabled
+          default: ${var.ab_enabled}
+
+      tasks:
+        - task_key: SetupServing
+          environment_key: default
+          notebook_task:
+            notebook_path: ../deployment/serving/SetupServingEndpoint.py
+            base_parameters:
+              env: ${bundle.target}
+              catalog_name: ${var.catalog_name}
+              schema_name: ${var.schema_name}
+              model_name: ${var.model_name}
+              ab_enabled: "{{job.parameters.ab_enabled}}"
+              ab_variant_b_alias: ${var.ab_variant_b_alias}
+              ab_traffic_split_pct: ${var.ab_traffic_split_pct}
+              approval_required: ${var.approval_required}
+
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "3"
+            dependencies:
+              - -r ../requirements.txt
+
+      <<: *permissions

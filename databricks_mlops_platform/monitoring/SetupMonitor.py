@@ -68,6 +68,16 @@ from databricks.sdk.service.catalog import MonitorInferenceLog, MonitorInference
 
 w = WorkspaceClient()
 
+# Slice metrics by the A/B arm when the column is present. The two arms are already served
+# by different model versions, so per-arm *quality* metrics (accuracy, precision, recall,
+# confusion matrix) fall out of `model_id_col="model_version"` on their own; adding
+# `variant` to slicing_exprs makes the arm an explicit dimension too, which keeps the split
+# legible even if both arms ever point at the same version. Guarded so a log without the
+# column (champion-only history) does not reference a missing field.
+slicing_exprs = ["variant"] if "variant" in spark.table(names.inference_log).columns else []
+if slicing_exprs:
+    print(f"Slicing monitor metrics by: {slicing_exprs}")
+
 monitor_config = dict(
     output_schema_name=names.fq_schema,
     inference_log=MonitorInferenceLog(
@@ -81,6 +91,7 @@ monitor_config = dict(
         granularities=["1 day"],
     ),
     baseline_table_name=names.baseline_table,
+    slicing_exprs=slicing_exprs,
 )
 
 # Data profiling is available on the tiers this platform targets, including Free Edition —
@@ -118,6 +129,10 @@ try:
         print(f"Created monitor on {names.inference_log}")
     else:
         print(f"Monitor already exists (status: {existing.status}); updating configuration.")
+        # Note: if `variant` slicing was added to an already-attached monitor and the API
+        # rejects changing slicing_exprs on update, the monitor must be recreated (delete
+        # then re-run). The per-version quality metrics do not depend on the variant slice,
+        # so drift/quality tracking continues to work either way.
         w.quality_monitors.update(table_name=names.inference_log, **monitor_config)
 except DatabricksError as err:
     if not _monitoring_unsupported(err):

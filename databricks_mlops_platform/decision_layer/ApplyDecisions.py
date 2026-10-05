@@ -100,16 +100,32 @@ print(f"Wrote {decisions.count()} decisions to {names.credit_decisions}")
 # DBTITLE 1,Summarise the decision distribution
 # Printed per run because a sudden shift in the band mix is often the first visible sign of
 # a model or data problem — ahead of any drift metric refreshing.
+#
+# When an A/B experiment is running, `variant` and `model_version` flow through from the
+# predictions table, so the band mix is grouped per arm — the first place a divergence
+# between the two models becomes visible. Guarded so a champion-only run is unaffected.
+group_cols = (["variant"] if "variant" in decisions.columns else []) + ["risk_band"]
 summary = (
-    decisions.groupBy("risk_band")
+    decisions.groupBy(*group_cols)
     .agg(
         F.count("*").alias("applicants"),
         F.round(F.avg("prediction"), 4).alias("avg_pd"),
         F.round(F.avg("offered_credit_limit"), 0).alias("avg_limit"),
     )
-    .orderBy("risk_band")
+    .orderBy(*group_cols)
 )
 summary.show(truncate=False)
+
+# Per-arm approval rate, published for the A/B comparison to consume.
+if "variant" in decisions.columns:
+    per_arm_rate = {
+        r["variant"]: round(r["approval_rate"], 4)
+        for r in decisions.groupBy("variant")
+        .agg(F.avg(F.col("is_eligible").cast("double")).alias("approval_rate"))
+        .collect()
+    }
+    print(f"Approval rate by arm: {per_arm_rate}")
+    dbutils.jobs.taskValues.set("approval_rate_by_arm", per_arm_rate)
 
 approval_rate = decisions.filter(F.col("is_eligible")).count() / max(decisions.count(), 1)
 print(f"Overall approval rate: {approval_rate:.2%}")

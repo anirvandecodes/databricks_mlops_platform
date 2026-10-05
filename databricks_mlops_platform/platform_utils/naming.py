@@ -91,6 +91,37 @@ class AssetNames:
         """Monitor-generated drift metrics (created by data profiling)."""
         return f"{self.inference_log}_drift_metrics"
 
+    # -- A/B experiment ---------------------------------------------------------
+    @property
+    def ab_comparison_results(self) -> str:
+        """Per-arm A/B comparison metrics, appended one row-set per analysis run."""
+        return self.table("ab_comparison_results")
+
+    @property
+    def ab_experiment_config(self) -> str:
+        """Record of the currently active A/B experiment (arm, split, salt, approver)."""
+        return self.table("ab_experiment_config")
+
+    @property
+    def serving_endpoint_name(self) -> str:
+        """Real-time serving endpoint name.
+
+        Endpoint names live in a flat, workspace-wide namespace — they cannot be
+        catalog/schema-qualified — so the schema is folded into the name (dots are not
+        allowed either) to keep dev/staging/prod endpoints from colliding.
+        """
+        return f"{self.schema}-{self.model}-ab"
+
+    @property
+    def serving_payload_prefix(self) -> str:
+        """Prefix for the serving endpoint's auto-captured request/response tables."""
+        return f"{self.model}_serving"
+
+    @property
+    def serving_payload_table(self) -> str:
+        """Auto-capture payload table produced by the serving endpoint."""
+        return self.table(f"{self.serving_payload_prefix}_payload")
+
     # -- decision layer ---------------------------------------------------------
     @property
     def credit_decisions(self) -> str:

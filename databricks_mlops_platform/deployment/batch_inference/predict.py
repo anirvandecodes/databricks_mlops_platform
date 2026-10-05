@@ -12,6 +12,47 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
 
+# Identifiers and bookkeeping columns are not model inputs; passing them would break the
+# model signature. Also excludes the A/B ``variant`` label, which is assigned before scoring
+# and must not be fed to the model.
+_NON_FEATURE_COLUMNS = {
+    "customer_id",
+    "computed_at",
+    "scoring_batch_date",
+    "class",
+    "residence_band",
+    "age_band",
+    "env",
+    "ingested_at",
+    "variant",
+}
+
+
+def _score_df(
+    spark: SparkSession,
+    source: DataFrame,
+    model_uri: str,
+    model_version: str,
+) -> DataFrame:
+    """Score an already-loaded frame with the model at ``model_uri``.
+
+    Split out from :func:`score_batch` so the A/B path can score a per-arm subset with a
+    different model without re-reading the table. Adds ``prediction``, ``model_version``
+    and ``scored_at``; any other pre-existing column (e.g. an A/B ``variant``) is preserved.
+    """
+    import mlflow
+
+    feature_columns = [c for c in source.columns if c not in _NON_FEATURE_COLUMNS]
+
+    predict_udf = mlflow.pyfunc.spark_udf(spark, model_uri=model_uri, result_type="double")
+
+    return (
+        source.withColumn("prediction", predict_udf(F.struct(*feature_columns)))
+        .withColumn("model_version", F.lit(str(model_version)))
+        .withColumn("scored_at", F.current_timestamp())
+    )
+
+
 def score_batch(
     spark: SparkSession,
     model_uri: str,
@@ -26,31 +67,56 @@ def score_batch(
         prediction to the model that produced it.
     :return: Input columns plus ``prediction``, ``model_version`` and ``scored_at``.
     """
-    import mlflow
+    return _score_df(spark, spark.table(input_table), model_uri, model_version)
 
-    source = spark.table(input_table)
 
-    # Feature columns only: identifiers and bookkeeping columns are not model inputs, and
-    # passing them would break the model signature.
-    exclude = {
-        "customer_id",
-        "computed_at",
-        "scoring_batch_date",
-        "class",
-        "residence_band",
-        "age_band",
-        "env",
-        "ingested_at",
-    }
-    feature_columns = [c for c in source.columns if c not in exclude]
+def assign_variants(
+    df: DataFrame,
+    split_pct: int,
+    salt: str,
+    id_col: str = "customer_id",
+) -> DataFrame:
+    """Add an A/B ``variant`` column, deterministically by ``id_col``.
 
-    predict_udf = mlflow.pyfunc.spark_udf(spark, model_uri=model_uri, result_type="double")
+    See ``platform_utils.variants``: assignment is a pure function of the id and salt, so a
+    customer's arm is stable across daily batches.
+    """
+    from platform_utils.variants import VARIANT_COL, variant_column_expr
 
-    return (
-        source.withColumn("prediction", predict_udf(F.struct(*feature_columns)))
-        .withColumn("model_version", F.lit(str(model_version)))
-        .withColumn("scored_at", F.current_timestamp())
-    )
+    return df.withColumn(VARIANT_COL, variant_column_expr(id_col, split_pct, salt))
+
+
+def score_batch_ab(
+    spark: SparkSession,
+    input_table: str,
+    arms: list,
+    split_pct: int,
+    salt: str,
+    id_col: str = "customer_id",
+) -> DataFrame:
+    """Score one batch across two A/B arms, each with its own model.
+
+    Each customer is assigned an arm once (deterministically), then each arm's subset is
+    scored with that arm's model and the results are unioned. Every row carries the
+    ``variant`` label alongside the ``model_version`` that produced it, so the inference log
+    and the monitor can compare the arms.
+
+    :param arms: ``[(variant_label, model_uri, model_version), ...]`` — one entry per arm.
+    :return: The same columns :func:`score_batch` produces, plus ``variant``.
+    """
+    from platform_utils.variants import VARIANT_COL
+
+    assigned = assign_variants(spark.table(input_table), split_pct, salt, id_col=id_col)
+
+    scored_arms = []
+    for label, model_uri, model_version in arms:
+        arm_source = assigned.filter(F.col(VARIANT_COL) == F.lit(label))
+        scored_arms.append(_score_df(spark, arm_source, model_uri, model_version))
+
+    result = scored_arms[0]
+    for other in scored_arms[1:]:
+        result = result.unionByName(other)
+    return result
 
 
 def write_predictions(predictions: DataFrame, output_table: str) -> int:
@@ -103,6 +169,9 @@ def build_inference_log(
         predictions.select(
             *(["customer_id"] if "customer_id" in predictions.columns else []),
             *available,
+            # The A/B arm label, when scoring ran in experiment mode. Additive: a
+            # champion-only batch has no variant, and the log is built without one.
+            *(["variant"] if "variant" in predictions.columns else []),
             "prediction",
             "model_version",
             "scored_at",

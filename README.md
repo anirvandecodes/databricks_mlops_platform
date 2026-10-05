@@ -25,6 +25,7 @@ requirements. The platform itself is workload-agnostic.
 | **Governed drift metrics** | A [data profiling](https://docs.databricks.com/aws/en/data-governance/unity-catalog/data-quality-monitoring/data-profiling/) Inference profile on the inference log generates PSI, KS, Jensen–Shannon, chi-squared and model-quality metrics plus a dashboard — from ~10 lines of configuration, no metric code to maintain. |
 | **Gated auto-retraining** | Drift triggers model *building*, never model *promotion*. Retrained models enter as challengers and face the same gate. |
 | **Decoupled decision layer** | The model outputs a probability; business rules (eligibility, risk bands, limit caps) are separate UC SQL functions. Policy changes ship without retraining. |
+| **Governed A/B testing** | A live experiment splits traffic between champion (arm A) and challenger (arm B) — deterministically by `hash(customer_id)` in batch, by percentage on a real-time serving endpoint. Per-arm quality falls out of the monitor's per-version slicing; a comparison job writes accuracy/precision/recall/approval-rate/PSI plus a two-proportion significance test. Crucially, *starting* a live split is gated like a promotion (arm B must have passed validation and carry an `ab_experiment_status=approved` tag) and audited; *ending* it — routing 100% back to champion — is ungated, so an experiment can never prolong customer exposure to a bad model. |
 
 ## Pipeline
 
@@ -47,7 +48,9 @@ databricks_mlops_platform/
 │   ├── naming.py               #   asset addressing; one place to change the UC layout
 │   ├── promotion.py            #   approval gate, promotion, rollback
 │   ├── audit.py                #   evidence packages
-│   ├── metrics.py              #   PSI — the retraining verdict, unit tested offline
+│   ├── metrics.py              #   PSI + A/B significance test, unit tested offline
+│   ├── variants.py             #   deterministic A/B cohort assignment
+│   ├── experiment.py           #   A/B experiment approval gate
 │   └── task_values.py          #   safe task-value access across single-task re-runs
 ├── feature_engineering/        # transforms — pure functions, unit tested
 ├── training/                   # LightGBM training; registers a CHALLENGER only
@@ -55,8 +58,9 @@ databricks_mlops_platform/
 ├── deployment/
 │   ├── approval/               #   Stage-2 model gate
 │   ├── model_deployment/       #   promotion + rollback
-│   └── batch_inference/        #   alias-resolved scoring + inference logging
-├── monitoring/                 # monitor setup, PSI drift check, gated retraining
+│   ├── batch_inference/        #   alias-resolved scoring + inference logging (A/B aware)
+│   └── serving/                #   real-time serving endpoint with A/B traffic split
+├── monitoring/                 # monitor setup, PSI drift check, gated retraining, A/B comparison
 ├── decision_layer/             # business policy as UC SQL functions
 ├── resources/                  # 5 workflows as declarative YAML
 ├── scripts/bootstrap_uc.py     # one-time UC setup (idempotent)
@@ -126,10 +130,17 @@ named reviewer.
 
 ## Not implemented
 
-Stated plainly so scope is clear: distributed hyperparameter tuning, real-time serving and
-the online feature store, and FinOps tagging/budgets. Approval is captured as a GitHub
-environment review plus a Unity Catalog tag rather than through a developer portal — the
-control is enforced; the portal integration is not built.
+Stated plainly so scope is clear: distributed hyperparameter tuning, the online feature
+store, and FinOps tagging/budgets. Approval is captured as a GitHub environment review plus
+a Unity Catalog tag rather than through a developer portal — the control is enforced; the
+portal integration is not built.
+
+A real-time serving endpoint exists for A/B testing (`deployment/serving/`), but it is
+scoped to the experiment: its traffic split is percentage-based (stochastic per request),
+so — unlike the batch path — it does not route a given customer to a stable arm. Where Model
+Serving is unavailable (some tiers, including Free Edition) the setup exits
+`SERVING_UNSUPPORTED` rather than failing, and batch A/B plus the governance chain are
+unaffected.
 
 **Data profiling works on the tiers this platform targets, including Free Edition** — verified
 by creating an active monitor there. Where the quality-monitors API is genuinely absent (some
