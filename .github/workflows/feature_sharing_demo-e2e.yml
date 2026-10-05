@@ -1,0 +1,107 @@
+# Feature-sharing demo, full walkthrough. Plays the seven acts of
+# databricks_mlops_platform/feature_sharing_demo/README.md against staging, using demo.sh
+# exactly as a presenter would, and asserts every gate along the way: the steps the README
+# says are BLOCKED must fail, everything else must pass.
+#
+# The contract/config swaps and approvals happen only in this runner's checkout; nothing is
+# committed. The run starts by recreating the staging demo schemas and ends by re-deploying
+# this commit and re-publishing, so staging matches main again for the feature_sharing_demo
+# job in databricks_mlops_platform-bundle-cd-staging.yml. It shares that workflow's deploy lock.
+name: Feature sharing demo — end to end
+
+on:
+  workflow_dispatch:
+  # Weekly, so drift in the workspace or the Feature Engineering client shows up before a demo.
+  schedule:
+    - cron: "0 3 * * 1"
+
+defaults:
+  run:
+    working-directory: ./databricks_mlops_platform/feature_sharing_demo
+
+env:
+  DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+  DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+  TARGET: staging
+
+jobs:
+  walkthrough:
+    name: Acts 1–7
+    runs-on: ubuntu-latest
+    concurrency: staging-bundle-deploy
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: databricks/setup-cli@main
+      - run: pip install pyyaml pytest
+
+      - name: Before you start — rules offline, reset, deploy, mock data
+        run: |
+          pytest tests -q
+          ./demo.sh reset
+          ./demo.sh deploy
+          ./demo.sh run feature_demo_setup
+
+      - name: Act 1 — Team A publishes customer_features 1.0.0
+        run: ./demo.sh run team_a_feature_pipeline
+
+      - name: Act 2 — Team B discovers, trains @Champion, scores
+        run: ./demo.sh run team_b_training
+
+      - name: Act 3 — Team A finds who consumes the feature
+        run: ./demo.sh run feature_consumers_check
+
+      - name: Act 4 — in-place logic change is BLOCKED; versioned change needs approvals
+        run: |
+          if ./demo.sh check v1.1.0_wrong_in_place CR-001; then
+            echo "::error::in-place logic change should have been blocked"; exit 1
+          fi
+          if ./demo.sh check v1.1.0 CR-001; then
+            echo "::error::v1.1.0 should be blocked until team_a and team_b approve"; exit 1
+          fi
+
+      - name: Act 5 — approve and release 1.1.0; Team B's @Champion unaffected
+        run: |
+          ./demo.sh approve CR-001 team_a
+          if ./demo.sh check v1.1.0 CR-001; then
+            echo "::error::v1.1.0 should still be blocked without team_b's approval"; exit 1
+          fi
+          ./demo.sh approve CR-001 team_b
+          ./demo.sh release v1.1.0 CR-001
+          ./demo.sh run team_b_scoring
+
+      - name: Act 7 pre-check — removal gate fails while Team B still uses txn_count_30d
+        run: |
+          if ./demo.sh run feature_consumers_check --params column=txn_count_30d,fail_if_active=true; then
+            echo "::error::consumer gate should fail while @Champion still reads txn_count_30d"; exit 1
+          fi
+
+      - name: Act 6 — Team B migrates to txn_count_30d_v2 and retrains
+        run: ./demo.sh migrate
+
+      - name: Act 7 — retire txn_count_30d (2.0.0)
+        run: |
+          ./demo.sh run feature_consumers_check --params column=txn_count_30d,fail_if_active=true
+          ./demo.sh approve CR-002 team_a
+          ./demo.sh check v2.0.0 CR-002
+          ./demo.sh release v2.0.0 CR-002
+
+      - name: Restore staging to this commit
+        if: always()
+        run: |
+          git checkout -- .
+          ./demo.sh deploy
+          ./demo.sh run feature_demo_setup
+          ./demo.sh run team_a_feature_pipeline
+          ./demo.sh run team_b_training
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "### Feature sharing demo — end to end (${{ job.status }})"
+            echo "All seven acts ran against \`$TARGET\`; staging was then restored to this commit."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,57 @@
+# Feature contract — owned by Team A. The single source of truth for this table's schema,
+# meaning and ownership. The publish pipeline applies it to Unity Catalog (columns,
+# comments, tags); check_change.py reviews every edit to it.
+table: ${catalog}.${producer_schema}.customer_features
+version: 2.0.0
+owner: team_a
+support_channel: "#team-a-features"
+description: >
+  Customer-level transaction behaviour features, one row per customer per weekly snapshot
+  (as_of_date). Point-in-time correct: every feature only uses transactions strictly
+  before as_of_date.
+primary_keys: [customer_id]
+timestamp_key: as_of_date
+refresh: weekly
+freshness_sla_hours: 192
+online: false
+sources:
+  - ${catalog}.${raw_schema}.transactions
+
+features:
+  - name: txn_amount_sum_30d
+    dtype: double
+    definition: Sum of transaction amounts (refunds negative) in the 30 days before as_of_date.
+    logic_version: 1
+    status: active
+    since: 1.0.0
+  - name: days_since_last_txn
+    dtype: int
+    definition: Days between the last transaction before as_of_date and as_of_date, looking back 90 days (999 if none).
+    logic_version: 1
+    status: active
+    since: 1.0.0
+  - name: txn_count_30d_v2
+    dtype: int
+    definition: Number of purchase transactions (refunds excluded) in the 30 days before as_of_date.
+    logic_version: 1
+    status: active
+    since: 1.1.0
+  - name: avg_txn_amount_90d
+    dtype: double
+    definition: Mean purchase amount (refunds excluded) in the 90 days before as_of_date (0 if none).
+    logic_version: 1
+    status: active
+    since: 1.1.0
+
+changelog:
+  - version: 1.0.0
+    date: "2026-10-05"
+    change: Initial release.
+  - version: 1.1.0
+    date: "2026-10-05"
+    change: >
+      CR-001 (requested by team_b). Added avg_txn_amount_90d. Added txn_count_30d_v2
+      (refunds excluded); deprecated txn_count_30d, sunset 2026-12-31.
+  - version: 2.0.0
+    date: "2026-12-31"
+    change: Removed deprecated txn_count_30d (no active consumers — see find_feature_consumers report).

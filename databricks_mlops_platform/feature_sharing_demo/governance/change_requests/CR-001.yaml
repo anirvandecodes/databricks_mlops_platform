@@ -1,0 +1,33 @@
+# Feature change request — raised by the consumer, reviewed by the producer.
+# In GitHub this is the "Feature change request" issue (.github/ISSUE_TEMPLATE); the PR that
+# implements it links the issue and carries this file so the approvals are auditable.
+id: CR-001
+title: Exclude refunds from 30-day transaction count; add 90-day average purchase amount
+status: open                 # open -> in_review -> approved -> released | rejected
+requested_by:
+  team: team_b
+  contact: "@team-b-lead"
+target:
+  table: ${catalog}.${producer_schema}.customer_features
+  features: [txn_count_30d, avg_txn_amount_90d]
+change_type: [new_feature, logic_change]   # new_feature | logic_change | key_change | bug_fix | deprecation
+reason: >
+  Refunds inflate txn_count_30d for customers who return goods; in our default-risk model
+  that reads as engagement and lowers predicted risk. We also need a 90-day spend level.
+consuming_models:
+  - ${catalog}.${consumer_schema}.default_risk_model
+needed_by: "2026-11-15"
+
+# Filled by the producer from the find_feature_consumers report: every team with an
+# active model/job reading an affected feature must approve a breaking change.
+affected_consumers: [team_b]
+
+# Approvals are appended during review (`./demo.sh approve <team>` in the demo, or a
+# reviewer commit in the PR). check_change.py blocks the release until every required
+# team has an entry with decision: approved. Entry shape:
+#   - team: team_a
+#     approver: "@team-a-lead"
+#     decision: approved            # approved | rejected | changes_requested
+#     date: "2026-10-06"
+#     note: Implemented as txn_count_30d_v2; txn_count_30d deprecated, sunset 2026-12-31.
+approvals: []

@@ -1,0 +1,8 @@
+# Feature-sharing demo: producers own their contracts + pipelines; a PR touching them cannot
+# merge without the owning team's review (enable "Require review from Code Owners" on main).
+# Consumers own their dependency config. Replace the handles with real team handles
+# (e.g. @org/team-a) once the repo lives in an organisation.
+/databricks_mlops_platform/feature_sharing_demo/team_a_producer/   @anirvandecodes
+/databricks_mlops_platform/feature_sharing_demo/team_b_consumer/   @anirvandecodes
+/databricks_mlops_platform/feature_sharing_demo/governance/        @anirvandecodes
+/databricks_mlops_platform/feature_sharing_demo/shared/            @anirvandecodes

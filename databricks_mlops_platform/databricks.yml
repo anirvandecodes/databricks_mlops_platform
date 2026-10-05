@@ -54,6 +54,23 @@ variables:
   ab_split_salt:
     description: Cohort salt for deterministic batch assignment; changing it reshuffles arms.
     default: "credit_risk_ab_v1"
+  # Cross-team feature-sharing demo (feature_sharing_demo/). Same catalog as the platform,
+  # one set of schemas per target, so dev runs by hand never disturb what CI exercises.
+  feature_demo_raw_schema:
+    description: Source (raw) data read by Team A's feature pipeline.
+    default: feature_demo_raw_${bundle.target}
+  feature_demo_producer_schema:
+    description: Team A's governed feature schema (Team A writes, others read).
+    default: team_a_features_${bundle.target}
+  feature_demo_consumer_schema:
+    description: Team B's ML schema (labels, model, predictions).
+    default: team_b_ml_${bundle.target}
+  feature_demo_producer_group:
+    description: Account group for Team A (granted MODIFY on the feature schema); blank = skip grants.
+    default: ""
+  feature_demo_consumer_group:
+    description: Account group for Team B (granted SELECT on the feature schema); blank = skip grants.
+    default: ""
 
 include:
   - ./resources/ml-artifacts-resource.yml
@@ -63,6 +80,7 @@ include:
   - ./resources/batch-inference-workflow-resource.yml
   - ./resources/monitoring-resource.yml
   - ./resources/serving-resource.yml
+  - ./resources/feature-sharing-demo-resource.yml
 
 targets:
   # Loosely controlled. Data scientists deploy here directly from a local IDE
