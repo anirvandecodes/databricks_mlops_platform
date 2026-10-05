@@ -1,0 +1,46 @@
+# Feature change request — filed by a CONSUMER team in the PRODUCER team's repo.
+# Mirrors databricks_mlops_platform/feature_sharing_demo/governance/change_requests/CR-*.yaml.
+name: Feature change request
+description: Ask the owning team to add, change, fix or retire a shared feature
+title: "[Feature CR] <table>: <short summary>"
+labels: [feature-change-request, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Shared features are owned by the producing team. You can't write to their table —
+        file this request (or open a PR against the contract yourself and link it here).
+        Check the column's definition, status and owner in Catalog Explorer first.
+  - type: input
+    id: table
+    attributes: {label: Feature table, placeholder: "prod.team_a_features.customer_features"}
+    validations: {required: true}
+  - type: input
+    id: features
+    attributes: {label: "Feature(s) affected or requested", placeholder: "txn_count_30d, avg_txn_amount_90d"}
+    validations: {required: true}
+  - type: checkboxes
+    id: change_type
+    attributes:
+      label: Change type
+      options:
+        - label: "New feature (additive — producer approval only)"
+        - label: "Logic / meaning change (ships as <name>_v2; old column deprecated)"
+        - label: "Key or grain change (ships as a new table)"
+        - label: "Bug fix to existing values (treated as breaking — consumers notified)"
+        - label: "Deprecation / removal"
+  - type: textarea
+    id: reason
+    attributes: {label: Business reason and expected impact}
+    validations: {required: true}
+  - type: input
+    id: models
+    attributes: {label: Your consuming model(s) / job(s), placeholder: "prod.team_b_ml.default_risk_model"}
+    validations: {required: true}
+  - type: input
+    id: needed_by
+    attributes: {label: Needed by (date)}
+  - type: input
+    id: contact
+    attributes: {label: Contact, placeholder: "@team-b-lead / #team-b"}
+    validations: {required: true}

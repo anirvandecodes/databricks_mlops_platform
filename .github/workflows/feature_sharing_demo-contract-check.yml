@@ -1,0 +1,93 @@
+# Feature-sharing demo, PR gate. Every PR that touches the demo runs the contract-rule unit
+# tests and validates the bundle; every PR that edits a released contract is diffed against
+# the base branch by check_change.py. Breaking changes stay blocked until each required team
+# has an approval recorded in a change request (governance/change_requests/CR-*.yaml)
+# changed in the same PR. Make "Feature contract check" a required check on main.
+name: Feature contract check
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "databricks_mlops_platform/feature_sharing_demo/**"
+      - "databricks_mlops_platform/resources/feature-sharing-demo-resource.yml"
+      - ".github/workflows/feature_sharing_demo-contract-check.yml"
+
+defaults:
+  run:
+    working-directory: ./databricks_mlops_platform/feature_sharing_demo
+
+concurrency:
+  group: feature-contract-check-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Contract rules (unit tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install pyyaml pytest
+      - run: pytest tests -v
+
+  contract-diff:
+    name: Contract diff vs base branch
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pyyaml
+      - name: Check every changed contract
+        env:
+          BASE: origin/${{ github.base_ref }}
+          DEMO: databricks_mlops_platform/feature_sharing_demo
+        run: |
+          set -euo pipefail
+          # git diff prints repo-relative paths; check_change.py runs from the demo folder.
+          cr=$(git diff --name-only "$BASE"...HEAD -- governance/change_requests | head -1 || true)
+          contracts=$(git diff --name-only --diff-filter=M "$BASE"...HEAD -- team_a_producer/contracts)
+          if [[ -z "$contracts" ]]; then
+            echo "No released contract changed in this PR." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          status=0
+          for c in $contracts; do
+            git show "$BASE:$c" > /tmp/base.yaml
+            args=(--base /tmp/base.yaml --proposed "${c#"$DEMO"/}")
+            [[ -n "$cr" ]] && args+=(--change-request "${cr#"$DEMO"/}")
+            python governance/check_change.py "${args[@]}" > /tmp/check.txt || status=1
+            cat /tmp/check.txt
+            { echo '```'; cat /tmp/check.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          done
+          exit $status
+
+  # The demo is part of the platform bundle. The platform's own bundle-ci skips demo-only
+  # PRs (its staging run retrains the credit model), so the bundle is validated here instead.
+  bundle-validate:
+    name: Bundle config resolves (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    # Skipped on forks, which cannot access repository secrets.
+    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [dev, staging, prod]
+    env:
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+    defaults:
+      run:
+        working-directory: ./databricks_mlops_platform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: databricks/setup-cli@main
+      - run: databricks bundle validate -t ${{ matrix.target }}

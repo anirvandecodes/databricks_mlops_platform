@@ -1,7 +1,11 @@
 """Unit tests for drift metrics — no Spark, no cluster, fast enough for pre-commit."""
 import pytest
 
-from platform_utils.metrics import population_stability_index, psi_verdict
+from platform_utils.metrics import (
+    population_stability_index,
+    psi_verdict,
+    two_proportion_z_test,
+)
 
 
 def test_identical_distributions_have_zero_psi():
@@ -73,3 +77,53 @@ def test_psi_verdict_honours_custom_thresholds():
     """Thresholds come from bundle variables, so overrides must be respected."""
     assert psi_verdict(0.05, warn=0.01, retrain=0.02) == "RETRAIN"
     assert psi_verdict(0.30, warn=0.5, retrain=0.9) == "STABLE"
+
+
+# -- A/B two-proportion z-test ----------------------------------------------------
+
+
+def test_z_test_diff_is_arm_b_minus_arm_a():
+    """A positive diff must mean arm B scored higher, so the sign is unambiguous."""
+    result = two_proportion_z_test(successes_a=50, n_a=100, successes_b=70, n_b=100)
+    assert result["rate_a"] == pytest.approx(0.50)
+    assert result["rate_b"] == pytest.approx(0.70)
+    assert result["diff"] == pytest.approx(0.20)
+
+
+def test_z_test_known_value():
+    """Hand-computed: 50/100 vs 70/100, pooled p=0.6, z = 0.2 / sqrt(0.24*0.02)."""
+    import math
+
+    result = two_proportion_z_test(50, 100, 70, 100)
+    expected_z = 0.20 / math.sqrt(0.6 * 0.4 * (1 / 100 + 1 / 100))
+    assert result["z"] == pytest.approx(expected_z, rel=1e-6)
+    assert result["p_value"] == pytest.approx(math.erfc(abs(expected_z) / math.sqrt(2)), rel=1e-6)
+    # ~2.89 sigma is significant at the 5% level.
+    assert result["p_value"] < 0.05
+
+
+def test_z_test_is_symmetric_under_arm_swap():
+    """Swapping the arms flips the z sign but leaves the two-sided p-value unchanged."""
+    ab = two_proportion_z_test(50, 100, 70, 100)
+    ba = two_proportion_z_test(70, 100, 50, 100)
+    assert ab["z"] == pytest.approx(-ba["z"])
+    assert ab["p_value"] == pytest.approx(ba["p_value"])
+
+
+def test_z_test_equal_rates_are_not_significant():
+    result = two_proportion_z_test(60, 100, 60, 100)
+    assert result["diff"] == pytest.approx(0.0)
+    assert result["z"] == pytest.approx(0.0)
+    assert result["p_value"] == pytest.approx(1.0)
+
+
+def test_z_test_empty_arm_is_undefined():
+    result = two_proportion_z_test(0, 0, 5, 10)
+    assert result["z"] is None and result["p_value"] is None
+
+
+def test_z_test_degenerate_identical_extremes_are_undefined():
+    """Both arms all-success: no variance, no difference to test."""
+    result = two_proportion_z_test(10, 10, 20, 20)
+    assert result["diff"] == pytest.approx(0.0)
+    assert result["z"] is None and result["p_value"] is None

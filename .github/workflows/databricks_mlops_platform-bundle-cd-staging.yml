@@ -54,3 +54,68 @@ jobs:
             echo "Promote to production by pushing a \`release/<name>\` branch. Production"
             echo "requires explicit model approval before any version serves traffic."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Feature-sharing demo (feature_sharing_demo/). The bundle deploy above already shipped the
+  # merged contract and Team B config; this runs only what the merge affected:
+  #
+  #   contract/producer changed -> Team A publishes, then Team B's @Champion scores again to
+  #                                show the release did not break it
+  #   Team B config changed     -> Team B rediscovers, retrains and moves @Champion
+  #   demo not set up yet       -> bootstrap: mock data, first publish, first training
+  #
+  # The PR gate (feature_sharing_demo-contract-check.yml) has already blocked any contract
+  # change without its approvals, so nothing here re-checks them.
+  feature_sharing_demo:
+    name: Feature sharing demo — publish and consume
+    needs: deploy
+    runs-on: ubuntu-latest
+    concurrency: staging-bundle-deploy
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: databricks/setup-cli@main
+
+      - name: Work out what to run
+        id: plan
+        env:
+          BEFORE: ${{ github.event.before }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          vars=$(databricks bundle validate -t staging -o json | jq '.variables')
+          table="$(jq -r '.catalog_name.value' <<<"$vars").$(jq -r '.feature_demo_producer_schema.value' <<<"$vars").customer_features"
+
+          bootstrap=false
+          databricks tables get "$table" >/dev/null 2>&1 || bootstrap=true
+
+          # Manual runs and first pushes have no usable "before" commit: run everything.
+          if [[ "$EVENT" != "push" || -z "$BEFORE" || "$BEFORE" =~ ^0+$ ]]; then
+            contract=true; consumer=true
+          else
+            changed=$(git diff --name-only "$BEFORE" "$GITHUB_SHA" -- feature_sharing_demo)
+            contract=$(grep -qE '/(team_a_producer|shared)/' <<<"$changed" && echo true || echo false)
+            consumer=$(grep -q '/team_b_consumer/' <<<"$changed" && echo true || echo false)
+          fi
+
+          printf 'bootstrap=%s\ncontract=%s\nconsumer=%s\n' "$bootstrap" "$contract" "$consumer" | tee -a "$GITHUB_OUTPUT"
+          {
+            echo "### Feature sharing demo"
+            echo "Feature table \`$table\` — bootstrap: $bootstrap, contract changed: $contract, Team B config changed: $consumer"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Bootstrap — schemas and mock data
+        if: steps.plan.outputs.bootstrap == 'true'
+        run: databricks bundle run feature_demo_setup -t staging
+
+      - name: Team A publishes the released contract
+        if: steps.plan.outputs.bootstrap == 'true' || steps.plan.outputs.contract == 'true'
+        run: databricks bundle run team_a_feature_pipeline -t staging
+
+      - name: Team B trains (discover -> train -> score)
+        if: steps.plan.outputs.bootstrap == 'true' || steps.plan.outputs.consumer == 'true'
+        run: databricks bundle run team_b_training -t staging
+
+      - name: Team B's @Champion still scores after the producer release
+        if: steps.plan.outputs.bootstrap != 'true' && steps.plan.outputs.contract == 'true' && steps.plan.outputs.consumer != 'true'
+        run: databricks bundle run team_b_scoring -t staging

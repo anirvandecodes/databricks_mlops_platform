@@ -1,0 +1,105 @@
+# Cross-team feature-sharing demo: Team A produces a governed feature table, Team B consumes
+# it, asks for a change, and the change ships through a reviewed contract. The runbook is
+# feature_sharing_demo/README.md; CI/CD is .github/workflows/feature_sharing_demo-*.yml and
+# the feature_sharing_demo job in databricks_mlops_platform-bundle-cd-staging.yml.
+#
+# Schemas are per target (feature_demo_*_<target>), like payments_<target> for the platform.
+_team_b_params: &team_b_params
+  feature_config_path: ${workspace.file_path}/feature_sharing_demo/team_b_consumer/feature_config.yaml
+  catalog: ${var.catalog_name}
+  producer_schema: ${var.feature_demo_producer_schema}
+  consumer_schema: ${var.feature_demo_consumer_schema}
+
+resources:
+  jobs:
+    # Demo fixture: (re)creates the schemas and mock source data. Not part of the process.
+    feature_demo_setup:
+      name: ${bundle.target}-feature-demo-00-setup
+      tags: {project: feature-sharing-demo, role: setup}
+      tasks:
+        - task_key: setup_mock_data
+          notebook_task:
+            notebook_path: ../feature_sharing_demo/setup/00_setup_demo.py
+            base_parameters:
+              catalog: ${var.catalog_name}
+              raw_schema: ${var.feature_demo_raw_schema}
+              producer_schema: ${var.feature_demo_producer_schema}
+              consumer_schema: ${var.feature_demo_consumer_schema}
+              producer_group: ${var.feature_demo_producer_group}
+              consumer_group: ${var.feature_demo_consumer_group}
+      max_concurrent_runs: 1
+
+    # Team A (producer): publishes customer_features exactly as the released contract says.
+    # Re-run after every contract release. In production this is scheduled (contract
+    # `refresh`) and deployed only by CI under Team A's service principal.
+    team_a_feature_pipeline:
+      name: ${bundle.target}-feature-demo-team-a-feature-pipeline
+      tags: {project: feature-sharing-demo, owner: team_a, role: producer}
+      parameters:
+        - name: contract_path
+          default: ${workspace.file_path}/feature_sharing_demo/team_a_producer/contracts/customer_features.yaml
+      tasks:
+        - task_key: publish_features
+          notebook_task:
+            notebook_path: ../feature_sharing_demo/team_a_producer/notebooks/01_publish_features.py
+            base_parameters:
+              contract_path: "{{job.parameters.contract_path}}"
+              catalog: ${var.catalog_name}
+              raw_schema: ${var.feature_demo_raw_schema}
+              producer_schema: ${var.feature_demo_producer_schema}
+      max_concurrent_runs: 1
+
+    # Team B (consumer): discovers Team A's features, trains with point-in-time lookups and
+    # scores in batch. Team B never copies Team A's feature logic; it only pins column names.
+    team_b_training:
+      name: ${bundle.target}-feature-demo-team-b-training
+      tags: {project: feature-sharing-demo, owner: team_b, role: consumer}
+      tasks:
+        - task_key: discover
+          notebook_task:
+            notebook_path: ../feature_sharing_demo/team_b_consumer/notebooks/01_discover.py
+            base_parameters: *team_b_params
+        - task_key: train
+          depends_on: [{task_key: discover}]
+          notebook_task:
+            notebook_path: ../feature_sharing_demo/team_b_consumer/notebooks/02_train_with_lookups.py
+            base_parameters: *team_b_params
+        - task_key: batch_score
+          depends_on: [{task_key: train}]
+          notebook_task:
+            notebook_path: ../feature_sharing_demo/team_b_consumer/notebooks/03_batch_score.py
+            base_parameters: *team_b_params
+      max_concurrent_runs: 1
+
+    # Scoring alone: used after a producer release to show the @Champion model is unaffected.
+    team_b_scoring:
+      name: ${bundle.target}-feature-demo-team-b-scoring
+      tags: {project: feature-sharing-demo, owner: team_b, role: consumer}
+      tasks:
+        - task_key: batch_score
+          notebook_task:
+            notebook_path: ../feature_sharing_demo/team_b_consumer/notebooks/03_batch_score.py
+            base_parameters: *team_b_params
+      max_concurrent_runs: 1
+
+    # Governance: who consumes a feature table / column? Run before any breaking change or
+    # removal; the result fills `affected_consumers` in the change request. With
+    # fail_if_active=true it is the deprecation gate (fails while active consumers remain).
+    feature_consumers_check:
+      name: ${bundle.target}-feature-demo-feature-consumers-check
+      tags: {project: feature-sharing-demo, role: governance}
+      parameters:
+        - name: column
+          default: ""
+        - name: fail_if_active
+          default: "false"
+      tasks:
+        - task_key: find_consumers
+          notebook_task:
+            notebook_path: ../feature_sharing_demo/governance/notebooks/find_feature_consumers.py
+            base_parameters:
+              table: ${var.catalog_name}.${var.feature_demo_producer_schema}.customer_features
+              column: "{{job.parameters.column}}"
+              fail_if_active: "{{job.parameters.fail_if_active}}"
+              catalog: ${var.catalog_name}
+      max_concurrent_runs: 1

@@ -62,3 +62,28 @@ def test_layout_is_portable_to_catalog_per_environment():
     isolated = AssetNames(catalog="prod", schema="credit_risk")
     assert shared.training_data == "workspace.mlops_prod.training_data"
     assert isolated.training_data == "prod.credit_risk.training_data"
+
+
+# -- A/B experiment assets --------------------------------------------------------
+
+
+def test_ab_comparison_results_is_three_level_qualified():
+    assert _names().ab_comparison_results == "workspace.mlops_dev.ab_comparison_results"
+
+
+def test_serving_endpoint_name_is_dot_free():
+    """Endpoint names cannot be catalog/schema-qualified and forbid dots."""
+    assert "." not in _names().serving_endpoint_name
+
+
+def test_serving_endpoint_name_differs_across_schemas():
+    """dev/staging/prod endpoints share one flat namespace, so they must not collide."""
+    dev = AssetNames(catalog="workspace", schema="payments_dev").serving_endpoint_name
+    prod = AssetNames(catalog="workspace", schema="payments_prod").serving_endpoint_name
+    assert dev != prod
+
+
+def test_serving_payload_table_is_three_level_qualified():
+    names = _names()
+    assert names.serving_payload_prefix == "credit_risk_model_serving"
+    assert names.serving_payload_table == "workspace.mlops_dev.credit_risk_model_serving_payload"

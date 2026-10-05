@@ -38,6 +38,39 @@ variables:
   psi_retrain_threshold:
     description: PSI above which automated retraining is triggered.
     default: "0.25"
+  # A/B experiment controls. Like the governance thresholds above, these are variables so a
+  # risk owner can start, size, or stop an experiment through a reviewed PR rather than by
+  # editing pipeline code. An experiment is off by default; enabling it in prod still faces
+  # the experiment approval gate (see platform_utils/experiment.py).
+  ab_enabled:
+    description: Whether batch scoring and serving split traffic across two model versions.
+    default: "false"
+  ab_variant_b_alias:
+    description: Alias of the model version served as A/B arm B (the challenger).
+    default: "challenger"
+  ab_traffic_split_pct:
+    description: Integer percentage of traffic routed to arm B.
+    default: "10"
+  ab_split_salt:
+    description: Cohort salt for deterministic batch assignment; changing it reshuffles arms.
+    default: "credit_risk_ab_v1"
+  # Cross-team feature-sharing demo (feature_sharing_demo/). Same catalog as the platform,
+  # one set of schemas per target, so dev runs by hand never disturb what CI exercises.
+  feature_demo_raw_schema:
+    description: Source (raw) data read by Team A's feature pipeline.
+    default: feature_demo_raw_${bundle.target}
+  feature_demo_producer_schema:
+    description: Team A's governed feature schema (Team A writes, others read).
+    default: team_a_features_${bundle.target}
+  feature_demo_consumer_schema:
+    description: Team B's ML schema (labels, model, predictions).
+    default: team_b_ml_${bundle.target}
+  feature_demo_producer_group:
+    description: Account group for Team A (granted MODIFY on the feature schema); blank = skip grants.
+    default: ""
+  feature_demo_consumer_group:
+    description: Account group for Team B (granted SELECT on the feature schema); blank = skip grants.
+    default: ""
 
 include:
   - ./resources/ml-artifacts-resource.yml
@@ -46,6 +79,8 @@ include:
   - ./resources/deployment-job-resource.yml
   - ./resources/batch-inference-workflow-resource.yml
   - ./resources/monitoring-resource.yml
+  - ./resources/serving-resource.yml
+  - ./resources/feature-sharing-demo-resource.yml
 
 targets:
   # Loosely controlled. Data scientists deploy here directly from a local IDE
@@ -56,6 +91,9 @@ targets:
     variables:
       schema_name: payments_dev
       approval_required: "false"
+      # A/B on in dev so a data scientist can exercise the experiment path freely; the
+      # gate is disabled here (approval_required=false), so no sign-off is needed.
+      ab_enabled: "true"
     workspace:
       # Literal, not a ${var.*} reference: the workspace host is resolved during auth
       # configuration, before variable interpolation runs, so a variable here fails with
@@ -69,6 +107,8 @@ targets:
     variables:
       schema_name: payments_staging
       approval_required: "false"
+      # A/B on in staging so the integration run exercises the two-arm scoring path.
+      ab_enabled: "true"
     workspace:
       host: https://dbc-aef35066-afa2.cloud.databricks.com
       # Deliberately NOT under /Workspace/Shared: that path is writable by every
@@ -93,6 +133,10 @@ targets:
     variables:
       schema_name: payments_prod
       approval_required: "true"
+      # A/B off in prod by default: a live split serves the challenger to real customers, so
+      # it stays disabled until a human turns it on — and even then approval_required=true
+      # means the experiment approval gate must pass before any traffic reaches arm B.
+      ab_enabled: "false"
     workspace:
       host: https://dbc-aef35066-afa2.cloud.databricks.com
       # Restricted path — see the staging comment. Human access to prod is view-only and

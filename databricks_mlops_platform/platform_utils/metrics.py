@@ -70,3 +70,44 @@ def psi_verdict(psi: float, warn: float = 0.10, retrain: float = 0.25) -> str:
     if psi >= warn:
         return "WARN"
     return "STABLE"
+
+
+def two_proportion_z_test(
+    successes_a: int, n_a: int, successes_b: int, n_b: int
+) -> dict:
+    """Two-sided two-proportion z-test comparing two A/B arms.
+
+    Answers "is the difference between arm A's rate and arm B's rate more than noise?" for
+    a binary outcome — an approval rate, or a correct-prediction rate once labels mature.
+    The pooled-proportion form is used, which is the standard test for equality of two
+    proportions.
+
+    Implemented in pure Python with ``math.erf`` for the normal CDF, so the analysis tier
+    needs no SciPy — the same cluster-free stance as :func:`population_stability_index`.
+
+    :return: ``{rate_a, rate_b, diff, z, p_value}``. ``diff`` is ``rate_b - rate_a`` so a
+        positive value means arm B scored higher. ``z`` and ``p_value`` are ``None`` when
+        the test is undefined (an empty arm, or both arms at an identical 0%/100% rate,
+        where the pooled variance is zero and no difference exists to test).
+    """
+    if n_a <= 0 or n_b <= 0:
+        return {"rate_a": None, "rate_b": None, "diff": None, "z": None, "p_value": None}
+
+    rate_a = successes_a / n_a
+    rate_b = successes_b / n_b
+    diff = rate_b - rate_a
+
+    pooled = (successes_a + successes_b) / (n_a + n_b)
+    variance = pooled * (1 - pooled) * (1 / n_a + 1 / n_b)
+
+    if variance <= 0:
+        # Degenerate: both arms are all-0 or all-1, so there is no difference to test.
+        return {"rate_a": rate_a, "rate_b": rate_b, "diff": diff, "z": None, "p_value": None}
+
+    import math
+
+    z = diff / math.sqrt(variance)
+    # Two-sided p-value from the standard normal survival function, via erf.
+    p_value = math.erfc(abs(z) / math.sqrt(2))
+
+    return {"rate_a": rate_a, "rate_b": rate_b, "diff": diff, "z": z, "p_value": p_value}
