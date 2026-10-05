@@ -35,12 +35,18 @@ if not catalog:
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.errors import NotFound
 
-# Registered models are deleted explicitly before DROP SCHEMA ... CASCADE, so a re-run
-# (every CI run of the walkthrough) does not depend on CASCADE removing a model with aliases.
+# Registered models are deleted explicitly before DROP SCHEMA ... CASCADE: neither CASCADE
+# nor registered_models.delete removes a model that still has versions, so a re-run (every
+# CI run of the walkthrough) would fail. Order matters: aliases, then versions, then model.
 w = WorkspaceClient()
 for schema in (raw_schema, producer_schema, consumer_schema):
     try:
         for m in w.registered_models.list(catalog_name=catalog, schema_name=schema):
+            full = w.registered_models.get(m.full_name, include_aliases=True)
+            for a in full.aliases or []:
+                w.registered_models.delete_alias(m.full_name, a.alias_name)
+            for v in w.model_versions.list(m.full_name):
+                w.model_versions.delete(m.full_name, v.version)
             w.registered_models.delete(m.full_name)
     except NotFound:
         pass
