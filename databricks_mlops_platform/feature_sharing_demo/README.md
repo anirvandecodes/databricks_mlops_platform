@@ -1,13 +1,14 @@
 # Cross-team feature sharing: changing a shared feature through a PR
 
 **Team A** owns a feature table. **Team B** trains a model on it. Team A changes the table
-with a pull request, and a check on the PR asks the live model registry: *does any model
-read a column this PR changes?* If one does, the PR is blocked.
+with a pull request, and a check on the PR asks Unity Catalog: *does anything — a live model,
+a job, a pipeline, a dashboard — read a column this PR changes?* If something does, the PR is
+blocked.
 
 | | Team A's PR | Check result |
 |---|---|---|
 | ✅ Happy path | Adds a new feature | **OK to merge**: no model reads a column that doesn't exist yet |
-| ❌ Not happy path | Changes how an existing feature is calculated | **BLOCKED**: Team B's `@champion` reads it and would silently get different numbers |
+| ❌ Not happy path | Changes how an existing feature is calculated | **BLOCKED**: Team B's `@champion` and its training and scoring jobs read it and would silently get different numbers |
 
 ```
 edit contract on a branch → PR → Feature contract check ──► no model affected → ✅ review → merge → staging publishes
@@ -20,17 +21,30 @@ edit contract on a branch → PR → Feature contract check ──► no model a
   keys, owner, and each feature's type, definition and `logic_version`. Team A's pipeline
   (`team_a_producer/notebooks/01_publish_features.py`) builds the UC feature table from it.
   The SQL for each feature is in that notebook's `FEATURE_LOGIC`.
-- **Team B** lists the columns it reads in `team_b_consumer/feature_config.yaml`. When it
-  trains, the model version is tagged `feature_dependencies` with those columns.
-- **The check** (`governance/check_change.py`) diffs the PR's contract against `main`, finds
-  every model version with an alias (`@champion`, …) in the catalog, and reads its
-  `feature_dependencies` tag. It runs for staging and prod and comments on the PR.
+- **Team B** lists the columns it reads in `team_b_consumer/feature_config.yaml` and trains
+  with `FeatureLookup` + `fe.log_model`, so the model records exactly what it reads.
+- **The check** (`governance/check_change.py`) diffs the PR's contract against `main` and asks
+  `governance/dependencies.py` what depends on the table (below). It runs for staging and prod
+  and comments on the PR.
 - **Approval** is a code-owner review (`.github/CODEOWNERS`). Nothing is written into YAML.
+
+### How dependencies are found
+
+| What | Source (all native Unity Catalog) | Counted when |
+|---|---|---|
+| **Models** | UC lineage lists every model version logged with `fe.log_model` from the table, in any catalog (plus the `feature_dependencies` tag, as a fallback for lineage lag). The exact columns come from each version's `feature_spec.yaml`. | The version holds an alias (`@champion`, …) **or** a serving endpoint serves it. A live version whose columns can't be read counts as reading every column. |
+| **Jobs, pipelines, dashboards** | `system.access.column_lineage`, last 30 days: the columns each one read **in its latest run**, so a job that has moved off a column stops counting | Always, except the producer (anything that writes the table) |
+| **Ad hoc notebooks and queries** | Same, interactive reads | Never blocks — listed as warnings so you can tell those people |
+
+If any source can't be read (permissions, no warehouse), the PR is **blocked**: an unknown
+answer isn't a yes. The same lookup, for one column, is the `feature_consumers_check` job:
+`databricks bundle run feature_consumers_check -t staging --params column=txn_count_30d,fail_if_active=true`.
 
 ## One-time setup
 
 1. Repo secrets `DATABRICKS_HOST` / `DATABRICKS_TOKEN`. The token's identity must be able to
-   read every model in the catalog.
+   read every model in the catalog, read `system.access`, and use a SQL warehouse (set
+   `DATABRICKS_WAREHOUSE_ID` to pick one; otherwise the first serverless warehouse is used).
 2. Branch protection on `main`: required check **Downstream impact (live model registry)**,
    and **Require review from Code Owners**.
 3. Staging has Team A's table and Team B's `@champion`. The first staging CD run does this,
@@ -94,10 +108,14 @@ Result: ❌ **BLOCKED**
 
 ```
 BLOCKED — this would break downstream:
-  x workspace.team_b_ml_staging.default_risk_model v1 @champion (team_b) reads txn_count_30d: logic/definition changed in place
+  x model workspace.team_b_ml_staging.default_risk_model v2 @champion (team_b) reads txn_count_30d: logic/definition changed in place
+  x job staging-feature-demo-team-b-training reads txn_count_30d: logic/definition changed in place
+  x job staging-feature-demo-team-b-scoring reads txn_count_30d: logic/definition changed in place
 
-  To ship this without breaking anyone: add the new logic as txn_count_30d_v2 (a new column) and leave txn_count_30d as it is,
-  or wait until no live model reads txn_count_30d.
+How to ship it without breaking anyone:
+  1. Add the new logic as a new column, txn_count_30d_v2, and leave txn_count_30d unchanged.
+  2. Each dependency above moves to txn_count_30d_v2 (its own PR).
+  3. Once nothing reads txn_count_30d, it can be changed or removed.
 ```
 
 The way out is case 1: add `txn_count_30d_v2` as a new column. Team B switches to it in its
@@ -109,8 +127,8 @@ own PR to `feature_config.yaml`.
 |---|---|---|
 | New feature | minor | never |
 | Deprecate a feature | minor | never |
-| Change a feature's definition or logic | major | a live model reads it |
-| Remove a feature | major | a live model reads it |
+| Change a feature's definition or logic | major | anything reads it (live model, job, pipeline, dashboard) |
+| Remove a feature | major | anything reads it |
 | Change a dtype, keys or table name | — | always (ship `<name>_v2` or a new table) |
 | Description, owner, SLA | patch | never |
 
@@ -123,6 +141,7 @@ python governance/check_change.py --base /tmp/base.yaml --proposed team_a_produc
   --var catalog=workspace --var producer_schema=team_a_features_staging --var raw_schema=feature_demo_raw_staging
 ```
 
-**Not covered:** readers that aren't aliased UC models (dashboards, ad hoc jobs, other
-catalogs), and `FEATURE_LOGIC` edits made without changing the contract. Code-owner review
-catches those.
+**Not covered:** readers outside Unity Catalog (exports, external engines reading the files),
+models that copy the features instead of using `fe.log_model` (they show up only as the job
+that read the table), readers new enough that lineage hasn't caught up (minutes), and
+`FEATURE_LOGIC` edits made without changing the contract. Code-owner review catches the last.

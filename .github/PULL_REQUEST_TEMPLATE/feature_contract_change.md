@@ -9,6 +9,6 @@ Checklist:
 - [ ] Version bumped (patch: metadata · minor: new or deprecated feature · major: changed or removed feature)
 - [ ] Changelog entry for the new version
 - [ ] Pipeline logic (`FEATURE_LOGIC`) updated for every new or changed feature
-- [ ] New logic for an existing feature ships as `<name>_v2` unless no live model reads it
-- [ ] *Feature contract check* is green (it fails if a live model reads a column this PR changes or removes)
+- [ ] New logic for an existing feature ships as `<name>_v2` unless nothing reads it
+- [ ] *Feature contract check* is green (it fails if a live model, job, pipeline or dashboard reads a column this PR changes or removes)
 - [ ] Announced in the contract's `support_channel` after release

@@ -189,21 +189,21 @@ def change_problems(base: dict[str, Any], proposed: dict[str, Any],
 
 
 def downstream_breaks(changes: list[dict[str, str]],
-                      consumers: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Which live consumers a change would break.
+                      dependencies: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Which dependencies a change would break.
 
-    consumers: [{"team", "model", "version", "alias", "features"}] — every aliased model
-    version that reads the table, with the columns it was trained on (see live_consumers in
-    governance/check_change.py). A consumer breaks when a column it reads is changed or
-    removed, or when the table's keys change.
+    dependencies: [{"kind", "name", "detail", "features", ...}] — see
+    governance/dependencies.py. "features" is the list of the table's columns it reads, or
+    None when that couldn't be determined (then it is assumed to read every column). A
+    dependency breaks when a column it reads is changed or removed, or when the keys change.
     """
     breaks = []
     for c in changes:
         if c["kind"] not in BREAKING_KINDS:
             continue
-        for consumer in consumers:
-            if c["kind"] == KEYS or c["feature"] in consumer["features"]:
-                breaks.append({**c, "consumer": consumer})
+        for dep in dependencies:
+            if c["kind"] == KEYS or dep["features"] is None or c["feature"] in dep["features"]:
+                breaks.append({**c, "dependency": dep})
     return breaks
 
 

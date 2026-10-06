@@ -1,7 +1,8 @@
 # Feature-sharing demo, PR gate. Every PR that touches the demo runs the contract-rule unit
 # tests and validates the bundle. Every PR that edits a released contract is diffed against
-# the base branch by check_change.py, which asks the live model registry (staging and prod)
-# whether any model reads a column the PR changes or removes — and fails the PR if one does.
+# the base branch by check_change.py, which asks Unity Catalog (staging and prod) whether any
+# live model, job, pipeline or dashboard reads a column the PR changes or removes — and fails
+# the PR if one does, or if that can't be determined.
 # Approval is a code-owner review (CODEOWNERS). Make "Downstream impact (live model
 # registry)" a required status check on main, together with "Require review from Code Owners".
 name: Feature contract check
