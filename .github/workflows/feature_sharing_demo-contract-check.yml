@@ -70,25 +70,43 @@ jobs:
           fi
           status=0
           : > /tmp/report.md
+          : > /tmp/summary.txt
           for c in $contracts; do
             git show "$BASE:$c" > /tmp/base.yaml
             # Consumers live in every environment the contract is released to.
             for target in staging prod; do
-              vars=$(cd .. && databricks bundle validate -t "$target" -o json | jq '.variables')
+              # Only the variables are needed; validate's warnings are noise here.
+              vars=$(cd .. && databricks bundle validate -t "$target" -o json 2>/tmp/validate.err | jq '.variables') \
+                || { cat /tmp/validate.err; exit 1; }
               v() { jq -r ".$1.value" <<<"$vars"; }
+              echo "::group::${c##*/} in $target"
               result=OK
               python governance/check_change.py --base /tmp/base.yaml --proposed "${c#"$DEMO"/}" \
                 --var catalog="$(v catalog_name)" \
                 --var producer_schema="$(v feature_demo_producer_schema)" \
-                --var raw_schema="$(v feature_demo_raw_schema)" > /tmp/check.txt || { status=1; result=BLOCKED; }
+                --var raw_schema="$(v feature_demo_raw_schema)" > /tmp/check.txt 2>&1 || { status=1; result=BLOCKED; }
               cat /tmp/check.txt
+              echo "::endgroup::"
+              printf '  %-8s %-8s %s\n' "$target" "$result" "${c##*/}" >> /tmp/summary.txt
+              # Each reason as a PR annotation, plus an indented line for the summary.
+              grep '^  x ' /tmp/check.txt | sed 's/^  x //' | while read -r reason; do
+                echo "::error title=Blocked in $target::$reason"
+                echo "             $reason" >> /tmp/summary.txt
+              done || true
               { echo "#### \`${c##*/}\` — $target: $result"; echo '```'; cat /tmp/check.txt; echo '```'; } >> /tmp/report.md
             done
           done
+          echo
+          echo "Feature contract check"
+          cat /tmp/summary.txt
+          if [[ $status == 0 ]]; then echo "Overall: OK to merge"
+          else echo "Overall: BLOCKED (expand the groups above for details)"; fi
           cat /tmp/report.md >> "$GITHUB_STEP_SUMMARY"
           {
             if [[ $status == 0 ]]; then echo "### ✅ Feature contract check: safe to merge"
             else echo "### ❌ Feature contract check: blocked (details below)"; fi
+            echo
+            echo '```'; cat /tmp/summary.txt; echo '```'
             echo
             cat /tmp/report.md
           } > /tmp/comment.md
