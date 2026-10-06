@@ -5,7 +5,7 @@
 #
 # Released features are immutable: new logic ships as a new feature (<name>_v2).
 table: ${catalog}.${producer_schema}.customer_features
-version: 1.0.0
+version: 1.1.0
 owner: team_a
 support_channel: "#team-a-features"
 description: >
@@ -24,8 +24,10 @@ features:
   - name: txn_count_30d
     dtype: int
     definition: Number of transactions (including refunds) in the 30 days before as_of_date.
-    status: active
+    status: deprecated
     since: 1.0.0
+    sunset_date: "2026-12-31"
+    replaced_by: txn_count_30d_v2
   - name: txn_amount_sum_30d
     dtype: double
     definition: Sum of transaction amounts (refunds negative) in the 30 days before as_of_date.
@@ -36,8 +38,18 @@ features:
     definition: Days between the last transaction before as_of_date and as_of_date, looking back 90 days (999 if none).
     status: active
     since: 1.0.0
+  - name: txn_count_30d_v2
+    dtype: int
+    definition: Number of purchase transactions (refunds excluded) in the 30 days before as_of_date.
+    status: active
+    since: 1.1.0
 
 changelog:
   - version: 1.0.0
     date: "2026-10-05"
     change: Initial release.
+  - version: 1.1.0
+    date: "2026-10-06"
+    change: >
+      Added txn_count_30d_v2 (refunds excluded). Deprecated txn_count_30d (sunset 2026-12-31);
+      it is unchanged until then.
