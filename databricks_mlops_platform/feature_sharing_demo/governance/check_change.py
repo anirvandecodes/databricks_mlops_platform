@@ -36,13 +36,16 @@ import feature_contract_utils as fcu  # noqa: E402
 ICON = {"added": "+", "deprecated": "~", "metadata": "~", "changed": "!", "removed": "!", "keys": "!"}
 
 
-def live_consumers(table: str) -> list[dict[str, Any]]:
+def live_consumers(table: str) -> list[dict[str, Any]] | None:
     """Aliased model versions in the table's catalog that read `table`, from their
-    feature_dependencies tag (written by team_b_consumer/notebooks/02_train_with_lookups)."""
+    feature_dependencies tag (written by team_b_consumer/notebooks/02_train_with_lookups).
+    None if the table isn't published in this workspace/environment yet."""
     from databricks.sdk import WorkspaceClient
     from databricks.sdk.errors import NotFound
 
     w = WorkspaceClient()
+    if not w.tables.exists(table).table_exists:
+        return None
     catalog = table.split(".")[0]
     consumers = []
     for schema in w.schemas.list(catalog_name=catalog):
@@ -68,7 +71,7 @@ def live_consumers(table: str) -> list[dict[str, Any]]:
 
 
 def run(base_path: str, proposed_path: str, variables: dict[str, str],
-        consumers_of: Callable[[str], list[dict[str, Any]]] | None = live_consumers) -> int:
+        consumers_of: Callable[[str], list[dict[str, Any]] | None] | None = live_consumers) -> int:
     base = fcu.load_yaml(base_path, variables)
     proposed = fcu.load_yaml(proposed_path, variables)
 
@@ -98,8 +101,10 @@ def run(base_path: str, proposed_path: str, variables: dict[str, str],
             print(f"  x {p}")
 
     breaking = [c for c in changes if c["kind"] in fcu.BREAKING_KINDS]
-    if changes and consumers_of:
-        consumers = consumers_of(base["table"])
+    consumers = consumers_of(base["table"]) if changes and consumers_of else []
+    if consumers is None:
+        print(f"\n{base['table']} isn't published here yet, so no model can read it — nothing to break.")
+    elif changes and consumers_of:
         print(f"\nLive consumers of {base['table']} (aliased model versions):")
         for c in consumers:
             print(f"  {c['team']:<8} {c['model']} v{c['version']} @{c['alias']}  reads {c['features']}")
@@ -116,9 +121,10 @@ def run(base_path: str, proposed_path: str, variables: dict[str, str],
                 print(f"  x {k['model']} v{k['version']} @{k['alias']} ({k['team']}) reads "
                       f"{b['feature']}: {b['message']}")
             for feature in sorted({b["feature"] for b in breaks if not b["feature"].startswith("<")}):
-                print(f"\n  To ship this without breaking anyone: add the new logic as "
-                      f"{fcu.next_version_name(feature)} (a new column) and leave {feature} as it is,"
-                      f"\n  or wait until no live model reads {feature}.")
+                print(f"\nHow to ship it without breaking anyone:\n"
+                      f"  1. Add the new logic as a new column, {fcu.next_version_name(feature)}, and leave {feature} unchanged.\n"
+                      f"  2. The consumer moves to {fcu.next_version_name(feature)} in its own PR.\n"
+                      f"  3. Once no live model reads {feature}, it can be changed or removed.")
     elif breaking:
         print("\n(offline: live consumers not checked)")
 
