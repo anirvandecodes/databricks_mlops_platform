@@ -4,10 +4,11 @@
 #   contract (YAML, reviewed in Git)  ->  computed columns  ->  quality checks
 #     ->  UC feature table (PK + TIMESERIES key, CDF)  ->  comments + tags for discovery
 #
-# The contract is the only place a feature's schema/meaning/status is decided. This
-# notebook refuses to publish a contract that is invalid or that promises a feature it
-# has no logic for, and only ever changes the table schema the way the contract says
-# (add new features; drop features removed after deprecation).
+# The contract decides each feature's schema, meaning and status; its SQL file in
+# team_a_producer/features/<table>/ decides how it's computed (run inside _base.sql). This
+# notebook refuses to publish if either is invalid or they don't match one to one, and only
+# ever changes the table schema the way the contract says (add new features; drop
+# features removed after deprecation).
 
 # COMMAND ----------
 
@@ -26,9 +27,11 @@ dbutils.widgets.text("raw_schema", "feature_demo_raw")
 dbutils.widgets.text("producer_schema", "team_a_features")
 
 variables = {k: dbutils.widgets.get(k).strip() for k in ("catalog", "raw_schema", "producer_schema")}
-contract = load_yaml(dbutils.widgets.get("contract_path").strip(), variables)
+contract_path = dbutils.widgets.get("contract_path").strip()
+contract = load_yaml(contract_path, variables)
+sql = load_feature_sql(contract_path, variables)
 
-problems = validate_contract(contract)
+problems = validate_contract(contract) or validate_sql(contract, sql)
 if problems:
     raise ValueError("Contract invalid:\n  " + "\n  ".join(problems))
 
@@ -40,44 +43,9 @@ print("Features:", ", ".join(f"{f['name']}[{f['status']}]" for f in contract["fe
 
 # COMMAND ----------
 
-# Feature logic — owned and reviewed by Team A. One SQL aggregate per published feature,
-# over transactions in the 90 days strictly before as_of_date (point-in-time correct).
-# Changing an entry here without a new feature name is exactly the "silent change"
-# the contract check blocks: new logic ships under a new name (e.g. *_v2).
-W30 = "t.txn_ts >= date_sub(s.as_of_date, 30)"
-FEATURE_LOGIC = {
-    "txn_count_30d":       f"count(CASE WHEN {W30} THEN t.txn_id END)",
-    "txn_count_30d_v2":    f"count(CASE WHEN {W30} AND NOT t.is_refund THEN t.txn_id END)",
-    "txn_amount_sum_30d":  f"coalesce(sum(CASE WHEN {W30} THEN t.amount END), 0)",
-    "days_since_last_txn": "coalesce(datediff(s.as_of_date, max(to_date(t.txn_ts))), 999)",
-    "avg_txn_amount_90d":  "coalesce(avg(CASE WHEN NOT t.is_refund THEN t.amount END), 0)",
-}
-
-missing = [f["name"] for f in contract["features"] if f["name"] not in FEATURE_LOGIC]
-if missing:
-    raise ValueError(f"Contract promises features with no pipeline logic: {missing}")
-
-select_features = ",\n  ".join(
-    f"CAST({FEATURE_LOGIC[f['name']]} AS {spark_type(f['dtype'])}) AS {f['name']}"
-    for f in contract["features"])
-
-features_df = spark.sql(f"""
-WITH snapshots AS (
-  SELECT c.{key}, d.as_of_date
-  FROM (SELECT DISTINCT {key} FROM {source}) c
-  CROSS JOIN (
-    SELECT explode(sequence(DATE'2026-01-04', date_add(max(to_date(txn_ts)), 1), INTERVAL 7 DAYS)) AS as_of_date
-    FROM {source}) d
-)
-SELECT s.{key}, s.as_of_date AS {ts_key},
-  {select_features}
-FROM snapshots s
-LEFT JOIN {source} t
-  ON t.{key} = s.{key}
- AND t.txn_ts <  CAST(s.as_of_date AS TIMESTAMP)
- AND t.txn_ts >= CAST(date_sub(s.as_of_date, 90) AS TIMESTAMP)
-GROUP BY s.{key}, s.as_of_date
-""")
+# Feature logic: _base.sql with each feature's expression inserted (point-in-time correct:
+# every expression only sees transactions strictly before as_of_date).
+features_df = spark.sql(features_sql(contract, sql))
 features_df.createOrReplaceTempView("new_features")
 
 # COMMAND ----------
@@ -140,7 +108,7 @@ WHEN MATCHED THEN UPDATE SET *
 WHEN NOT MATCHED THEN INSERT *
 """)
 
-for stmt in uc_metadata_statements(contract):
+for stmt in uc_metadata_statements(contract, sql):
     spark.sql(stmt)
 
 # COMMAND ----------

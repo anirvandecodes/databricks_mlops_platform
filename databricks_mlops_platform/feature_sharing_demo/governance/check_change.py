@@ -1,31 +1,37 @@
-"""Feature-contract PR gate: will this change break anything downstream?
+"""Feature-contract PR gate: is this change to a shared feature table safe to ship?
 
-Compares the contract on the base branch (main) with the contract in the PR:
+Compares one feature table on the base branch (main) with the PR — its contract
+(team_a_producer/contracts/<table>.yaml) and its SQL (team_a_producer/features/<table>/):
 
-  1. Is the proposed contract valid?                 (validate_contract)
-  2. What changed?                                   (added / deprecated / changed / removed / ...)
-  3. Is the change allowed at all?                   (no key/dtype edits in place, semver bump,
-                                                      changelog entry)
-  4. Does anything read a changed or removed column?             (dependencies.py)
-     Live model versions (UC lineage + their feature specs; alias or serving endpoint) and
-     jobs, pipelines and dashboards (column lineage, latest run). If a source can't be read,
-     the PR is blocked: an unknown answer is not a yes.
+  1. Are the contract and SQL valid, and do they match one to one?
+  2. What changed?                 added / deprecated / removed / changed / metadata
+  3. Is it allowed?                released features are immutable (no SQL, dtype, key or
+                                   query-skeleton edits in place); only deprecated features can
+                                   be removed; semver bump; changelog entry
+  4. Does the SQL compile?         EXPLAIN in a SQL warehouse, for added or changed features
+  5. What depends on it?           for changes that affect existing readers (dependencies.py):
+                                   live models (UC lineage + feature specs; alias or serving
+                                   endpoint) and jobs, pipelines and dashboards (column lineage,
+                                   latest run). A removal is blocked while anything still reads
+                                   the column; if a source can't be read, the PR is blocked.
 
-Exit code 0 = safe to merge, 1 = blocked. Code-owner review (CODEOWNERS) is the approval;
-this gate is the only thing that decides whether downstream breaks.
+Exit code 0 = safe to merge, 1 = blocked. Approval is a code-owner review (CODEOWNERS).
 
     python governance/check_change.py \
-        --base /tmp/base.yaml \
+        --base /tmp/base/<demo>/team_a_producer/contracts/customer_features.yaml \
         --proposed team_a_producer/contracts/customer_features.yaml \
         --var catalog=workspace --var producer_schema=team_a_features_staging \
         --var raw_schema=feature_demo_raw_staging
 
-Authenticates like the Databricks CLI (DATABRICKS_HOST/DATABRICKS_TOKEN in CI, or
-DATABRICKS_CONFIG_PROFILE locally); lineage is read through a SQL warehouse
-(DATABRICKS_WAREHOUSE_ID, or the first serverless one). --offline skips the lookup.
+The SQL folder is found next to each contract (../features/<table>/), so --base points into
+a checkout of the base branch. Authenticates like the Databricks CLI (DATABRICKS_HOST and
+DATABRICKS_TOKEN or DATABRICKS_CLIENT_ID/SECRET in CI, DATABRICKS_CONFIG_PROFILE locally);
+SQL runs in DATABRICKS_WAREHOUSE_ID or the first serverless warehouse. --offline skips steps
+4 and 5.
 """
 
 import argparse
+import datetime
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -34,31 +40,34 @@ from typing import Any, Callable
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shared"))
 
 import feature_contract_utils as fcu  # noqa: E402
-from dependencies import Report, find_dependencies, log  # noqa: E402
+from dependencies import Report, compile_sql, find_dependencies, log  # noqa: E402
 
-ICON = {"added": "+", "deprecated": "~", "metadata": "~", "changed": "!", "removed": "!", "keys": "!"}
+ICON = {"added": "+", "deprecated": "~", "metadata": "~", "changed": "!", "removed": "-", "keys": "!"}
 
 
 def run(base_path: str, proposed_path: str, variables: dict[str, str],
-        dependencies_of: Callable[[str], Report | None] | None = find_dependencies) -> int:
-    base = fcu.load_yaml(base_path, variables)
-    proposed = fcu.load_yaml(proposed_path, variables)
+        dependencies_of: Callable[[str], Report | None] | None = find_dependencies,
+        compile_with: Callable[[str, list[str]], str | None] | None = compile_sql) -> int:
+    base, proposed = fcu.load_yaml(base_path, variables), fcu.load_yaml(proposed_path, variables)
+    base_sql = fcu.load_feature_sql(base_path, variables)
+    proposed_sql = fcu.load_feature_sql(proposed_path, variables)
 
     print(f"Feature contract check: {proposed['table']}")
     print(f"  main {base['version']}  ->  PR {proposed['version']}\n")
     log(f"Checking {proposed['table']}: main {base['version']} -> PR {proposed['version']}")
 
-    log("Step 1/4  Is the proposed contract valid?")
-    problems = fcu.validate_contract(proposed)
+    log("Step 1/5  Are the contract and its SQL valid, one SQL file per feature?")
+    problems = fcu.validate_contract(proposed) or fcu.validate_sql(proposed, proposed_sql)
     log("          " + ("no: " + "; ".join(problems) if problems else "yes"))
     if problems:
-        print("BLOCKED — invalid contract:")
+        print("BLOCKED — invalid contract or SQL:")
         for p in problems:
             print(f"  x {p}")
+        print("\nRESULT: BLOCKED")
         return 1
 
-    log("Step 2/4  What changed compared with main?")
-    changes = fcu.diff_contract(base, proposed)
+    log("Step 2/5  What changed compared with main?")
+    changes = fcu.diff_contract(base, proposed, base_sql, proposed_sql)
     log("          " + (", ".join(f"{c['feature']} ({c['kind']})" for c in changes) or "nothing"))
     print("Changes:")
     for c in changes:
@@ -67,7 +76,7 @@ def run(base_path: str, proposed_path: str, variables: dict[str, str],
         print("  (none)")
 
     blocked = False
-    log("Step 3/4  Is the change allowed? (version bump, changelog, no dtype/key edits in place)")
+    log("Step 3/5  Is it allowed? (immutable features, removal only after deprecation, semver, changelog)")
     problems = fcu.change_problems(base, proposed, changes)
     log("          " + ("no: " + "; ".join(problems) if problems else "yes"))
     if problems:
@@ -75,20 +84,36 @@ def run(base_path: str, proposed_path: str, variables: dict[str, str],
         print("\nBLOCKED — not allowed:")
         for p in problems:
             print(f"  x {p}")
+    warnings = fcu.change_warnings(base, changes, datetime.date.today().isoformat())
+
+    touched = [c["feature"] for c in changes if c["kind"] in (fcu.ADDED, fcu.CHANGED)]
+    if touched and compile_with:
+        log(f"Step 4/5  Does the feature SQL compile? (EXPLAIN; added/changed: {', '.join(touched)})")
+        error = compile_with(fcu.features_sql(proposed, proposed_sql), proposed["sources"])
+        if error:
+            blocked = True
+            print(f"\nBLOCKED — the feature SQL doesn't compile:\n  x {error}")
+    else:
+        log("Step 4/5  Does the feature SQL compile? — skipped (no feature SQL added or changed)")
 
     breaking = [c for c in changes if c["kind"] in fcu.BREAKING_KINDS]
-    log("Step 4/4  Does anything downstream read a changed or removed column?"
-        + (f"  (changed/removed: {', '.join(c['feature'] for c in breaking)})" if breaking
-           else "  (no column is changed or removed)"))
-    report = dependencies_of(base["table"]) if changes and dependencies_of else None
-    if changes and dependencies_of and report is None:
+    report, published = None, True
+    if breaking and dependencies_of:
+        log("Step 5/5  What depends on what this changes? (" + ", ".join(
+            f"{c['feature']} {c['kind']}" for c in breaking) + ")")
+        report = dependencies_of(base["table"])
+        published = report is not None
+    else:
+        log("Step 5/5  What depends on it? — skipped (no existing feature changes)")
+
+    if not published:
         print(f"\n{base['table']} isn't published here yet, so nothing can read it — nothing to break.")
     elif report:
         keys = set(base["primary_keys"]) | {base["timestamp_key"]}
         print_dependencies(report, keys)
         deps = [asdict(d) for d in report.dependencies]
         breaks = fcu.downstream_breaks(breaking, [d for d in deps if d["blocking"]])
-        warnings = fcu.downstream_breaks(breaking, [d for d in deps if not d["blocking"]])
+        adhoc = fcu.downstream_breaks(breaking, [d for d in deps if not d["blocking"]])
         if report.errors:
             blocked = True
             print("\nBLOCKED — dependencies couldn't be fully checked, so the change can't be proven safe:")
@@ -100,18 +125,24 @@ def run(base_path: str, proposed_path: str, variables: dict[str, str],
             for b in breaks:
                 print(f"  x {_label(b['dependency'])} reads {b['feature']}: {b['message']}")
             for feature in sorted({b["feature"] for b in breaks if not b["feature"].startswith("<")}):
+                new = fcu.next_version_name(feature)
                 print(f"\nHow to ship it without breaking anyone:\n"
-                      f"  1. Add the new logic as a new column, {fcu.next_version_name(feature)}, and leave {feature} unchanged.\n"
-                      f"  2. Each dependency above moves to {fcu.next_version_name(feature)} (its own PR).\n"
-                      f"  3. Once nothing reads {feature}, it can be changed or removed.")
+                      f"  1. Add the new logic as a new feature, {new} (contract entry + {new}.sql).\n"
+                      f"  2. Deprecate {feature} (sunset_date, replaced_by: {new}).\n"
+                      f"  3. Each dependency above moves to {new} in its own PR.\n"
+                      f"  4. Once nothing reads {feature}, remove it (major version).")
         elif not report.errors:
-            print("\nNothing that depends on this table reads a changed or removed column — nothing breaks.")
-        if warnings:
-            print("\nWarnings (ad hoc reads, not blocking — tell these people):")
-            for b in warnings:
-                print(f"  ! {_label(b['dependency'])} read {b['feature']} ({b['dependency']['detail']})")
+            print("\nNothing that depends on this table reads a changed or removed column.")
+        warnings += [f"{_label(b['dependency'])} read {b['feature']} ({b['dependency']['detail']})" for b in adhoc]
     elif breaking:
         print("\n(offline: dependencies not checked)")
+    elif changes:
+        print("\nNo existing feature changes, so nothing that reads this table can break.")
+
+    if warnings:
+        print("\nWarnings (not blocking):")
+        for w in warnings:
+            print(f"  ! {w}")
 
     print("\nRESULT:", "BLOCKED" if blocked else "OK to merge")
     log(f"Result: {'BLOCKED' if blocked else 'OK to merge'}")
@@ -150,14 +181,15 @@ def print_dependencies(report: Report, keys: set[str]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--base", required=True, help="contract on the base branch (main)")
+    parser.add_argument("--base", required=True, help="contract in a checkout of the base branch (main)")
     parser.add_argument("--proposed", required=True, help="contract in the PR")
     parser.add_argument("--var", action="append", default=[], metavar="NAME=VALUE",
                         help="value for a ${NAME} placeholder in the contract (repeatable)")
-    parser.add_argument("--offline", action="store_true", help="skip the live dependency lookup")
+    parser.add_argument("--offline", action="store_true", help="skip the SQL compile and dependency lookups")
     args = parser.parse_args()
     variables = dict(v.split("=", 1) for v in args.var)
-    sys.exit(run(args.base, args.proposed, variables, None if args.offline else find_dependencies))
+    sys.exit(run(args.base, args.proposed, variables, *((None, None) if args.offline
+                                                          else (find_dependencies, compile_sql))))
 
 
 if __name__ == "__main__":

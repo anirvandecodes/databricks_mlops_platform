@@ -8,6 +8,7 @@
 
 # COMMAND ----------
 
+import hashlib
 import re
 from pathlib import Path
 from typing import Any
@@ -18,13 +19,13 @@ REQUIRED_CONTRACT_FIELDS = (
     "table", "version", "owner", "support_channel", "description",
     "primary_keys", "timestamp_key", "refresh", "freshness_sla_hours", "sources", "features",
 )
-REQUIRED_FEATURE_FIELDS = ("name", "dtype", "definition", "logic_version", "status", "since")
+REQUIRED_FEATURE_FIELDS = ("name", "dtype", "definition", "status", "since")
+BASE_SQL = "_base"  # the query skeleton in a table's features/ folder; the rest are <feature>.sql
 FEATURE_STATUSES = ("active", "deprecated")
 FEATURE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 
-# Kinds of contract change (see diff_contract). The breaking ones break any model that reads
-# the affected column.
+# Kinds of change (see diff_contract). The breaking ones change what an existing reader gets.
 ADDED, DEPRECATED, CHANGED, REMOVED, KEYS, METADATA = (
     "added", "deprecated", "changed", "removed", "keys", "metadata")
 BREAKING_KINDS = (CHANGED, REMOVED, KEYS)
@@ -50,6 +51,20 @@ def _substitute(obj: Any, variables: dict[str, str]) -> Any:
         for name, value in variables.items():
             obj = obj.replace(f"${{{name}}}", value)
     return obj
+
+
+def feature_sql_dir(contract_path: str | Path) -> Path:
+    """team_a_producer/contracts/<table>.yaml -> team_a_producer/features/<table>/"""
+    p = Path(contract_path)
+    return p.parent.parent / "features" / p.stem
+
+
+def load_feature_sql(contract_path: str | Path, variables: dict[str, str] | None = None) -> dict[str, str]:
+    """{feature name: its SQL expression, "_base": the query skeleton} for a contract.
+    Empty if the folder doesn't exist."""
+    folder = feature_sql_dir(contract_path)
+    return {f.stem: _substitute(f.read_text(encoding="utf-8"), variables or {})
+            for f in sorted(folder.glob("*.sql"))} if folder.is_dir() else {}
 
 
 def parse_version(version: str) -> tuple[int, int, int]:
@@ -98,25 +113,51 @@ def validate_contract(contract: dict[str, Any]) -> list[str]:
     return errors
 
 
+def validate_sql(contract: dict[str, Any], sql: dict[str, str]) -> list[str]:
+    """Every feature in the contract has exactly one SQL expression, and vice versa."""
+    errors = []
+    if BASE_SQL not in sql:
+        return [f"missing {BASE_SQL}.sql (the query the feature expressions go into)"]
+    if "${features}" not in _strip_comments(sql[BASE_SQL]):
+        errors.append(f"{BASE_SQL}.sql must contain ${{features}} where the feature expressions go")
+    names = {f["name"] for f in contract["features"]}
+    errors += [f"feature {n}: no {n}.sql" for n in sorted(names - set(sql))]
+    errors += [f"{n}.sql: not in the contract (add it to features: or delete the file)"
+               for n in sorted(set(sql) - names - {BASE_SQL})]
+    errors += [f"{n}.sql: empty" for n in sorted(names & set(sql)) if not sql_norm(sql[n])]
+    return errors
+
+
 def feature_names(contract: dict[str, Any], status: str | None = None) -> list[str]:
     return [f["name"] for f in contract["features"] if status is None or f["status"] == status]
 
 
 # ---------------------------------------------------------------------------
 # Change detection (the PR gate)
+#
+# Features are immutable: once released, a feature's SQL and type never change. New logic
+# ships as a new feature (<name>_v2); the old one is deprecated, then removed once nothing
+# depends on it. That keeps every model's training data reproducible and means a release
+# can't change what a reader gets — whether or not we can see the reader.
 # ---------------------------------------------------------------------------
 
-def diff_contract(base: dict[str, Any], proposed: dict[str, Any]) -> list[dict[str, str]]:
-    """Every difference between the contract on main and the one in the PR.
+def diff_contract(base: dict[str, Any], proposed: dict[str, Any],
+                  base_sql: dict[str, str] | None = None,
+                  proposed_sql: dict[str, str] | None = None) -> list[dict[str, str]]:
+    """Every difference between main and the PR, for one feature table (contract + SQL).
 
     Returns [{"feature", "kind", "message"}] where kind is one of:
-      added       new feature                                  (minor bump)
-      deprecated  active -> deprecated                         (minor bump)
-      changed     definition / logic_version / dtype edited    (major bump; breaks readers)
-      removed     feature dropped from the contract            (major bump; breaks readers)
-      keys        table, primary or timestamp key changed      (breaks every reader)
-      metadata    description, owner, SLA, ... edited          (patch bump)
+      added       new feature                                    minor bump
+      deprecated  active -> deprecated                           minor bump
+      removed     feature dropped                                major bump, deprecated features only
+      changed     a released feature's SQL or dtype edited       never allowed
+      keys        table, keys, or the query skeleton edited      never allowed
+      metadata    definition text, description, owner, SLA, ...  patch bump
+    SQL comments and whitespace don't count as changes. If main has no SQL for the table
+    yet (the PR that first adds it), there's nothing to compare the SQL with.
     """
+    base_sql, proposed_sql = base_sql or {}, proposed_sql or {}
+    compare_sql = bool(base_sql)
     changes: list[dict[str, str]] = []
 
     def add(feature: str, kind: str, message: str) -> None:
@@ -127,22 +168,27 @@ def diff_contract(base: dict[str, Any], proposed: dict[str, Any]) -> list[dict[s
     if (list(base["primary_keys"]) != list(proposed["primary_keys"])
             or base["timestamp_key"] != proposed["timestamp_key"]):
         add("<keys>", KEYS, "primary/timestamp key changed")
+    if compare_sql and sql_norm(base_sql.get(BASE_SQL, "")) != sql_norm(proposed_sql.get(BASE_SQL, "")):
+        add("<query>", KEYS, f"{BASE_SQL}.sql changed (grain, window or source: changes every feature)")
 
     base_feats = {f["name"]: f for f in base["features"]}
     prop_feats = {f["name"]: f for f in proposed["features"]}
     for name, old in base_feats.items():
         new = prop_feats.get(name)
         if new is None:
-            add(name, REMOVED, "removed")
+            add(name, REMOVED, f"removed (was {old['status']})")
             continue
         if old["dtype"] != new["dtype"]:
             add(name, CHANGED, f"dtype changed {old['dtype']} -> {new['dtype']}")
-        if (old["logic_version"] != new["logic_version"]
-                or _norm(old["definition"]) != _norm(new["definition"])):
-            add(name, CHANGED, "logic/definition changed in place")
+        if compare_sql and sql_norm(base_sql.get(name, "")) != sql_norm(proposed_sql.get(name, "")):
+            add(name, CHANGED, f"SQL changed in place ({name}.sql)")
+        if _norm(old["definition"]) != _norm(new["definition"]):
+            add(name, METADATA, "definition text changed")
         if old["status"] == "active" and new["status"] == "deprecated":
             add(name, DEPRECATED, f"deprecated (sunset {new.get('sunset_date')}, "
                                   f"replaced by {new.get('replaced_by')})")
+        elif old["status"] == "deprecated" and new["status"] == "active":
+            add(name, METADATA, "un-deprecated")
     for name in prop_feats:
         if name not in base_feats:
             add(name, ADDED, "new feature")
@@ -154,18 +200,19 @@ def diff_contract(base: dict[str, Any], proposed: dict[str, Any]) -> list[dict[s
 
 def change_problems(base: dict[str, Any], proposed: dict[str, Any],
                     changes: list[dict[str, str]]) -> list[str]:
-    """Rule breaks that block the PR whoever the consumers are.
-
-    The pipeline can only add columns, drop columns and recompute values, so key and dtype
-    changes have to ship as a new table / a new column. The version must be bumped by
-    semver and the changelog must say why.
-    """
+    """Rule breaks that block the PR, whoever depends on the table."""
     problems = []
+    base_feats = {f["name"]: f for f in base["features"]}
     for c in changes:
         if c["kind"] == KEYS:
             problems.append(f"{c['message']}: publish a new table (e.g. <table>_v2) instead")
-        elif c["message"].startswith("dtype changed"):
-            problems.append(f"{c['feature']}: {c['message']} — publish {next_version_name(c['feature'])} instead")
+        elif c["kind"] == CHANGED:
+            new = next_version_name(c["feature"])
+            problems.append(f"{c['feature']}: {c['message']} — released features are immutable. Add the new "
+                            f"logic as {new}, deprecate {c['feature']}, remove it once nothing reads it")
+        elif c["kind"] == REMOVED and base_feats[c["feature"]]["status"] != "deprecated":
+            problems.append(f"{c['feature']}: active features can't be removed — deprecate it "
+                            "(sunset_date, replaced_by) in one release and remove it in a later one")
 
     try:
         old_v, new_v = parse_version(base["version"]), parse_version(proposed["version"])
@@ -186,6 +233,14 @@ def change_problems(base: dict[str, Any], proposed: dict[str, Any],
     elif not any(str(e.get("version")) == str(proposed["version"]) for e in proposed.get("changelog", [])):
         problems.append(f"changelog has no entry for {proposed['version']}")
     return problems
+
+
+def change_warnings(base: dict[str, Any], changes: list[dict[str, str]], today: str) -> list[str]:
+    """Allowed, but worth flagging: removing a feature before the sunset date it promised."""
+    base_feats = {f["name"]: f for f in base["features"]}
+    return [f"{c['feature']}: removed before its promised sunset date {base_feats[c['feature']]['sunset_date']}"
+            for c in changes
+            if c["kind"] == REMOVED and str(base_feats[c["feature"]].get("sunset_date", "")) > today]
 
 
 def downstream_breaks(changes: list[dict[str, str]],
@@ -216,6 +271,30 @@ def _norm(text: str) -> str:
     return " ".join(str(text).split())
 
 
+def _strip_comments(sql: str) -> str:
+    return re.sub(r"--[^\n]*", "", str(sql))
+
+
+def sql_norm(sql: str) -> str:
+    """SQL without -- comments or extra whitespace: what counts as a change."""
+    return _norm(_strip_comments(sql))
+
+
+# ---------------------------------------------------------------------------
+# The feature query: _base.sql with every feature's expression inserted
+# ---------------------------------------------------------------------------
+
+def features_sql(contract: dict[str, Any], sql: dict[str, str]) -> str:
+    select = ",\n  ".join(f"CAST({sql_norm(sql[f['name']])} AS {spark_type(f['dtype'])}) AS {f['name']}"
+                          for f in contract["features"])
+    return _strip_comments(sql[BASE_SQL]).replace("${features}", select)
+
+
+def expression_hash(sql: str) -> str:
+    """Short fingerprint of a feature's SQL (comments/whitespace ignored), tagged on its column."""
+    return hashlib.sha256(sql_norm(sql).encode()).hexdigest()[:12]
+
+
 # ---------------------------------------------------------------------------
 # Unity Catalog DDL derived from the contract
 # ---------------------------------------------------------------------------
@@ -239,7 +318,7 @@ def schema_sync_statements(contract: dict[str, Any], existing_columns: list[str]
     """ALTER statements that bring an existing table's columns in line with the contract.
 
     Adds new features; drops columns that left the contract (the PR gate only lets that
-    through when no live model reads them).
+    through for deprecated features nothing depends on).
     """
     table = contract["table"]
     keys = set(contract["primary_keys"]) | {contract["timestamp_key"]}
@@ -255,7 +334,7 @@ def schema_sync_statements(contract: dict[str, Any], existing_columns: list[str]
     return stmts
 
 
-def uc_metadata_statements(contract: dict[str, Any]) -> list[str]:
+def uc_metadata_statements(contract: dict[str, Any], sql: dict[str, str]) -> list[str]:
     """COMMENT / SET TAGS statements so the contract is discoverable in Catalog Explorer."""
     table = contract["table"]
     stmts = [
@@ -271,7 +350,7 @@ def uc_metadata_statements(contract: dict[str, Any]) -> list[str]:
     for feat in contract["features"]:
         col = f"{table} ALTER COLUMN {feat['name']}"
         stmts.append(f"ALTER TABLE {col} COMMENT {_sql_str(_norm(feat['definition']))}")
-        tags = {"status": feat["status"], "since": feat["since"], "logic_version": feat["logic_version"]}
+        tags = {"status": feat["status"], "since": feat["since"], "sql_hash": expression_hash(sql[feat["name"]])}
         if feat["status"] == "deprecated":
             tags["sunset_date"] = feat["sunset_date"]
             tags["replaced_by"] = feat["replaced_by"]

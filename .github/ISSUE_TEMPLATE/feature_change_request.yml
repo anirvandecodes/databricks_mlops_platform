@@ -25,9 +25,9 @@ body:
       label: Change type
       options:
         - label: "New feature (new column — safe for every consumer)"
-        - label: "Logic / meaning change (ships as <name>_v2 while any model reads the old column)"
+        - label: "Logic / meaning change (ships as a new feature <name>_v2; the old one is deprecated)"
         - label: "Key or grain change (ships as a new table)"
-        - label: "Bug fix to existing values (blocked while any model reads the column)"
+        - label: "Bug fix to existing values (ships as <name>_v2 too: released features never change)"
         - label: "Deprecation / removal"
   - type: textarea
     id: reason
