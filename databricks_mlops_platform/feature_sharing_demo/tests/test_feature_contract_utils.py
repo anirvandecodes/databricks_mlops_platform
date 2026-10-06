@@ -38,6 +38,16 @@ def base():
     return fcu.load_yaml(CONTRACT, VARS), fcu.load_feature_sql(CONTRACT, VARS)
 
 
+def active(base):
+    """The released table with txn_count_30d active — some cases start from that, whatever
+    the checked-in contract says (a PR may already have deprecated it)."""
+    contract = copy.deepcopy(base[0])
+    contract["features"][0]["status"] = "active"
+    contract["features"][0].pop("sunset_date", None)
+    contract["features"][0].pop("replaced_by", None)
+    return contract, base[1]
+
+
 def report(*deps: dict, errors: tuple = ()) -> Report:
     return Report(TABLE, [Dependency(**d) for d in deps], [], list(errors))
 
@@ -77,8 +87,8 @@ def changed_in_place(base):
 
 
 def right_way(base):
-    """The fix: the new logic as a new feature, the old one deprecated."""
-    contract, sql = copy.deepcopy(base[0]), dict(base[1])
+    """The fix: the new logic as a new feature, the old one deprecated (compare with active(base))."""
+    contract, sql = copy.deepcopy(active(base)[0]), dict(base[1])
     _bump(contract, "minor")
     contract["features"][0].update(status="deprecated", sunset_date="2099-12-31", replaced_by="replacement_feature")
     contract["features"].append(_feature("replacement_feature", contract["version"], dtype="int"))
@@ -162,8 +172,8 @@ def test_definition_text_is_documentation(base):
 
 def test_deprecation_is_allowed(base):
     pr = right_way(base)
-    assert _kinds(base, pr) == {"txn_count_30d": "deprecated", "replacement_feature": "added"}
-    assert _problems(base, pr) == []
+    assert _kinds(active(base), pr) == {"txn_count_30d": "deprecated", "replacement_feature": "added"}
+    assert _problems(active(base), pr) == []
 
 
 # --- never allowed, whoever depends on the table -----------------------------------------
@@ -182,6 +192,7 @@ def test_dtype_change_in_place_is_never_allowed(base):
 
 
 def test_active_feature_cannot_be_removed(base):
+    base = active(base)
     contract = _bump(copy.deepcopy(base[0]), "major")
     contract["features"].pop(0)
     sql = {k: v for k, v in base[1].items() if k != "txn_count_30d"}
@@ -213,9 +224,9 @@ def test_keys_and_query_skeleton_need_a_new_table(base, edit):
 @pytest.mark.parametrize("make,too_small,label", [(added, "patch", "minor"), (right_way, "patch", "minor")])
 def test_version_bump_must_match_change(base, make, too_small, label):
     contract, sql = make(base)
-    contract["version"] = _next(base[0]["version"], too_small)
+    contract["version"] = _next(active(base)[0]["version"], too_small)
     contract["changelog"].append({"version": contract["version"]})
-    assert any(f"{label} bump" in p for p in _problems(base, (contract, sql)))
+    assert any(f"{label} bump" in p for p in _problems(active(base), (contract, sql)))
 
 
 def test_changelog_entry_required(base):
@@ -284,7 +295,7 @@ def test_gate_blocks_change_in_place_even_with_no_readers(tmp_path, base):
 
 
 def test_gate_right_way_passes(tmp_path, base):
-    assert _run(tmp_path, None, right_way(base)) == 0
+    assert _run(tmp_path, active(base), right_way(base)) == 0
 
 
 def test_gate_blocks_removal_while_something_reads_it(tmp_path, base, capsys):
