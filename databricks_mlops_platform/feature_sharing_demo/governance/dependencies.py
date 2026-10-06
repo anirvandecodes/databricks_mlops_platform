@@ -18,7 +18,11 @@ Jobs, pipelines and dashboards (things that read the table directly):
      are reported as warnings, not dependencies.
 
 Every source is required: if one can't be read, the error is returned and the caller must
-treat the result as unknown (check_change.py blocks).
+treat the result as unknown (check_change.py blocks). Transient failures (timeouts, rate
+limits, 5xx) are retried first; permission and not-found errors are not.
+
+compile_sql() runs EXPLAIN on a query in the same warehouse, so feature SQL that doesn't
+compile fails the PR instead of the pipeline.
 """
 
 import json
@@ -72,8 +76,14 @@ def find_dependencies(table: str, lookback_days: int = 30, w: Any = None) -> Rep
     log("  table exists in Unity Catalog")
     report = Report(table)
     for name, step in (("models", _models), ("column lineage", _lineage_readers)):
+        def attempt() -> Report:  # a fresh Report per attempt, so a retry can't add duplicates
+            part = Report(table)
+            step(w, table, part, lookback_days)
+            return part
         try:
-            step(w, table, report, lookback_days)
+            part = _retry(attempt, name)
+            report.dependencies += part.dependencies
+            report.not_counted += part.not_counted
         except Exception as e:  # any source missing = can't decide
             report.errors.append(f"could not read {name}: {type(e).__name__}: {e}")
             log(f"  ✗ could not read {name}: {type(e).__name__}: {e}")
@@ -210,22 +220,14 @@ ORDER BY 1, 2
 
 
 def _lineage_readers(w: Any, table: str, report: Report, lookback_days: int) -> None:
-    from databricks.sdk.service.sql import StatementParameterListItem, StatementState
+    from databricks.sdk.service.sql import StatementParameterListItem
 
     warehouse = _warehouse_id(w)
     log(f"  [lineage]    system.access.column_lineage, last {lookback_days} days, latest run per reader "
         f"(warehouse {warehouse})")
-    stmt = w.statement_execution.execute_statement(
-        warehouse_id=warehouse, statement=_READERS_SQL, wait_timeout="50s",
-        parameters=[StatementParameterListItem(name="table", value=table),
-                    StatementParameterListItem(name="days", value=str(lookback_days), type="INT")])
-    while stmt.status.state in (StatementState.PENDING, StatementState.RUNNING):
-        time.sleep(2)
-        stmt = w.statement_execution.get_statement(stmt.statement_id)
-    if stmt.status.state != StatementState.SUCCEEDED:
-        raise RuntimeError(stmt.status.error.message if stmt.status.error else stmt.status.state)
-
-    rows = stmt.result.data_array or []
+    rows = _run_sql(w, warehouse, _READERS_SQL, [
+        StatementParameterListItem(name="table", value=table),
+        StatementParameterListItem(name="days", value=str(lookback_days), type="INT")])
     log(f"               {len(rows)} reader(s)" + ("" if rows else " — nothing read this table recently"))
     for etype, eid, last_read, by, producer, cols in rows:
         kind = etype.lower()
@@ -239,6 +241,68 @@ def _lineage_readers(w: Any, table: str, report: Report, lookback_days: int) -> 
         report.dependencies.append(Dependency(
             kind, name, f"latest read {last_read[:16]} by {by}", json.loads(cols),
             f"column lineage, last {lookback_days} days", blocking=etype not in AD_HOC_ENTITY_TYPES))
+
+
+def compile_sql(query: str, sources: list[str], w: Any = None) -> str | None:
+    """EXPLAIN `query` in a SQL warehouse: None if it compiles (or its source tables aren't
+    in this workspace, so there's nothing to compile against), else the error message."""
+    from databricks.sdk import WorkspaceClient
+
+    w = w or WorkspaceClient()
+    missing = [s for s in sources if not w.tables.exists(s).table_exists]
+    if missing:
+        log(f"          skipped: source {', '.join(missing)} isn't in this workspace")
+        return None
+    try:
+        rows = _retry(lambda: _run_sql(w, _warehouse_id(w), "EXPLAIN " + query), "EXPLAIN")
+    except _SqlError as e:  # syntax errors fail the statement
+        log(f"          no: {_first_line(str(e))}")
+        return _first_line(str(e))
+    # Analysis errors (unknown column, missing table) come back as the plan text instead.
+    text = "\n".join(str(r[0]) for r in rows)
+    if "Error occurred during query planning" in text:
+        error = _first_line(text.split("Error occurred during query planning:", 1)[1])
+        log(f"          no: {error}")
+        return error
+    log("          yes")
+    return None
+
+
+def _first_line(message: str) -> str:
+    return next((line.strip() for line in message.strip().splitlines() if line.strip()), message.strip())
+
+
+class _SqlError(RuntimeError):
+    """The statement ran and failed (bad SQL, missing table): not worth retrying."""
+
+
+def _run_sql(w: Any, warehouse: str, statement: str, parameters: list | None = None) -> list[list[str]]:
+    from databricks.sdk.service.sql import StatementState
+
+    stmt = w.statement_execution.execute_statement(
+        warehouse_id=warehouse, statement=statement, wait_timeout="50s", parameters=parameters)
+    while stmt.status.state in (StatementState.PENDING, StatementState.RUNNING):
+        time.sleep(2)
+        stmt = w.statement_execution.get_statement(stmt.statement_id)
+    if stmt.status.state != StatementState.SUCCEEDED:
+        raise _SqlError(stmt.status.error.message if stmt.status.error else str(stmt.status.state))
+    return (stmt.result.data_array or []) if stmt.result else []
+
+
+def _retry(fn: Any, what: str, attempts: int = 3) -> Any:
+    """Retry transient failures (timeouts, throttling, 5xx) with backoff; fail fast on the rest."""
+    from databricks.sdk.errors import BadRequest, NotFound, PermissionDenied, Unauthenticated
+
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except (BadRequest, NotFound, PermissionDenied, Unauthenticated, _SqlError):
+            raise
+        except Exception as e:
+            if attempt == attempts:
+                raise
+            log(f"  ↻ {what}: {type(e).__name__}: {e} — retrying ({attempt}/{attempts - 1})")
+            time.sleep(5 * attempt)
 
 
 def _warehouse_id(w: Any) -> str:

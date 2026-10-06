@@ -1,54 +1,84 @@
 # Cross-team feature sharing: changing a shared feature through a PR
 
 **Team A** owns a feature table. **Team B** trains a model on it. Team A changes the table
-with a pull request, and a check on the PR asks Unity Catalog: *does anything — a live model,
-a job, a pipeline, a dashboard — read a column this PR changes?* If something does, the PR is
-blocked.
+with a pull request, and a check on the PR decides whether the change is safe to ship.
+
+The rule the check enforces is the one feature platforms use: **released features are
+immutable.** A feature's SQL and type never change after release. New logic ships as a new
+feature (`<name>_v2`), the old one is deprecated, and it's removed only once nothing in Unity
+Catalog depends on it.
 
 | | Team A's PR | Check result |
 |---|---|---|
-| ✅ Happy path | Adds a new feature | **OK to merge**: no model reads a column that doesn't exist yet |
-| ❌ Not happy path | Changes how an existing feature is calculated | **BLOCKED**: Team B's `@champion` and its training and scoring jobs read it and would silently get different numbers |
+| 1 ✅ Happy path | Adds a new feature | **OK to merge** |
+| 2 ❌ Not happy path | Changes an existing feature's SQL | **BLOCKED**: released features are immutable, and the check lists who it would have broken (Team B's `@champion` and its training and scoring jobs) |
+| 3 ✅ Right way | Adds the new logic as `txn_count_30d_v2` and deprecates `txn_count_30d` | **OK to merge**: Team B keeps reading the old column, unchanged, and moves when it's ready |
 
-```
-edit contract on a branch → PR → Feature contract check ──► no model affected → ✅ review → merge → staging publishes
-                                                         └─► a model reads it  → ❌ blocked, PR comment names the model
-```
+## Layout
 
-## How it works
-
-- **The contract** (`team_a_producer/contracts/customer_features.yaml`) describes the table:
-  keys, owner, and each feature's type, definition and `logic_version`. Team A's pipeline
-  (`team_a_producer/notebooks/01_publish_features.py`) builds the UC feature table from it.
-  The SQL for each feature is in that notebook's `FEATURE_LOGIC`.
-- **Team B** lists the columns it reads in `team_b_consumer/feature_config.yaml` and trains
-  with `FeatureLookup` + `fe.log_model`, so the model records exactly what it reads.
-- **The check** (`governance/check_change.py`) diffs the PR's contract against `main` and asks
-  `governance/dependencies.py` what depends on the table (below). It runs for staging and prod
-  and comments on the PR.
-- **Approval** is a code-owner review (`.github/CODEOWNERS`). Nothing is written into YAML.
-
-### How dependencies are found
-
-| What | Source (all native Unity Catalog) | Counted when |
+| Path | Owner | What it is |
 |---|---|---|
-| **Models** | UC lineage lists every model version logged with `fe.log_model` from the table, in any catalog (plus the `feature_dependencies` tag, as a fallback for lineage lag). The exact columns come from each version's `feature_spec.yaml`. | The version holds an alias (`@champion`, …) **or** a serving endpoint serves it. A live version whose columns can't be read counts as reading every column. |
-| **Jobs, pipelines, dashboards** | `system.access.column_lineage`, last 30 days: the columns each one read **in its latest run**, so a job that has moved off a column stops counting | Always, except the producer (anything that writes the table) |
-| **Ad hoc notebooks and queries** | Same, interactive reads | Never blocks — listed as warnings so you can tell those people |
+| `team_a_producer/contracts/customer_features.yaml` | Team A | The **contract**: what the table promises — keys, owner, SLA, and each feature's type, definition, status and lifecycle |
+| `team_a_producer/features/customer_features/<feature>.sql` | Team A | **How** each feature is computed: one SQL aggregate expression per feature |
+| `team_a_producer/features/customer_features/_base.sql` | Team A | The query skeleton the expressions go into (grain, point-in-time join, window) |
+| `team_a_producer/notebooks/01_publish_features.py` | Team A | Runs `_base.sql` with every expression, runs the quality gate, publishes the UC feature table, writes comments and tags |
+| `team_b_consumer/feature_config.yaml` | Team B | The exact columns Team B reads; it trains with `FeatureLookup` + `fe.log_model` |
+| `governance/check_change.py` | Platform | **The PR check** (below) |
+| `governance/dependencies.py` | Platform | What depends on a table, from Unity Catalog's own records; and the SQL compile check |
+| `shared/feature_contract_utils.py` | Platform | The rules, as plain functions (unit-tested) |
+| `governance/notebooks/find_feature_consumers.py` | Platform | The same dependency lookup as a job: "who uses my table / column?" |
 
-If any source can't be read (permissions, no warehouse), the PR is **blocked**: an unknown
-answer isn't a yes. The same lookup, for one column, is the `feature_consumers_check` job:
-`databricks bundle run feature_consumers_check -t staging --params column=txn_count_30d,fail_if_active=true`.
+## The PR check
 
-## One-time setup
+`.github/workflows/feature_sharing_demo-contract-check.yml` runs on every PR that touches the
+demo. For each feature table whose contract **or SQL** changed, `check_change.py` compares
+`main` with the PR, once for staging and once for prod:
 
-1. Repo secrets `DATABRICKS_HOST` / `DATABRICKS_TOKEN`. The token's identity must be able to
-   read every model in the catalog, read `system.access`, and use a SQL warehouse (set
-   `DATABRICKS_WAREHOUSE_ID` to pick one; otherwise the first serverless warehouse is used).
-2. Branch protection on `main`: required check **Downstream impact (live model registry)**,
-   and **Require review from Code Owners**.
-3. Staging has Team A's table and Team B's `@champion`. The first staging CD run does this,
-   or run it by hand:
+| Step | Question | Blocks when |
+|---|---|---|
+| 1 | Are the contract and SQL valid, one SQL file per feature? | a field or file is missing, or they don't match |
+| 2 | What changed? | — (lists added / deprecated / removed / changed / metadata) |
+| 3 | Is it allowed? | a released feature's SQL or type changed; an active feature was removed; keys or `_base.sql` changed; the version bump or changelog entry is wrong |
+| 4 | Does the SQL compile? | `EXPLAIN` of the full feature query fails (only when feature SQL was added or changed) |
+| 5 | What depends on it? | something still reads a feature this removes; or a source can't be read |
+
+Step 5 runs only when a change affects existing readers. It uses Unity Catalog's records:
+
+| What | Source | Counted when |
+|---|---|---|
+| **Models** | UC lineage lists every model version logged with `fe.log_model` from the table, in any catalog; each version's `feature_spec.yaml` gives the exact columns | The version has an alias (`@champion`, …) **or** a serving endpoint serves it. Unknown columns count as every column. |
+| **Jobs, pipelines, dashboards** | `system.access.column_lineage`: the columns each one read **in its latest run**, last 30 days | Always, except the producer (anything that writes the table) |
+| **Ad hoc notebooks and queries** | same | Never blocks: listed as warnings |
+
+If a source can't be read, the PR is blocked: an unknown answer isn't a yes. Transient API
+errors are retried first. Every step is logged live in the CI log; the PR comment has the
+report.
+
+Approval is a code-owner review (`.github/CODEOWNERS`).
+
+## The rules
+
+| Change | How | Version |
+|---|---|---|
+| New feature | contract entry + `<feature>.sql` | minor |
+| New logic for an existing feature | a new feature `<name>_v2`; deprecate `<name>` | minor |
+| Deprecate a feature | `status: deprecated`, `sunset_date`, `replaced_by` | minor |
+| Remove a feature | only once deprecated **and** nothing depends on it (warns if before `sunset_date`) | major |
+| Definition text, description, owner, SLA | metadata | patch |
+| Change a released feature's SQL or type | **never** — ship `<name>_v2` | — |
+| Change keys, `_base.sql` (grain, window, source) or the table name | **never** — ship a new table | — |
+
+SQL comments and whitespace aren't changes. Every version needs a changelog entry.
+
+## Setup
+
+1. Repo secrets `DATABRICKS_HOST` + `DATABRICKS_TOKEN`, or, for production, a service
+   principal (`DATABRICKS_CLIENT_ID` / `DATABRICKS_CLIENT_SECRET`). The identity must read
+   every model in the catalog, read `system.access`, and use a SQL warehouse
+   (`DATABRICKS_WAREHOUSE_ID`, or the first serverless one).
+2. Branch protection on `main`: required check **Downstream impact (live model registry)** and
+   **Require review from Code Owners**. Without it the check only advises.
+3. Staging has Team A's table and Team B's `@champion` (the first staging CD run does this):
    ```bash
    cd databricks_mlops_platform && export DATABRICKS_CONFIG_PROFILE=dbc-aef35066-afa2
    databricks bundle deploy -t staging
@@ -57,91 +87,46 @@ answer isn't a yes. The same lookup, for one column, is the `feature_consumers_c
    databricks bundle run team_b_training -t staging
    ```
 
-## Case 1: happy path, add a feature
+CI installs pinned versions from `requirements-ci.txt`; upgrade them deliberately.
 
-```bash
-git switch main && git pull && git switch -c team-a/add-avg-txn-amount-90d
-```
+## Making a change
 
-In `customer_features.yaml`, set `version: 1.1.0` and add:
+**Add a feature** (case 1 and 3): add it to `features:` in the contract (with `since` = the
+new version), add `team_a_producer/features/customer_features/<name>.sql`, bump the minor
+version, add a changelog entry, open a PR.
 
 ```yaml
-features:
   - name: avg_txn_amount_90d
     dtype: double
     definition: Mean purchase amount (refunds excluded) in the 90 days before as_of_date (0 if none).
-    logic_version: 1
     status: active
     since: 1.1.0
-
-changelog:
-  - version: 1.1.0
-    date: "2026-10-06"
-    change: Added avg_txn_amount_90d.
+```
+```sql
+-- avg_txn_amount_90d.sql
+coalesce(avg(CASE WHEN NOT t.is_refund THEN t.amount END), 0)
 ```
 
-(`FEATURE_LOGIC` already has the SQL for it.)
+**Change a feature's logic** (case 3, not case 2): add `<name>_v2` as above and, in the same
+PR, deprecate `<name>` (`status: deprecated`, `sunset_date`, `replaced_by: <name>_v2`).
+Consumers move to `_v2` in their own PRs; Team B's discover step warns them until they do.
+
+**Remove a deprecated feature**: delete it from the contract and delete its `.sql` file,
+bump the major version. The check blocks it while anything still reads it.
+
+Run the check locally:
 
 ```bash
-git commit -am "Add avg_txn_amount_90d" && git push -u origin HEAD && gh pr create --fill
-```
-
-Result: ✅ **OK to merge**. After merging, staging CD (about 10 minutes) adds the column and
-re-scores with Team B's `@champion`, unchanged.
-
-## Case 2: not happy path, change a feature in place
-
-```bash
-git switch main && git pull && git switch -c team-a/txn-count-exclude-refunds
-```
-
-- In `customer_features.yaml`, for `txn_count_30d`: change `definition` to `Number of
-  purchase transactions (refunds excluded) in the 30 days before as_of_date.`, set
-  `logic_version: 2`, bump `version` to `2.0.0`, and add a changelog entry.
-- In `01_publish_features.py`: `"txn_count_30d": f"count(CASE WHEN {W30} AND NOT t.is_refund THEN t.txn_id END)",`
-
-```bash
-git commit -am "Exclude refunds from txn_count_30d" && git push -u origin HEAD && gh pr create --fill
-```
-
-Result: ❌ **BLOCKED**
-
-```
-BLOCKED — this would break downstream:
-  x model workspace.team_b_ml_staging.default_risk_model v2 @champion (team_b) reads txn_count_30d: logic/definition changed in place
-  x job staging-feature-demo-team-b-training reads txn_count_30d: logic/definition changed in place
-  x job staging-feature-demo-team-b-scoring reads txn_count_30d: logic/definition changed in place
-
-How to ship it without breaking anyone:
-  1. Add the new logic as a new column, txn_count_30d_v2, and leave txn_count_30d unchanged.
-  2. Each dependency above moves to txn_count_30d_v2 (its own PR).
-  3. Once nothing reads txn_count_30d, it can be changed or removed.
-```
-
-The way out is case 1: add `txn_count_30d_v2` as a new column. Team B switches to it in its
-own PR to `feature_config.yaml`.
-
-## The rules
-
-| Change | Version | Blocked when |
-|---|---|---|
-| New feature | minor | never |
-| Deprecate a feature | minor | never |
-| Change a feature's definition or logic | major | anything reads it (live model, job, pipeline, dashboard) |
-| Remove a feature | major | anything reads it |
-| Change a dtype, keys or table name | — | always (ship `<name>_v2` or a new table) |
-| Description, owner, SLA | patch | never |
-
-Tested in `tests/test_feature_contract_utils.py` (`pytest tests -q`). To run the check
-locally:
-
-```bash
-git show origin/main:databricks_mlops_platform/feature_sharing_demo/team_a_producer/contracts/customer_features.yaml > /tmp/base.yaml
-python governance/check_change.py --base /tmp/base.yaml --proposed team_a_producer/contracts/customer_features.yaml \
+cd databricks_mlops_platform/feature_sharing_demo
+pip install -r requirements-ci.txt && pytest tests -q
+git worktree add /tmp/base origin/main
+python governance/check_change.py \
+  --base /tmp/base/databricks_mlops_platform/feature_sharing_demo/team_a_producer/contracts/customer_features.yaml \
+  --proposed team_a_producer/contracts/customer_features.yaml \
   --var catalog=workspace --var producer_schema=team_a_features_staging --var raw_schema=feature_demo_raw_staging
 ```
 
 **Not covered:** readers outside Unity Catalog (exports, external engines reading the files),
-models that copy the features instead of using `fe.log_model` (they show up only as the job
-that read the table), readers new enough that lineage hasn't caught up (minutes), and
-`FEATURE_LOGIC` edits made without changing the contract. Code-owner review catches the last.
+models that don't use `fe.log_model` (they show up only as the job that read the table), and
+readers so new that lineage hasn't caught up (minutes). Immutability makes the first and last
+safe for changes; they matter only for removal.
