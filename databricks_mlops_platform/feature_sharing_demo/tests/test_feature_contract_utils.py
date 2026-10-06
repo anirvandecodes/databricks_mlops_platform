@@ -18,14 +18,21 @@ sys.path.insert(0, str(DEMO / "shared"))
 sys.path.insert(0, str(DEMO / "governance"))
 
 import check_change  # noqa: E402
+import dependencies  # noqa: E402
 import feature_contract_utils as fcu  # noqa: E402
+from dependencies import Dependency, Report  # noqa: E402
 
 CONTRACT = DEMO / "team_a_producer" / "contracts" / "customer_features.yaml"
 CONSUMER_CFG = DEMO / "team_b_consumer" / "feature_config.yaml"
 VARS = {"catalog": "demo", "raw_schema": "raw", "producer_schema": "team_a_features", "consumer_schema": "team_b_ml"}
 TABLE = "demo.team_a_features.customer_features"
-TEAM_B = {"team": "team_b", "model": "demo.team_b_ml.default_risk_model", "version": 1, "alias": "champion",
-          "features": ["txn_count_30d", "txn_amount_sum_30d", "days_since_last_txn"]}
+TEAM_B = {"kind": "model", "name": "demo.team_b_ml.default_risk_model", "detail": "v1 @champion (team_b)",
+          "features": ["txn_count_30d", "txn_amount_sum_30d", "days_since_last_txn"], "source": "feature spec",
+          "blocking": True}
+
+
+def report(*deps: dict, errors: tuple = ()) -> Report:
+    return Report(TABLE, [Dependency(**d) for d in deps], [], list(errors))
 
 
 @pytest.fixture
@@ -165,12 +172,17 @@ def test_next_version_name(name, expected):
 
 def test_change_to_a_read_column_breaks_its_reader(base):
     (b,) = fcu.downstream_breaks(fcu.diff_contract(base, changed_in_place(base)), [TEAM_B])
-    assert b["feature"] == "txn_count_30d" and b["consumer"]["team"] == "team_b"
+    assert b["feature"] == "txn_count_30d" and b["dependency"]["name"] == TEAM_B["name"]
 
 
 def test_change_to_an_unread_column_breaks_nobody(base):
     reads_other = {**TEAM_B, "features": ["txn_amount_sum_30d"]}
     assert fcu.downstream_breaks(fcu.diff_contract(base, changed_in_place(base)), [reads_other]) == []
+
+
+def test_unknown_columns_count_as_every_column(base):
+    unknown = {**TEAM_B, "features": None}
+    assert len(fcu.downstream_breaks(fcu.diff_contract(base, changed_in_place(base)), [unknown])) == 1
 
 
 def test_key_change_breaks_every_reader(base):
@@ -189,14 +201,14 @@ def _write(tmp_path, name, data):
 
 
 def test_gate_happy_path(tmp_path, base, capsys):
-    rc = check_change.run(str(CONTRACT), _write(tmp_path, "pr.yaml", added(base)), VARS, lambda t: [TEAM_B])
-    assert rc == 0 and "nothing downstream breaks" in capsys.readouterr().out
+    rc = check_change.run(str(CONTRACT), _write(tmp_path, "pr.yaml", added(base)), VARS, lambda t: report(TEAM_B))
+    assert rc == 0 and "nothing breaks" in capsys.readouterr().out
 
 
 def test_gate_blocks_change_that_breaks_downstream(tmp_path, base, capsys):
     seen = []
     rc = check_change.run(str(CONTRACT), _write(tmp_path, "pr.yaml", changed_in_place(base)), VARS,
-                          lambda t: seen.append(t) or [TEAM_B])
+                          lambda t: seen.append(t) or report(TEAM_B))
     out = capsys.readouterr().out
     assert rc == 1 and seen == [TABLE]
     assert "this would break downstream" in out and "txn_count_30d_v2" in out
@@ -204,12 +216,37 @@ def test_gate_blocks_change_that_breaks_downstream(tmp_path, base, capsys):
 
 def test_gate_allows_breaking_change_with_no_readers(tmp_path, base):
     assert check_change.run(str(CONTRACT), _write(tmp_path, "pr.yaml", changed_in_place(base)), VARS,
-                            lambda t: []) == 0
+                            lambda t: report()) == 0
+
+
+def test_gate_blocks_job_reading_changed_column(tmp_path, base, capsys):
+    job = {**TEAM_B, "kind": "job", "name": "nightly-report", "detail": "latest read today", "source": "lineage"}
+    rc = check_change.run(str(CONTRACT), _write(tmp_path, "pr.yaml", changed_in_place(base)), VARS,
+                          lambda t: report(job))
+    assert rc == 1 and "x job nightly-report reads txn_count_30d" in capsys.readouterr().out
+
+
+def test_gate_only_warns_on_ad_hoc_reads(tmp_path, base, capsys):
+    adhoc = {**TEAM_B, "kind": "notebook", "name": "123", "detail": "latest read today", "blocking": False}
+    rc = check_change.run(str(CONTRACT), _write(tmp_path, "pr.yaml", changed_in_place(base)), VARS,
+                          lambda t: report(adhoc))
+    assert rc == 0 and "! notebook 123 read txn_count_30d" in capsys.readouterr().out
+
+
+def test_gate_fails_closed_when_a_source_is_unreadable(tmp_path, base, capsys):
+    rc = check_change.run(str(CONTRACT), _write(tmp_path, "pr.yaml", added(base)), VARS,
+                          lambda t: report(errors=("could not read column lineage: PermissionDenied",)))
+    assert rc == 1 and "couldn't be fully checked" in capsys.readouterr().out
+
+
+def test_gate_skips_environment_where_table_is_unpublished(tmp_path, base, capsys):
+    rc = check_change.run(str(CONTRACT), _write(tmp_path, "pr.yaml", changed_in_place(base)), VARS, lambda t: None)
+    assert rc == 0 and "isn't published here yet" in capsys.readouterr().out
 
 
 def test_gate_blocks_invalid_contract(tmp_path, base):
     del base["owner"]
-    assert check_change.run(str(CONTRACT), _write(tmp_path, "pr.yaml", base), VARS, lambda t: []) == 1
+    assert check_change.run(str(CONTRACT), _write(tmp_path, "pr.yaml", base), VARS, lambda t: report()) == 1
 
 
 # --- UC DDL derived from the contract -------------------------------------------------
@@ -254,3 +291,12 @@ def test_consumer_warned_about_deprecated_pins(base):
     cfg = fcu.load_yaml(CONSUMER_CFG, VARS)
     (warning,) = fcu.deprecated_dependencies(cfg, {TABLE: base})
     assert "txn_count_30d" in warning and "migrate to txn_count_30d_v2" in warning
+
+
+def test_feature_spec_columns_only_from_this_table():
+    spec = {"input_columns": [
+        {"customer_id": {"source": "training_data"}},
+        {"txn_count_30d": {"table_name": TABLE, "feature_name": "txn_count_30d", "source": "feature_store"}},
+        {"other": {"table_name": "demo.x.other_features", "feature_name": "other", "source": "feature_store"}},
+    ]}
+    assert dependencies.feature_spec_columns(spec, TABLE) == ["txn_count_30d"]

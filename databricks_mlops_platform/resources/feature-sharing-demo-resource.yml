@@ -82,9 +82,9 @@ resources:
             base_parameters: *team_b_params
       max_concurrent_runs: 1
 
-    # Governance: who consumes a feature table / column? Run before any breaking change or
-    # removal; the result lists the teams to talk to first. With
-    # fail_if_active=true it is the deprecation gate (fails while active consumers remain).
+    # Governance: what depends on a feature table / column? The same lookup as the PR check
+    # (governance/dependencies.py). With fail_if_active=true it is the removal gate (fails
+    # while anything still depends on the column).
     feature_consumers_check:
       name: ${bundle.target}-feature-demo-feature-consumers-check
       tags: {project: feature-sharing-demo, role: governance}
@@ -101,5 +101,4 @@ resources:
               table: ${var.catalog_name}.${var.feature_demo_producer_schema}.customer_features
               column: "{{job.parameters.column}}"
               fail_if_active: "{{job.parameters.fail_if_active}}"
-              catalog: ${var.catalog_name}
       max_concurrent_runs: 1

@@ -1,102 +1,70 @@
 # Databricks notebook source
-# Governance — who depends on a feature table (or one column of it)?
+# Governance — what depends on a feature table (or one column of it)?
 #
-# Run by the producer before any breaking change or removal. Two sources:
-#   1. Declared dependencies (authoritative for "active"): every registered model version
-#      that currently holds an alias (@Champion, @Challenger, ...) and whose
-#      feature_dependencies tag includes the table/column. Changing or removing a column
-#      one of these reads would break it (the PR gate, check_change.py, asks the same thing).
-#   2. Unity Catalog lineage (system.access.table_lineage / column_lineage): who read the
-#      table recently — jobs, notebooks, models, dashboards. Shown for context; catches
-#      consumers that never declared anything. Lineage can lag by several minutes.
+# The same lookup the PR check runs (governance/dependencies.py), for a producer planning a
+# change:
+#   - live model versions (UC lineage + their feature specs; alias or serving endpoint)
+#   - jobs, pipelines and dashboards (column lineage, latest run, last `lookback_days`)
+#   - ad hoc notebook/query reads, as warnings
 #
-# Output: the teams to talk to before a breaking change (`affected_consumers`).
-# fail_if_active=true turns this into the deprecation gate (fails while active consumers remain).
+# column=<name> narrows it to one column. fail_if_active=true fails the run while anything
+# still depends on it — the gate before removing a column.
+
+# COMMAND ----------
+
+import os
+import sys
+
+# Workspace files: this notebook's folder is the working directory; dependencies.py is one up.
+sys.path.insert(0, os.path.abspath(".."))
+from dependencies import find_dependencies  # noqa: E402
+
+for w in ("table", "column", "fail_if_active", "lookback_days"):
+    dbutils.widgets.text(w, "")
+table = dbutils.widgets.get("table").strip()
+column = dbutils.widgets.get("column").strip() or None
+fail_if_active = dbutils.widgets.get("fail_if_active").strip().lower() == "true"
+lookback_days = int(dbutils.widgets.get("lookback_days").strip() or 30)
+target = f"{table}.{column}" if column else table
+
+# COMMAND ----------
+
+report = find_dependencies(table, lookback_days)
+if report is None:
+    dbutils.notebook.exit(f"{table} isn't published in this workspace.")
+deps = [d for d in report.dependencies if column is None or d.features is None or column in d.features]
+
+print(f"What depends on {target}:")
+for title, group in (("Blocking (must migrate first)", [d for d in deps if d.blocking]),
+                     ("Ad hoc reads (tell these people)", [d for d in deps if not d.blocking])):
+    print(f"\n{title}:")
+    for d in group:
+        cols = "every column (unknown)" if d.features is None else ", ".join(d.features)
+        print(f"  {d.kind:<9} {d.name} {d.detail}\n            reads {cols}  [{d.source}]")
+    if not group:
+        print("  none")
+if report.not_counted:
+    print("\nNot counted:")
+    for n in report.not_counted:
+        print(f"  {n}")
+for e in report.errors:
+    print(f"\nERROR {e}")
+
+display(spark.createDataFrame(
+    [(d.kind, d.name, d.detail, d.blocking, None if d.features is None else ", ".join(d.features), d.source)
+     for d in deps] or [("none", "", "", False, "", "")],
+    "kind string, name string, detail string, blocking boolean, reads string, source string"))
 
 # COMMAND ----------
 
 import json
 
-import mlflow
-from mlflow.tracking import MlflowClient
-
-for w in ("table", "column", "fail_if_active", "catalog"):
-    dbutils.widgets.text(w, "")
-table = dbutils.widgets.get("table").strip()
-column = dbutils.widgets.get("column").strip() or None
-fail_if_active = dbutils.widgets.get("fail_if_active").strip().lower() == "true"
-catalog = dbutils.widgets.get("catalog").strip() or table.split(".")[0]
-target = f"{table}.{column}" if column else table
-print(f"Consumers of {target}")
-
-# COMMAND ----------
-
-# 1. Declared, active dependencies from the model registry.
-mlflow.set_registry_uri("databricks-uc")
-client = MlflowClient()
-active = []
-from databricks.sdk import WorkspaceClient
-
-w = WorkspaceClient()
-model_names = [m.full_name
-               for s in w.schemas.list(catalog_name=catalog) if s.name != "information_schema"
-               for m in w.registered_models.list(catalog_name=catalog, schema_name=s.name)]
-for name in model_names:
-    rm = client.get_registered_model(name)
-    owner = (rm.tags or {}).get("consumer_team", "unknown")
-    for alias in rm.aliases or []:
-        alias_name, version = (alias.alias, alias.version) if hasattr(alias, "alias") else (alias, rm.aliases[alias])
-        mv = client.get_model_version(rm.name, version)
-        deps = json.loads((mv.tags or {}).get("feature_dependencies", "{}"))
-        cols = deps.get(table)
-        if cols is None or (column and column not in cols):
-            continue
-        active.append({"team": owner, "model": rm.name, "version": int(version),
-                       "alias": alias_name, "features": cols})
-
-print("\nActive model dependencies (aliased versions):")
-for a in active:
-    print(f"  {a['team']:<8} {a['model']} v{a['version']} @{a['alias']}  uses {a['features']}")
-if not active:
-    print("  none")
-
-# COMMAND ----------
-
-# 2. Lineage — recent readers (last 90 days).
-try:
-    if column:
-        lineage = spark.sql(f"""
-          SELECT entity_type, entity_id, target_table_full_name, target_column_name, created_by,
-                 max(event_time) AS last_read
-          FROM system.access.column_lineage
-          WHERE source_table_full_name = '{table}' AND source_column_name = '{column}'
-            AND event_time >= current_timestamp() - INTERVAL 90 DAYS
-          GROUP BY ALL ORDER BY last_read DESC""")
-    else:
-        lineage = spark.sql(f"""
-          SELECT entity_type, entity_id, target_type, target_table_full_name, created_by,
-                 max(event_time) AS last_read
-          FROM system.access.table_lineage
-          WHERE source_table_full_name = '{table}'
-            AND event_time >= current_timestamp() - INTERVAL 90 DAYS
-          GROUP BY ALL ORDER BY last_read DESC""")
-    print(f"\nLineage: {lineage.count()} recent reader(s)")
-    display(lineage)
-except Exception as e:  # system tables not enabled / no access
-    print(f"\nLineage unavailable ({type(e).__name__}); relying on declared dependencies only.")
-
-# COMMAND ----------
-
-teams = sorted({a["team"] for a in active})
-print("\nTeams to talk to before changing it:")
-print(f"affected_consumers: [{', '.join(teams)}]")
-dbutils.jobs.taskValues.set("affected_consumers", teams)
-
-summary = {"target": target, "active_consumers": active, "affected_consumers": teams}
-if fail_if_active and active:
-    raise AssertionError(
-        f"{target} still has {len(active)} active consumer(s): "
-        + ", ".join(f"{a['model']} v{a['version']} @{a['alias']}" for a in active)
-        + " — they must migrate before removal.")
-
-dbutils.notebook.exit(json.dumps(summary))
+blocking = [d for d in deps if d.blocking]
+if report.errors:
+    raise RuntimeError("Dependencies couldn't be fully checked:\n  " + "\n  ".join(report.errors))
+if fail_if_active and blocking:
+    raise AssertionError(f"{target} still has {len(blocking)} dependency(ies): "
+                         + "; ".join(f"{d.kind} {d.name} {d.detail}" for d in blocking)
+                         + " — they must migrate before removal.")
+dbutils.notebook.exit(json.dumps({"target": target, "blocking": [f"{d.kind} {d.name}" for d in blocking],
+                                  "ad_hoc": [f"{d.kind} {d.name}" for d in deps if not d.blocking]}))
