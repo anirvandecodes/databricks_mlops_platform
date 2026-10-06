@@ -23,11 +23,20 @@ treat the result as unknown (check_change.py blocks).
 
 import json
 import os
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 import yaml
+
+_START = time.monotonic()
+
+
+def log(message: str) -> None:
+    """Progress line on stderr: shows what is being checked while the report stays on stdout."""
+    print(f"[{time.monotonic() - _START:6.1f}s] {message}", file=sys.stderr, flush=True)
+
 
 # Lineage entity types that are someone poking at the data, not something that runs again.
 AD_HOC_ENTITY_TYPES = {"NOTEBOOK", "DBSQL_QUERY", "QUERY", None}
@@ -56,14 +65,20 @@ def find_dependencies(table: str, lookback_days: int = 30, w: Any = None) -> Rep
     from databricks.sdk import WorkspaceClient
 
     w = w or WorkspaceClient()
+    log(f"Finding dependencies of {table}")
     if not w.tables.exists(table).table_exists:
+        log("  table isn't published in this workspace → nothing can depend on it")
         return None
+    log("  table exists in Unity Catalog")
     report = Report(table)
     for name, step in (("models", _models), ("column lineage", _lineage_readers)):
         try:
             step(w, table, report, lookback_days)
         except Exception as e:  # any source missing = can't decide
             report.errors.append(f"could not read {name}: {type(e).__name__}: {e}")
+            log(f"  ✗ could not read {name}: {type(e).__name__}: {e}")
+    log(f"  done: {sum(d.blocking for d in report.dependencies)} dependency(ies), "
+        f"{sum(not d.blocking for d in report.dependencies)} ad hoc reader(s), {len(report.errors)} error(s)")
     return report
 
 
@@ -72,12 +87,23 @@ def find_dependencies(table: str, lookback_days: int = 30, w: Any = None) -> Rep
 # ---------------------------------------------------------------------------
 
 def _models(w: Any, table: str, report: Report, lookback_days: int) -> None:
+    log("  [models 1/4] UC lineage: model versions logged from this table (fe.log_model)")
     lineage = w.api_client.do("GET", "/api/2.0/lineage-tracking/table-lineage",
                               query={"table_name": table, "include_entity_lineage": "true"})
-    names = {d["modelInfo"]["model_name"] for d in lineage.get("downstreams", []) if "modelInfo" in d}
-    names |= _tagged_models(w, table)
+    found = sorted({(d["modelInfo"]["model_name"], d["modelInfo"]["version"])
+                    for d in lineage.get("downstreams", []) if "modelInfo" in d})
+    log("               " + (", ".join(f"{n} v{v}" for n, v in found) or "none"))
+    names = {n for n, _ in found}
+    log(f"  [models 2/4] fallback: models tagged feature_dependencies in catalog {table.split('.')[0]}")
+    tagged = _tagged_models(w, table)
+    log("               " + (", ".join(sorted(tagged)) or "none")
+        + (f"  (not in lineage yet: {', '.join(sorted(tagged - names))})" if tagged - names else ""))
+    names |= tagged
+    log("  [models 3/4] serving endpoints that serve UC model versions")
     served = _served_versions(w)
+    log("               " + (", ".join(f"{n} v{v} on {e}" for n, vs in served.items() for v, e in vs) or "none"))
 
+    log("  [models 4/4] live versions and the exact columns each reads (feature_spec.yaml)")
     for name in sorted(names):
         rm = _uc("registered-models/get", w, name=name)["registered_model"]
         team = _tags(rm).get("consumer_team", "unknown")
@@ -86,13 +112,18 @@ def _models(w: Any, table: str, report: Report, lookback_days: int) -> None:
             live.setdefault(int(a["version"]), []).append(f"@{a['alias']}")
         for v, endpoint in served.get(name, []):
             live.setdefault(v, []).append(f"served by {endpoint}")
+        log(f"               {name} (team {team})")
         for v in _all_versions(w, name):
             if v not in live:
                 report.not_counted.append(f"model     {name} v{v} (no alias, not served)")
+                log(f"                 v{v}: not live (no alias, not served) → not counted")
         for v, why in sorted(live.items()):
             features, source = _version_features(w, name, v, table)
             if features == []:
+                log(f"                 v{v} {' '.join(why)}: doesn't read this table")
                 continue  # this version doesn't use the table
+            log(f"                 v{v} {' '.join(why)}: reads "
+                + ("EVERY column (unknown)" if features is None else ", ".join(features)) + f"  [{source}]")
             report.dependencies.append(Dependency(
                 "model", name, f"v{v} {' '.join(why)} ({team})", features, source))
 
@@ -181,8 +212,11 @@ ORDER BY 1, 2
 def _lineage_readers(w: Any, table: str, report: Report, lookback_days: int) -> None:
     from databricks.sdk.service.sql import StatementParameterListItem, StatementState
 
+    warehouse = _warehouse_id(w)
+    log(f"  [lineage]    system.access.column_lineage, last {lookback_days} days, latest run per reader "
+        f"(warehouse {warehouse})")
     stmt = w.statement_execution.execute_statement(
-        warehouse_id=_warehouse_id(w), statement=_READERS_SQL, wait_timeout="50s",
+        warehouse_id=warehouse, statement=_READERS_SQL, wait_timeout="50s",
         parameters=[StatementParameterListItem(name="table", value=table),
                     StatementParameterListItem(name="days", value=str(lookback_days), type="INT")])
     while stmt.status.state in (StatementState.PENDING, StatementState.RUNNING):
@@ -191,12 +225,17 @@ def _lineage_readers(w: Any, table: str, report: Report, lookback_days: int) -> 
     if stmt.status.state != StatementState.SUCCEEDED:
         raise RuntimeError(stmt.status.error.message if stmt.status.error else stmt.status.state)
 
-    for etype, eid, last_read, by, producer, cols in (stmt.result.data_array or []):
+    rows = stmt.result.data_array or []
+    log(f"               {len(rows)} reader(s)" + ("" if rows else " — nothing read this table recently"))
+    for etype, eid, last_read, by, producer, cols in rows:
         kind = etype.lower()
         name = _entity_name(w, etype, eid)
         if producer == "true":
             report.not_counted.append(f"producer  {kind} {name} (writes this table)")
+            log(f"               {kind} {name}: producer (writes this table) → not counted")
             continue
+        log(f"               {kind} {name}: read {', '.join(json.loads(cols))} at {last_read[:16]}"
+            + ("" if etype not in AD_HOC_ENTITY_TYPES else " → ad hoc, warning only"))
         report.dependencies.append(Dependency(
             kind, name, f"latest read {last_read[:16]} by {by}", json.loads(cols),
             f"column lineage, last {lookback_days} days", blocking=etype not in AD_HOC_ENTITY_TYPES))

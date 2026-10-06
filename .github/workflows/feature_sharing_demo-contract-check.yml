@@ -85,7 +85,11 @@ jobs:
               python governance/check_change.py --base /tmp/base.yaml --proposed "${c#"$DEMO"/}" \
                 --var catalog="$(v catalog_name)" \
                 --var producer_schema="$(v feature_demo_producer_schema)" \
-                --var raw_schema="$(v feature_demo_raw_schema)" > /tmp/check.txt 2>&1 || { status=1; result=BLOCKED; }
+                --var raw_schema="$(v feature_demo_raw_schema)" \
+                > /tmp/check.txt 2> >(tee /tmp/progress.txt >&2) || { status=1; result=BLOCKED; }
+              # Progress streams live above (stderr); the report below is what goes into the PR comment.
+              [[ -s /tmp/check.txt ]] || { echo "The check crashed:"; tail -20 /tmp/progress.txt; } > /tmp/check.txt
+              echo "──────── report ($target) ────────"
               cat /tmp/check.txt
               echo "::endgroup::"
               printf '  %-8s %-8s %s\n' "$target" "$result" "${c##*/}" >> /tmp/summary.txt

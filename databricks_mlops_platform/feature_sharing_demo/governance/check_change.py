@@ -34,7 +34,7 @@ from typing import Any, Callable
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shared"))
 
 import feature_contract_utils as fcu  # noqa: E402
-from dependencies import Report, find_dependencies  # noqa: E402
+from dependencies import Report, find_dependencies, log  # noqa: E402
 
 ICON = {"added": "+", "deprecated": "~", "metadata": "~", "changed": "!", "removed": "!", "keys": "!"}
 
@@ -46,15 +46,20 @@ def run(base_path: str, proposed_path: str, variables: dict[str, str],
 
     print(f"Feature contract check: {proposed['table']}")
     print(f"  main {base['version']}  ->  PR {proposed['version']}\n")
+    log(f"Checking {proposed['table']}: main {base['version']} -> PR {proposed['version']}")
 
+    log("Step 1/4  Is the proposed contract valid?")
     problems = fcu.validate_contract(proposed)
+    log("          " + ("no: " + "; ".join(problems) if problems else "yes"))
     if problems:
         print("BLOCKED — invalid contract:")
         for p in problems:
             print(f"  x {p}")
         return 1
 
+    log("Step 2/4  What changed compared with main?")
     changes = fcu.diff_contract(base, proposed)
+    log("          " + (", ".join(f"{c['feature']} ({c['kind']})" for c in changes) or "nothing"))
     print("Changes:")
     for c in changes:
         print(f"  {ICON[c['kind']]} {c['feature']:<22} {c['kind']:<10} {c['message']}")
@@ -62,7 +67,9 @@ def run(base_path: str, proposed_path: str, variables: dict[str, str],
         print("  (none)")
 
     blocked = False
+    log("Step 3/4  Is the change allowed? (version bump, changelog, no dtype/key edits in place)")
     problems = fcu.change_problems(base, proposed, changes)
+    log("          " + ("no: " + "; ".join(problems) if problems else "yes"))
     if problems:
         blocked = True
         print("\nBLOCKED — not allowed:")
@@ -70,6 +77,9 @@ def run(base_path: str, proposed_path: str, variables: dict[str, str],
             print(f"  x {p}")
 
     breaking = [c for c in changes if c["kind"] in fcu.BREAKING_KINDS]
+    log("Step 4/4  Does anything downstream read a changed or removed column?"
+        + (f"  (changed/removed: {', '.join(c['feature'] for c in breaking)})" if breaking
+           else "  (no column is changed or removed)"))
     report = dependencies_of(base["table"]) if changes and dependencies_of else None
     if changes and dependencies_of and report is None:
         print(f"\n{base['table']} isn't published here yet, so nothing can read it — nothing to break.")
@@ -104,6 +114,7 @@ def run(base_path: str, proposed_path: str, variables: dict[str, str],
         print("\n(offline: dependencies not checked)")
 
     print("\nRESULT:", "BLOCKED" if blocked else "OK to merge")
+    log(f"Result: {'BLOCKED' if blocked else 'OK to merge'}")
     return 1 if blocked else 0
 
 
