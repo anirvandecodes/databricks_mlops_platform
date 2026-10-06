@@ -4,12 +4,13 @@
 # Run by the producer before any breaking change or removal. Two sources:
 #   1. Declared dependencies (authoritative for "active"): every registered model version
 #      that currently holds an alias (@Champion, @Challenger, ...) and whose
-#      feature_dependencies tag includes the table/column. These teams must approve.
+#      feature_dependencies tag includes the table/column. Changing or removing a column
+#      one of these reads would break it (the PR gate, check_change.py, asks the same thing).
 #   2. Unity Catalog lineage (system.access.table_lineage / column_lineage): who read the
 #      table recently — jobs, notebooks, models, dashboards. Shown for context; catches
 #      consumers that never declared anything. Lineage can lag by several minutes.
 #
-# Output: the `affected_consumers` list to paste into the change request.
+# Output: the teams to talk to before a breaking change (`affected_consumers`).
 # fail_if_active=true turns this into the deprecation gate (fails while active consumers remain).
 
 # COMMAND ----------
@@ -87,7 +88,7 @@ except Exception as e:  # system tables not enabled / no access
 # COMMAND ----------
 
 teams = sorted({a["team"] for a in active})
-print("\nPaste into the change request:")
+print("\nTeams to talk to before changing it:")
 print(f"affected_consumers: [{', '.join(teams)}]")
 dbutils.jobs.taskValues.set("affected_consumers", teams)
 
@@ -96,6 +97,6 @@ if fail_if_active and active:
     raise AssertionError(
         f"{target} still has {len(active)} active consumer(s): "
         + ", ".join(f"{a['model']} v{a['version']} @{a['alias']}" for a in active)
-        + " — they must migrate (or approve) before removal.")
+        + " — they must migrate before removal.")
 
 dbutils.notebook.exit(json.dumps(summary))

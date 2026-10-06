@@ -86,7 +86,7 @@ for dep in cfg["feature_dependencies"]:
           f"Team B built against {dep.get('contract_version')}")
     for feat in dep["feature_names"]:
         if feat not in columns:
-            problems.append(f"{table}.{feat}: pinned but no longer published — raise a change request "
+            problems.append(f"{table}.{feat}: pinned but no longer published — contact "
                             f"with {tags.get('feature_owner')} ({tags.get('support_channel')})")
         elif status.get(feat) and status[feat]["status"] == "deprecated":
             s = status[feat]

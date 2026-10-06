@@ -1,5 +1,5 @@
-# Feature change request — filed by a CONSUMER team in the PRODUCER team's repo.
-# Mirrors databricks_mlops_platform/feature_sharing_demo/governance/change_requests/CR-*.yaml.
+# Feature change request — filed by a CONSUMER team in the PRODUCER team's repo. The producer
+# implements it as a contract PR, which the Feature contract check gates.
 name: Feature change request
 description: Ask the owning team to add, change, fix or retire a shared feature
 title: "[Feature CR] <table>: <short summary>"
@@ -24,10 +24,10 @@ body:
     attributes:
       label: Change type
       options:
-        - label: "New feature (additive — producer approval only)"
-        - label: "Logic / meaning change (ships as <name>_v2; old column deprecated)"
+        - label: "New feature (new column — safe for every consumer)"
+        - label: "Logic / meaning change (ships as <name>_v2 while any model reads the old column)"
         - label: "Key or grain change (ships as a new table)"
-        - label: "Bug fix to existing values (treated as breaking — consumers notified)"
+        - label: "Bug fix to existing values (blocked while any model reads the column)"
         - label: "Deprecation / removal"
   - type: textarea
     id: reason

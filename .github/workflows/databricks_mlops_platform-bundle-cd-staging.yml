@@ -64,7 +64,7 @@ jobs:
   #   demo not set up yet       -> bootstrap: mock data, first publish, first training
   #
   # The PR gate (feature_sharing_demo-contract-check.yml) has already blocked any contract
-  # change without its approvals, so nothing here re-checks them.
+  # change that would break a live model, so nothing here re-checks it.
   feature_sharing_demo:
     name: Feature sharing demo — publish and consume
     needs: deploy

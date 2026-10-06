@@ -1,16 +1,14 @@
 <!-- Feature contract PRs: open with ?template=feature_contract_change.md -->
 ## Summary
 
-## Feature contract changes (delete if no contract file changed)
-- Change request: CR-___ / #issue
+## Feature contract change (delete if no contract file changed)
 - Contract: `<table>` `<old version>` → `<new version>`
-- Change kind reported by the contract check: none / metadata / additive / breaking
+- Requested in: #issue (if a consumer asked for it)
 
 Checklist:
-- [ ] Contract version bumped (patch: metadata · minor: new/deprecated feature · major: removal)
+- [ ] Version bumped (patch: metadata · minor: new or deprecated feature · major: changed or removed feature)
 - [ ] Changelog entry for the new version
-- [ ] No in-place logic/dtype change — changed logic ships as `<name>_v2`
-- [ ] Deprecated features have `sunset_date` and `replaced_by`
-- [ ] Ran `find_feature_consumers` and filled `affected_consumers` in the CR
-- [ ] Breaking: every affected consumer team approved in the CR (CI enforces this)
+- [ ] Pipeline logic (`FEATURE_LOGIC`) updated for every new or changed feature
+- [ ] New logic for an existing feature ships as `<name>_v2` unless no live model reads it
+- [ ] *Feature contract check* is green (it fails if a live model reads a column this PR changes or removes)
 - [ ] Announced in the contract's `support_channel` after release

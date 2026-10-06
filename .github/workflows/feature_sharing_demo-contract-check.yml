@@ -1,8 +1,9 @@
 # Feature-sharing demo, PR gate. Every PR that touches the demo runs the contract-rule unit
-# tests and validates the bundle; every PR that edits a released contract is diffed against
-# the base branch by check_change.py. Breaking changes stay blocked until each required team
-# has an approval recorded in a change request (governance/change_requests/CR-*.yaml)
-# changed in the same PR. Make "Feature contract check" a required check on main.
+# tests and validates the bundle. Every PR that edits a released contract is diffed against
+# the base branch by check_change.py, which asks the live model registry (staging and prod)
+# whether any model reads a column the PR changes or removes — and fails the PR if one does.
+# Approval is a code-owner review (CODEOWNERS). Make "Downstream impact (live model
+# registry)" a required status check on main, together with "Require review from Code Owners".
 name: Feature contract check
 
 on:
@@ -34,10 +35,17 @@ jobs:
       - run: pip install pyyaml pytest
       - run: pytest tests -v
 
-  contract-diff:
-    name: Contract diff vs base branch
+  downstream:
+    name: Downstream impact (live model registry)
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -45,29 +53,48 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install pyyaml
-      - name: Check every changed contract
+      - uses: databricks/setup-cli@main
+      - run: pip install pyyaml databricks-sdk
+      - name: Check every changed contract against the models that read it
         env:
           BASE: origin/${{ github.base_ref }}
           DEMO: databricks_mlops_platform/feature_sharing_demo
+          PR: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
           # git diff prints repo-relative paths; check_change.py runs from the demo folder.
-          cr=$(git diff --name-only "$BASE"...HEAD -- governance/change_requests | head -1 || true)
           contracts=$(git diff --name-only --diff-filter=M "$BASE"...HEAD -- team_a_producer/contracts)
           if [[ -z "$contracts" ]]; then
             echo "No released contract changed in this PR." | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           status=0
+          : > /tmp/report.md
           for c in $contracts; do
             git show "$BASE:$c" > /tmp/base.yaml
-            args=(--base /tmp/base.yaml --proposed "${c#"$DEMO"/}")
-            [[ -n "$cr" ]] && args+=(--change-request "${cr#"$DEMO"/}")
-            python governance/check_change.py "${args[@]}" > /tmp/check.txt || status=1
-            cat /tmp/check.txt
-            { echo '```'; cat /tmp/check.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            # Consumers live in every environment the contract is released to.
+            for target in staging prod; do
+              vars=$(cd .. && databricks bundle validate -t "$target" -o json | jq '.variables')
+              v() { jq -r ".$1.value" <<<"$vars"; }
+              result=OK
+              python governance/check_change.py --base /tmp/base.yaml --proposed "${c#"$DEMO"/}" \
+                --var catalog="$(v catalog_name)" \
+                --var producer_schema="$(v feature_demo_producer_schema)" \
+                --var raw_schema="$(v feature_demo_raw_schema)" > /tmp/check.txt || { status=1; result=BLOCKED; }
+              cat /tmp/check.txt
+              { echo "#### \`${c##*/}\` — $target: $result"; echo '```'; cat /tmp/check.txt; echo '```'; } >> /tmp/report.md
+            done
           done
+          cat /tmp/report.md >> "$GITHUB_STEP_SUMMARY"
+          {
+            if [[ $status == 0 ]]; then echo "### ✅ Feature contract check: safe to merge"
+            else echo "### ❌ Feature contract check: blocked (details below)"; fi
+            echo
+            cat /tmp/report.md
+          } > /tmp/comment.md
+          # One comment per PR, updated on every push.
+          gh pr comment "$PR" --body-file /tmp/comment.md --edit-last 2>/dev/null \
+            || gh pr comment "$PR" --body-file /tmp/comment.md
           exit $status
 
   # The demo is part of the platform bundle. The platform's own bundle-ci skips demo-only

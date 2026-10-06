@@ -5,9 +5,9 @@
 #   <catalog>.<consumer_schema>.default_labels Team B's training spine (customer, as_of_date, label)
 #   <catalog>.<producer_schema>                empty — Team A's pipeline creates the feature table
 #
-# The data is shaped so CR-001 matters: risky customers issue more refunds, so counting
-# refunds as activity (txn_count_30d v1) blurs the risk signal and the refund-free
-# txn_count_30d_v2 improves Team B's model. DROPS the demo schemas — demo catalog only.
+# The data is shaped so excluding refunds matters: risky customers issue more refunds, so
+# counting refunds as activity (txn_count_30d) blurs the risk signal — which is why someone
+# is tempted to "fix" txn_count_30d in place, the change the PR gate blocks. DROPS the demo schemas — demo catalog only.
 
 # COMMAND ----------
 
@@ -35,12 +35,18 @@ if not catalog:
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.errors import NotFound
 
-# Registered models are deleted explicitly before DROP SCHEMA ... CASCADE, so a re-run
-# (every CI run of the walkthrough) does not depend on CASCADE removing a model with aliases.
+# Registered models are deleted explicitly before DROP SCHEMA ... CASCADE: neither CASCADE
+# nor registered_models.delete removes a model that still has versions, so a re-run (every
+# CI run of the walkthrough) would fail. Order matters: aliases, then versions, then model.
 w = WorkspaceClient()
 for schema in (raw_schema, producer_schema, consumer_schema):
     try:
         for m in w.registered_models.list(catalog_name=catalog, schema_name=schema):
+            full = w.registered_models.get(m.full_name, include_aliases=True)
+            for a in full.aliases or []:
+                w.registered_models.delete_alias(m.full_name, a.alias_name)
+            for v in w.model_versions.list(m.full_name):
+                w.model_versions.delete(m.full_name, v.version)
             w.registered_models.delete(m.full_name)
     except NotFound:
         pass
