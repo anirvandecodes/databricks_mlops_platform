@@ -5,7 +5,7 @@
 #
 # Released features are immutable: new logic ships as a new feature (<name>_v2).
 table: ${catalog}.${producer_schema}.customer_features
-version: 1.0.0
+version: 1.1.0
 owner: team_a
 support_channel: "#team-a-features"
 description: >
@@ -36,8 +36,16 @@ features:
     definition: Days between the last transaction before as_of_date and as_of_date, looking back 90 days (999 if none).
     status: active
     since: 1.0.0
+  - name: avg_txn_amount_90d
+    dtype: double
+    definition: Mean purchase amount (refunds excluded) in the 90 days before as_of_date (0 if none).
+    status: active
+    since: 1.1.0
 
 changelog:
   - version: 1.0.0
     date: "2026-10-05"
     change: Initial release.
+  - version: 1.1.0
+    date: "2026-10-06"
+    change: Added avg_txn_amount_90d.
