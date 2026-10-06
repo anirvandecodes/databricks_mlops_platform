@@ -83,7 +83,7 @@ resources:
       max_concurrent_runs: 1
 
     # Governance: who consumes a feature table / column? Run before any breaking change or
-    # removal; the result fills `affected_consumers` in the change request. With
+    # removal; the result lists the teams to talk to first. With
     # fail_if_active=true it is the deprecation gate (fails while active consumers remain).
     feature_consumers_check:
       name: ${bundle.target}-feature-demo-feature-consumers-check

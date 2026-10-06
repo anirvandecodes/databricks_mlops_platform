@@ -5,9 +5,9 @@
 #   <catalog>.<consumer_schema>.default_labels Team B's training spine (customer, as_of_date, label)
 #   <catalog>.<producer_schema>                empty — Team A's pipeline creates the feature table
 #
-# The data is shaped so CR-001 matters: risky customers issue more refunds, so counting
-# refunds as activity (txn_count_30d v1) blurs the risk signal and the refund-free
-# txn_count_30d_v2 improves Team B's model. DROPS the demo schemas — demo catalog only.
+# The data is shaped so excluding refunds matters: risky customers issue more refunds, so
+# counting refunds as activity (txn_count_30d) blurs the risk signal — which is why someone
+# is tempted to "fix" txn_count_30d in place, the change the PR gate blocks. DROPS the demo schemas — demo catalog only.
 
 # COMMAND ----------
 

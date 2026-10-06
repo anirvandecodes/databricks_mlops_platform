@@ -4,7 +4,7 @@
 # Usage from tests/CI:   import feature_contract_utils
 #
 # Plain functions only — no top-level spark/dbutils — so the same logic runs in the
-# workspace (%run), in pytest, and in the local/GitHub change check (check_change.py).
+# workspace (%run), in pytest, and in the PR gate (governance/check_change.py).
 
 # COMMAND ----------
 
@@ -23,9 +23,11 @@ FEATURE_STATUSES = ("active", "deprecated")
 FEATURE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 
-# Change kinds, ordered by severity.
-NONE, METADATA, ADDITIVE, BREAKING = "none", "metadata", "additive", "breaking"
-_SEVERITY = {NONE: 0, METADATA: 1, ADDITIVE: 2, BREAKING: 3}
+# Kinds of contract change (see diff_contract). The breaking ones break any model that reads
+# the affected column.
+ADDED, DEPRECATED, CHANGED, REMOVED, KEYS, METADATA = (
+    "added", "deprecated", "changed", "removed", "keys", "metadata")
+BREAKING_KINDS = (CHANGED, REMOVED, KEYS)
 
 
 # ---------------------------------------------------------------------------
@@ -101,104 +103,108 @@ def feature_names(contract: dict[str, Any], status: str | None = None) -> list[s
 
 
 # ---------------------------------------------------------------------------
-# Change classification (the heart of the review process)
+# Change detection (the PR gate)
 # ---------------------------------------------------------------------------
 
-def classify_change(base: dict[str, Any], proposed: dict[str, Any]) -> dict[str, Any]:
-    """Compare two versions of a contract.
+def diff_contract(base: dict[str, Any], proposed: dict[str, Any]) -> list[dict[str, str]]:
+    """Every difference between the contract on main and the one in the PR.
 
-    Returns {"kind": none|metadata|additive|breaking,
-             "changes": [{"feature", "kind", "message"}],
-             "violations": [str]}  — violations are rule breaks that must block merge.
-
-    Rules (see docs/feature_sharing.md):
-      * new feature                       -> additive (minor bump)
-      * active -> deprecated              -> breaking: affected consumers must acknowledge (minor bump)
-      * removing a deprecated feature     -> breaking: no active consumers allowed (major bump)
-      * removing an *active* feature      -> VIOLATION (deprecate first)
-      * dtype / logic change in place     -> VIOLATION (publish <name>_v2 instead)
-      * key / grain change                -> VIOLATION (publish a new table <table>_v2)
-      * description / SLA / owner edits   -> metadata (patch bump)
+    Returns [{"feature", "kind", "message"}] where kind is one of:
+      added       new feature                                  (minor bump)
+      deprecated  active -> deprecated                         (minor bump)
+      changed     definition / logic_version / dtype edited    (major bump; breaks readers)
+      removed     feature dropped from the contract            (major bump; breaks readers)
+      keys        table, primary or timestamp key changed      (breaks every reader)
+      metadata    description, owner, SLA, ... edited          (patch bump)
     """
     changes: list[dict[str, str]] = []
-    violations: list[str] = []
 
     def add(feature: str, kind: str, message: str) -> None:
         changes.append({"feature": feature, "kind": kind, "message": message})
 
     if base["table"] != proposed["table"]:
-        violations.append(
-            f"table renamed {base['table']} -> {proposed['table']}: publish a new contract file "
-            "for the new table instead of editing this one")
-
+        add("<table>", KEYS, f"table renamed {base['table']} -> {proposed['table']}")
     if (list(base["primary_keys"]) != list(proposed["primary_keys"])
             or base["timestamp_key"] != proposed["timestamp_key"]):
-        add("<keys>", BREAKING, "primary/timestamp key changed")
-        violations.append(
-            "key or grain change: publish a new table (e.g. <table>_v2) and let consumers migrate")
+        add("<keys>", KEYS, "primary/timestamp key changed")
 
     base_feats = {f["name"]: f for f in base["features"]}
     prop_feats = {f["name"]: f for f in proposed["features"]}
-
     for name, old in base_feats.items():
         new = prop_feats.get(name)
         if new is None:
-            if old["status"] == "deprecated":
-                add(name, BREAKING, "deprecated feature removed")
-            else:
-                add(name, BREAKING, "active feature removed")
-                violations.append(f"{name}: active features cannot be removed — deprecate it first")
+            add(name, REMOVED, "removed")
             continue
         if old["dtype"] != new["dtype"]:
-            add(name, BREAKING, f"dtype changed {old['dtype']} -> {new['dtype']}")
-            violations.append(f"{name}: dtype changed in place — publish {next_version_name(name)} instead")
+            add(name, CHANGED, f"dtype changed {old['dtype']} -> {new['dtype']}")
         if (old["logic_version"] != new["logic_version"]
                 or _norm(old["definition"]) != _norm(new["definition"])):
-            add(name, BREAKING, "calculation logic/definition changed in place")
-            violations.append(
-                f"{name}: logic changed in place — consumers' models would silently shift. "
-                f"Publish {next_version_name(name)} and deprecate {name}")
+            add(name, CHANGED, "logic/definition changed in place")
         if old["status"] == "active" and new["status"] == "deprecated":
-            add(name, BREAKING, f"deprecated (sunset {new.get('sunset_date')}, replaced by {new.get('replaced_by')})")
-        elif old["status"] == "deprecated" and new["status"] == "active":
-            add(name, METADATA, "un-deprecated")
-
+            add(name, DEPRECATED, f"deprecated (sunset {new.get('sunset_date')}, "
+                                  f"replaced by {new.get('replaced_by')})")
     for name in prop_feats:
         if name not in base_feats:
-            add(name, ADDITIVE, "new feature")
-
+            add(name, ADDED, "new feature")
     for field in ("description", "owner", "support_channel", "refresh", "freshness_sla_hours", "sources"):
         if base.get(field) != proposed.get(field):
             add("<table>", METADATA, f"{field} changed")
-
-    kind = max((c["kind"] for c in changes), key=_SEVERITY.__getitem__, default=NONE)
-    violations += _version_bump_violations(base, proposed, changes)
-    return {"kind": kind, "changes": changes, "violations": violations}
+    return changes
 
 
-def _version_bump_violations(base: dict[str, Any], proposed: dict[str, Any],
-                             changes: list[dict[str, str]]) -> list[str]:
+def change_problems(base: dict[str, Any], proposed: dict[str, Any],
+                    changes: list[dict[str, str]]) -> list[str]:
+    """Rule breaks that block the PR whoever the consumers are.
+
+    The pipeline can only add columns, drop columns and recompute values, so key and dtype
+    changes have to ship as a new table / a new column. The version must be bumped by
+    semver and the changelog must say why.
+    """
+    problems = []
+    for c in changes:
+        if c["kind"] == KEYS:
+            problems.append(f"{c['message']}: publish a new table (e.g. <table>_v2) instead")
+        elif c["message"].startswith("dtype changed"):
+            problems.append(f"{c['feature']}: {c['message']} — publish {next_version_name(c['feature'])} instead")
+
     try:
         old_v, new_v = parse_version(base["version"]), parse_version(proposed["version"])
     except ValueError as e:
-        return [str(e)]
+        return problems + [str(e)]
     if not changes:
-        return [] if new_v == old_v else ["version bumped but nothing changed"]
-
-    removal = any(c["message"].endswith("removed") for c in changes)
-    feature_change = any(c["kind"] in (ADDITIVE, BREAKING) for c in changes)
-    if removal:
+        return problems + ([] if new_v == old_v else ["version bumped but nothing changed"])
+    kinds = {c["kind"] for c in changes}
+    if kinds & set(BREAKING_KINDS):
         required, label = (old_v[0] + 1, 0, 0), "major"
-    elif feature_change:
+    elif kinds & {ADDED, DEPRECATED}:
         required, label = (old_v[0], old_v[1] + 1, 0), "minor"
     else:
         required, label = (old_v[0], old_v[1], old_v[2] + 1), "patch"
     if new_v < required:
-        return [f"version {proposed['version']} too low: this change needs a {label} bump "
-                f"(>= {'.'.join(map(str, required))})"]
-    if not any(str(e.get("version")) == str(proposed["version"]) for e in proposed.get("changelog", [])):
-        return [f"changelog has no entry for {proposed['version']}"]
-    return []
+        problems.append(f"version {proposed['version']} too low: this change needs a {label} bump "
+                        f"(>= {'.'.join(map(str, required))})")
+    elif not any(str(e.get("version")) == str(proposed["version"]) for e in proposed.get("changelog", [])):
+        problems.append(f"changelog has no entry for {proposed['version']}")
+    return problems
+
+
+def downstream_breaks(changes: list[dict[str, str]],
+                      consumers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Which live consumers a change would break.
+
+    consumers: [{"team", "model", "version", "alias", "features"}] — every aliased model
+    version that reads the table, with the columns it was trained on (see live_consumers in
+    governance/check_change.py). A consumer breaks when a column it reads is changed or
+    removed, or when the table's keys change.
+    """
+    breaks = []
+    for c in changes:
+        if c["kind"] not in BREAKING_KINDS:
+            continue
+        for consumer in consumers:
+            if c["kind"] == KEYS or c["feature"] in consumer["features"]:
+                breaks.append({**c, "consumer": consumer})
+    return breaks
 
 
 def next_version_name(name: str) -> str:
@@ -208,27 +214,6 @@ def next_version_name(name: str) -> str:
 
 def _norm(text: str) -> str:
     return " ".join(str(text).split())
-
-
-# ---------------------------------------------------------------------------
-# Approvals
-# ---------------------------------------------------------------------------
-
-def required_approvers(result: dict[str, Any], proposed: dict[str, Any],
-                       affected_consumers: list[str]) -> list[str]:
-    """Who must approve: always the producer; plus every affected consumer team if breaking."""
-    if result["kind"] == NONE:
-        return []
-    approvers = [proposed["owner"]]
-    if result["kind"] == BREAKING:
-        approvers += [t for t in affected_consumers if t not in approvers]
-    return approvers
-
-
-def missing_approvals(required: list[str], change_request: dict[str, Any]) -> list[str]:
-    approved = {a["team"] for a in change_request.get("approvals", []) or []
-                if str(a.get("decision", "")).lower() == "approved"}
-    return [team for team in required if team not in approved]
 
 
 # ---------------------------------------------------------------------------
@@ -253,8 +238,8 @@ def _sql_str(value: Any) -> str:
 def schema_sync_statements(contract: dict[str, Any], existing_columns: list[str]) -> list[str]:
     """ALTER statements that bring an existing table's columns in line with the contract.
 
-    Adds new features; drops columns that left the contract (classify_change only allows
-    that for features that were deprecated first).
+    Adds new features; drops columns that left the contract (the PR gate only lets that
+    through when no live model reads them).
     """
     table = contract["table"]
     keys = set(contract["primary_keys"]) | {contract["timestamp_key"]}
