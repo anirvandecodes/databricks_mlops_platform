@@ -2,8 +2,8 @@
 
 These pin the PR gate itself: what counts as a change, which edits are never allowed, the
 version bump each change needs, which live consumers a change breaks, and the UC DDL
-derived from a contract. Each case starts from the released contract in
-team_a_producer/contracts/ so the tests cannot drift from what is on main.
+derived from a contract. Each case starts from the contract in team_a_producer/contracts/,
+whatever its version, so the tests keep passing on the PRs that change it.
 """
 
 import copy
@@ -33,9 +33,14 @@ def base():
     return fcu.load_yaml(CONTRACT, VARS)
 
 
-def _bump(c: dict, version: str) -> dict:
-    c["version"] = version
-    c.setdefault("changelog", []).append({"version": version})
+def _next(version: str, part: str) -> str:
+    major, minor, patch = fcu.parse_version(version)
+    return {"major": f"{major + 1}.0.0", "minor": f"{major}.{minor + 1}.0", "patch": f"{major}.{minor}.{patch + 1}"}[part]
+
+
+def _bump(c: dict, part: str) -> dict:
+    c["version"] = _next(c["version"], part)
+    c.setdefault("changelog", []).append({"version": c["version"]})
     return c
 
 
@@ -46,16 +51,16 @@ def _feature(name: str, since: str, **kw) -> dict:
 
 def added(base: dict) -> dict:
     """Happy path: a new column."""
-    new = _bump(copy.deepcopy(base), "1.1.0")
-    new["features"].append(_feature("avg_txn_amount_90d", "1.1.0"))
+    new = _bump(copy.deepcopy(base), "minor")
+    new["features"].append(_feature("new_test_feature", new["version"]))
     return new
 
 
 def changed_in_place(base: dict) -> dict:
-    """Not-happy path: new logic under an existing name."""
-    new = _bump(copy.deepcopy(base), "2.0.0")
-    new["features"][0]["definition"] = "Number of purchase transactions (refunds excluded) in the 30 days."
-    new["features"][0]["logic_version"] = 2
+    """Not-happy path: new logic under an existing name (txn_count_30d)."""
+    new = _bump(copy.deepcopy(base), "major")
+    new["features"][0]["definition"] += " Now computed differently."
+    new["features"][0]["logic_version"] += 1
     return new
 
 
@@ -84,7 +89,7 @@ def test_deprecated_feature_needs_sunset_and_replacement(base):
 
 def test_new_feature_is_added(base):
     new = added(base)
-    assert _kinds(base, new) == {"avg_txn_amount_90d": "added"}
+    assert _kinds(base, new) == {"new_test_feature": "added"}
     assert fcu.change_problems(base, new, fcu.diff_contract(base, new)) == []
 
 
@@ -95,15 +100,15 @@ def test_logic_change_in_place_is_changed(base):
 
 
 def test_removal_is_removed(base):
-    new = _bump(copy.deepcopy(base), "2.0.0")
+    new = _bump(copy.deepcopy(base), "major")
     new["features"].pop(0)
     assert _kinds(base, new) == {"txn_count_30d": "removed"}
 
 
 def test_deprecation_is_not_breaking(base):
-    new = _bump(copy.deepcopy(base), "1.1.0")
+    new = _bump(copy.deepcopy(base), "minor")
     new["features"][0].update(status="deprecated", sunset_date="2026-12-31", replaced_by="txn_count_30d_v2")
-    new["features"].append(_feature("txn_count_30d_v2", "1.1.0", dtype="int"))
+    new["features"].append(_feature("txn_count_30d_v2", new["version"], dtype="int"))
     assert _kinds(base, new) == {"txn_count_30d": "deprecated", "txn_count_30d_v2": "added"}
     assert fcu.downstream_breaks(fcu.diff_contract(base, new), [TEAM_B]) == []
 
@@ -117,34 +122,35 @@ def test_whitespace_in_definition_is_not_a_change(base):
 # --- never allowed, whoever the consumers are -----------------------------------------
 
 def test_dtype_change_in_place_not_allowed(base):
-    new = _bump(copy.deepcopy(base), "2.0.0")
+    new = _bump(copy.deepcopy(base), "major")
     new["features"][0]["dtype"] = "double"
     problems = fcu.change_problems(base, new, fcu.diff_contract(base, new))
     assert any("publish txn_count_30d_v2 instead" in p for p in problems)
 
 
 def test_key_change_needs_new_table(base):
-    new = _bump(copy.deepcopy(base), "2.0.0")
+    new = _bump(copy.deepcopy(base), "major")
     new["primary_keys"] = ["account_id"]
     assert any("new table" in p for p in fcu.change_problems(base, new, fcu.diff_contract(base, new)))
 
 
-@pytest.mark.parametrize("make,version,label", [
-    (added, "1.0.1", "minor"),             # new feature
-    (changed_in_place, "1.1.0", "major"),  # breaking change
+@pytest.mark.parametrize("make,too_small,label", [
+    (added, "patch", "minor"),             # new feature
+    (changed_in_place, "minor", "major"),  # breaking change
 ])
-def test_version_bump_must_match_change(base, make, version, label):
+def test_version_bump_must_match_change(base, make, too_small, label):
     new = make(base)
-    new["version"] = version
-    new["changelog"].append({"version": version})
+    new["version"] = _next(base["version"], too_small)
+    new["changelog"].append({"version": new["version"]})
     assert any(f"{label} bump" in p for p in fcu.change_problems(base, new, fcu.diff_contract(base, new)))
 
 
 def test_metadata_change_needs_patch_and_changelog(base):
     new = copy.deepcopy(base)
     new["support_channel"] = "#team-a-help"
-    new["version"] = "1.0.1"
-    assert fcu.change_problems(base, new, fcu.diff_contract(base, new)) == ["changelog has no entry for 1.0.1"]
+    new["version"] = _next(base["version"], "patch")
+    assert fcu.change_problems(base, new, fcu.diff_contract(base, new)) == [
+        f"changelog has no entry for {new['version']}"]
 
 
 @pytest.mark.parametrize("name,expected", [("x", "x_v2"), ("x_v2", "x_v3"), ("txn_count_30d", "txn_count_30d_v2")])
@@ -206,9 +212,9 @@ def test_gate_blocks_invalid_contract(tmp_path, base):
 # --- UC DDL derived from the contract -------------------------------------------------
 
 def test_schema_sync_adds_new_and_drops_removed(base):
-    existing = ["customer_id", "as_of_date", "txn_count_30d", "txn_amount_sum_30d", "days_since_last_txn"]
+    existing = ["customer_id", "as_of_date"] + fcu.feature_names(base)
     assert fcu.schema_sync_statements(added(base), existing) == [
-        f"ALTER TABLE {TABLE} ADD COLUMNS (avg_txn_amount_90d DOUBLE)"]
+        f"ALTER TABLE {TABLE} ADD COLUMNS (new_test_feature DOUBLE)"]
     removed = copy.deepcopy(base)
     removed["features"].pop(0)
     assert fcu.schema_sync_statements(removed, existing) == [f"ALTER TABLE {TABLE} DROP COLUMN txn_count_30d"]
