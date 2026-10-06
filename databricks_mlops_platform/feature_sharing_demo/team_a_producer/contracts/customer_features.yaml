@@ -5,7 +5,7 @@
 #
 # Released features are immutable: new logic ships as a new feature (<name>_v2).
 table: ${catalog}.${producer_schema}.customer_features
-version: 1.0.0
+version: 2.0.0
 owner: team_a
 support_channel: "#team-a-features"
 description: >
@@ -23,7 +23,7 @@ sources:
 features:
   - name: txn_count_30d
     dtype: int
-    definition: Number of transactions (including refunds) in the 30 days before as_of_date.
+    definition: Number of purchase transactions (refunds excluded) in the 30 days before as_of_date.
     status: active
     since: 1.0.0
   - name: txn_amount_sum_30d
@@ -41,3 +41,6 @@ changelog:
   - version: 1.0.0
     date: "2026-10-05"
     change: Initial release.
+  - version: 2.0.0
+    date: "2026-10-06"
+    change: txn_count_30d now excludes refunds.
