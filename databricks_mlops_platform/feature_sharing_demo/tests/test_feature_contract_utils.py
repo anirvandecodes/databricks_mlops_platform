@@ -81,6 +81,8 @@ def test_validation_catches_missing_metadata(base):
 
 def test_deprecated_feature_needs_sunset_and_replacement(base):
     base["features"][0]["status"] = "deprecated"
+    base["features"][0].pop("sunset_date", None)
+    base["features"][0].pop("replaced_by", None)
     errors = fcu.validate_contract(base)
     assert any("sunset_date" in e for e in errors) and any("replaced_by" in e for e in errors)
 
@@ -106,10 +108,11 @@ def test_removal_is_removed(base):
 
 
 def test_deprecation_is_not_breaking(base):
+    base["features"][0]["status"] = "active"
     new = _bump(copy.deepcopy(base), "minor")
-    new["features"][0].update(status="deprecated", sunset_date="2026-12-31", replaced_by="txn_count_30d_v2")
-    new["features"].append(_feature("txn_count_30d_v2", new["version"], dtype="int"))
-    assert _kinds(base, new) == {"txn_count_30d": "deprecated", "txn_count_30d_v2": "added"}
+    new["features"][0].update(status="deprecated", sunset_date="2026-12-31", replaced_by="replacement_test_feature")
+    new["features"].append(_feature("replacement_test_feature", new["version"], dtype="int"))
+    assert _kinds(base, new) == {"txn_count_30d": "deprecated", "replacement_test_feature": "added"}
     assert fcu.downstream_breaks(fcu.diff_contract(base, new), [TEAM_B]) == []
 
 
