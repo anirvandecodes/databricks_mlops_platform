@@ -23,12 +23,17 @@ import dependencies  # noqa: E402
 import feature_contract_utils as fcu  # noqa: E402
 from dependencies import Dependency, Report  # noqa: E402
 
-CONTRACT = DEMO / "team_a_producer" / "contracts" / "customer_features.yaml"
-CONSUMER_CFG = DEMO / "team_b_consumer" / "feature_config.yaml"
+CONTRACT = DEMO / "features" / "customer_features" / "customer_features.yaml"
 VARS = {"catalog": "demo", "raw_schema": "raw", "producer_schema": "team_a_features", "consumer_schema": "team_b_ml"}
 TABLE = "demo.team_a_features.customer_features"
+# A consumer's declared dependency on the table (inline — the demo's consumer just reads the
+# table and shows lineage, so there is no feature_config.yaml file to load).
+CONSUMER_CFG = {"feature_dependencies": [
+    {"table": TABLE, "contract_version": "1.0.0", "lookup_key": "customer_id",
+     "timestamp_lookup_key": "as_of_date",
+     "feature_names": ["txn_count", "txn_amount_sum", "days_since_last_txn"]}]}
 TEAM_B = {"kind": "model", "name": "demo.team_b_ml.default_risk_model", "detail": "v1 @champion (team_b)",
-          "features": ["txn_count_30d", "txn_amount_sum_30d", "days_since_last_txn"], "source": "feature spec",
+          "features": ["txn_count", "txn_amount_sum", "days_since_last_txn"], "source": "feature spec",
           "blocking": True}
 COMPILES = lambda query, sources: None  # noqa: E731
 
@@ -39,7 +44,7 @@ def base():
 
 
 def active(base):
-    """The released table with txn_count_30d active — some cases start from that, whatever
+    """The released table with txn_count active — some cases start from that, whatever
     the checked-in contract says (a PR may already have deprecated it)."""
     contract = copy.deepcopy(base[0])
     contract["features"][0]["status"] = "active"
@@ -79,10 +84,10 @@ def added(base):
 
 
 def changed_in_place(base):
-    """Not-happy path: new SQL under a released feature's name (txn_count_30d)."""
+    """Not-happy path: new SQL under a released feature's name (txn_count)."""
     contract, sql = copy.deepcopy(base[0]), dict(base[1])
     _bump(contract, "major")
-    sql["txn_count_30d"] = "count(CASE WHEN NOT t.is_refund THEN t.txn_id END)"
+    sql["txn_count"] = "count(CASE WHEN NOT t.is_refund THEN t.txn_id END)"
     return contract, sql
 
 
@@ -97,12 +102,12 @@ def right_way(base):
 
 
 def removed_after_deprecation(base):
-    """The released table with txn_count_30d deprecated, then a PR that removes it."""
+    """The released table with txn_count deprecated, then a PR that removes it."""
     dep = copy.deepcopy(base[0])
     dep["features"][0].update(status="deprecated", sunset_date="2000-01-01", replaced_by="x")
     new = _bump(copy.deepcopy(dep), "major")
     new["features"].pop(0)
-    sql = {k: v for k, v in base[1].items() if k != "txn_count_30d"}
+    sql = {k: v for k, v in base[1].items() if k != "txn_count"}
     return (dep, base[1]), (new, sql)
 
 
@@ -140,8 +145,8 @@ def test_deprecated_feature_needs_sunset_and_replacement(base):
 
 def test_every_feature_needs_exactly_one_sql_file(base):
     contract, sql = base
-    missing = {k: v for k, v in sql.items() if k != "txn_count_30d"}
-    assert "feature txn_count_30d: no txn_count_30d.sql" in fcu.validate_sql(contract, missing)
+    missing = {k: v for k, v in sql.items() if k != "txn_count"}
+    assert "feature txn_count: no txn_count.sql" in fcu.validate_sql(contract, missing)
     assert any("orphan.sql: not in the contract" in e for e in fcu.validate_sql(contract, {**sql, "orphan": "x"}))
     assert any("_base.sql" in e for e in fcu.validate_sql(contract, {k: v for k, v in sql.items() if k != "_base"}))
 
@@ -155,7 +160,7 @@ def test_new_feature_is_added(base):
 
 def test_sql_comments_and_whitespace_are_not_changes(base):
     sql = dict(base[1])
-    sql["txn_count_30d"] = "-- reworded comment\n  " + sql["txn_count_30d"].replace(" ", "   ")
+    sql["txn_count"] = "-- reworded comment\n  " + sql["txn_count"].replace(" ", "   ")
     assert _diff(base, (base[0], sql)) == []
 
 
@@ -166,13 +171,13 @@ def test_first_pr_adding_sql_has_nothing_to_compare(base):
 def test_definition_text_is_documentation(base):
     contract = _bump(copy.deepcopy(base[0]), "patch")
     contract["features"][0]["definition"] += " (clarified)"
-    assert _kinds(base, (contract, base[1])) == {"txn_count_30d": "metadata"}
+    assert _kinds(base, (contract, base[1])) == {"txn_count": "metadata"}
     assert _problems(base, (contract, base[1])) == []
 
 
 def test_deprecation_is_allowed(base):
     pr = right_way(base)
-    assert _kinds(active(base), pr) == {"txn_count_30d": "deprecated", "replacement_feature": "added"}
+    assert _kinds(active(base), pr) == {"txn_count": "deprecated", "replacement_feature": "added"}
     assert _problems(active(base), pr) == []
 
 
@@ -180,9 +185,9 @@ def test_deprecation_is_allowed(base):
 
 def test_sql_change_in_place_is_never_allowed(base):
     pr = changed_in_place(base)
-    assert _kinds(base, pr) == {"txn_count_30d": "changed"}
+    assert _kinds(base, pr) == {"txn_count": "changed"}
     (problem,) = _problems(base, pr)
-    assert "immutable" in problem and "txn_count_30d_v2" in problem
+    assert "immutable" in problem and "txn_count_v2" in problem
 
 
 def test_dtype_change_in_place_is_never_allowed(base):
@@ -195,13 +200,13 @@ def test_active_feature_cannot_be_removed(base):
     base = active(base)
     contract = _bump(copy.deepcopy(base[0]), "major")
     contract["features"].pop(0)
-    sql = {k: v for k, v in base[1].items() if k != "txn_count_30d"}
+    sql = {k: v for k, v in base[1].items() if k != "txn_count"}
     assert any("deprecate it" in p for p in _problems(base, (contract, sql)))
 
 
 def test_deprecated_feature_can_be_removed(base):
     dep, pr = removed_after_deprecation(base)
-    assert _kinds(dep, pr) == {"txn_count_30d": "removed"} and _problems(dep, pr) == []
+    assert _kinds(dep, pr) == {"txn_count": "removed"} and _problems(dep, pr) == []
 
 
 def test_removal_before_sunset_is_a_warning(base):
@@ -217,7 +222,7 @@ def test_keys_and_query_skeleton_need_a_new_table(base, edit):
     if edit == "keys":
         contract["primary_keys"] = ["account_id"]
     else:
-        sql["_base"] = sql["_base"].replace("90)", "60)")
+        sql["_base"] = sql["_base"].replace("current_date()", "DATE'2026-09-30'")
     assert any("new table" in p for p in _problems(base, (contract, sql)))
 
 
@@ -236,7 +241,7 @@ def test_changelog_entry_required(base):
     assert _problems(base, (contract, base[1])) == [f"changelog has no entry for {contract['version']}"]
 
 
-@pytest.mark.parametrize("name,expected", [("x", "x_v2"), ("x_v2", "x_v3"), ("txn_count_30d", "txn_count_30d_v2")])
+@pytest.mark.parametrize("name,expected", [("x", "x_v2"), ("x_v2", "x_v3"), ("txn_count", "txn_count_v2")])
 def test_next_version_name(name, expected):
     assert fcu.next_version_name(name) == expected
 
@@ -246,12 +251,12 @@ def test_next_version_name(name, expected):
 def test_removal_breaks_its_readers(base):
     dep, pr = removed_after_deprecation(base)
     (b,) = fcu.downstream_breaks(_diff(dep, pr), [TEAM_B])
-    assert b["feature"] == "txn_count_30d" and b["dependency"]["name"] == TEAM_B["name"]
+    assert b["feature"] == "txn_count" and b["dependency"]["name"] == TEAM_B["name"]
 
 
 def test_removal_of_an_unread_column_breaks_nobody(base):
     dep, pr = removed_after_deprecation(base)
-    assert fcu.downstream_breaks(_diff(dep, pr), [{**TEAM_B, "features": ["txn_amount_sum_30d"]}]) == []
+    assert fcu.downstream_breaks(_diff(dep, pr), [{**TEAM_B, "features": ["txn_amount_sum"]}]) == []
 
 
 def test_unknown_columns_count_as_every_column(base):
@@ -262,14 +267,14 @@ def test_unknown_columns_count_as_every_column(base):
 # --- check_change.py end to end (the PR gate) ---------------------------------------------
 
 def _write(tmp_path, table):
-    """contracts/customer_features.yaml + features/customer_features/*.sql, as in the repo."""
+    """features/customer_features/ with the contract.yaml beside its *.sql, as in the repo."""
     contract, sql = table
-    path = tmp_path / "contracts" / "customer_features.yaml"
-    path.parent.mkdir(parents=True)
+    folder = tmp_path / "customer_features"
+    folder.mkdir(parents=True)
+    path = folder / "customer_features.yaml"
     path.write_text(yaml.safe_dump(contract))
-    (tmp_path / "features" / "customer_features").mkdir(parents=True)
     for name, text in sql.items():
-        (tmp_path / "features" / "customer_features" / f"{name}.sql").write_text(text)
+        (folder / f"{name}.sql").write_text(text)
     return str(path)
 
 
@@ -318,14 +323,14 @@ def test_gate_blocks_job_reading_removed_column(tmp_path, base, capsys):
     dep, pr = removed_after_deprecation(base)
     job = {**TEAM_B, "kind": "job", "name": "nightly-report", "detail": "latest read today", "source": "lineage"}
     assert _run(tmp_path, dep, pr, deps=lambda t: report(job)) == 1
-    assert "x job nightly-report reads txn_count_30d" in capsys.readouterr().out
+    assert "x job nightly-report reads txn_count" in capsys.readouterr().out
 
 
 def test_gate_only_warns_on_ad_hoc_reads(tmp_path, base, capsys):
     dep, pr = removed_after_deprecation(base)
     adhoc = {**TEAM_B, "kind": "notebook", "name": "123", "detail": "latest read today", "blocking": False}
     assert _run(tmp_path, dep, pr, deps=lambda t: report(adhoc)) == 0
-    assert "! notebook 123 read txn_count_30d" in capsys.readouterr().out
+    assert "! notebook 123 read txn_count" in capsys.readouterr().out
 
 
 def test_gate_fails_closed_when_a_source_is_unreadable(tmp_path, base, capsys):
@@ -359,15 +364,15 @@ def test_schema_sync_adds_new_and_drops_removed(base):
     assert fcu.schema_sync_statements(added(base)[0], existing) == [
         f"ALTER TABLE {TABLE} ADD COLUMNS (new_test_feature DOUBLE)"]
     _, (removed, _) = removed_after_deprecation(base)
-    assert fcu.schema_sync_statements(removed, existing) == [f"ALTER TABLE {TABLE} DROP COLUMN txn_count_30d"]
+    assert fcu.schema_sync_statements(removed, existing) == [f"ALTER TABLE {TABLE} DROP COLUMN txn_count"]
 
 
 def test_metadata_statements_tag_status_and_sql_hash(base):
     contract, sql = right_way(base)
     stmts = fcu.uc_metadata_statements(contract, sql)
-    dep = [s for s in stmts if "ALTER COLUMN txn_count_30d SET TAGS" in s][0]
+    dep = [s for s in stmts if "ALTER COLUMN txn_count SET TAGS" in s][0]
     assert "'status' = 'deprecated'" in dep and "'replaced_by' = 'replacement_feature'" in dep
-    assert f"'sql_hash' = '{fcu.expression_hash(sql['txn_count_30d'])}'" in dep
+    assert f"'sql_hash' = '{fcu.expression_hash(sql['txn_count'])}'" in dep
     assert any(f"'contract_version' = '{contract['version']}'" in s for s in stmts)
 
 
@@ -379,7 +384,7 @@ def test_sql_strings_are_escaped(base):
 # --- consumer side ------------------------------------------------------------------------
 
 def test_lookup_specs_from_consumer_config():
-    (spec,) = fcu.lookup_specs(fcu.load_yaml(CONSUMER_CFG, VARS))
+    (spec,) = fcu.lookup_specs(CONSUMER_CFG)
     assert spec["table_name"] == TABLE and spec["lookup_key"] == "customer_id"
     assert spec["timestamp_lookup_key"] == "as_of_date" and spec["feature_names"]
 
@@ -391,14 +396,14 @@ def test_consumers_must_pin_features():
 
 def test_consumer_warned_about_deprecated_pins(base):
     contract, _ = right_way(base)
-    (warning,) = fcu.deprecated_dependencies(fcu.load_yaml(CONSUMER_CFG, VARS), {TABLE: contract})
-    assert "txn_count_30d" in warning and "migrate to replacement_feature" in warning
+    (warning,) = fcu.deprecated_dependencies(CONSUMER_CFG, {TABLE: contract})
+    assert "txn_count" in warning and "migrate to replacement_feature" in warning
 
 
 def test_feature_spec_columns_only_from_this_table():
     spec = {"input_columns": [
         {"customer_id": {"source": "training_data"}},
-        {"txn_count_30d": {"table_name": TABLE, "feature_name": "txn_count_30d", "source": "feature_store"}},
+        {"txn_count": {"table_name": TABLE, "feature_name": "txn_count", "source": "feature_store"}},
         {"other": {"table_name": "demo.x.other_features", "feature_name": "other", "source": "feature_store"}},
     ]}
-    assert dependencies.feature_spec_columns(spec, TABLE) == ["txn_count_30d"]
+    assert dependencies.feature_spec_columns(spec, TABLE) == ["txn_count"]

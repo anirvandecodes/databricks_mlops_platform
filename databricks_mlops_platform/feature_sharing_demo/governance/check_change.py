@@ -1,7 +1,7 @@
 """Feature-contract PR gate: is this change to a shared feature table safe to ship?
 
-Compares one feature table on the base branch (main) with the PR — its contract
-(team_a_producer/contracts/<table>.yaml) and its SQL (team_a_producer/features/<table>/):
+Compares one feature table on the base branch (main) with the PR — its self-contained
+folder features/<table>/ (the <table>.yaml contract and its _base.sql + <feature>.sql):
 
   1. Are the contract and SQL valid, and do they match one to one?
   2. What changed?                 added / deprecated / removed / changed / metadata
@@ -18,12 +18,12 @@ Compares one feature table on the base branch (main) with the PR — its contrac
 Exit code 0 = safe to merge, 1 = blocked. Approval is a code-owner review (CODEOWNERS).
 
     python governance/check_change.py \
-        --base /tmp/base/<demo>/team_a_producer/contracts/customer_features.yaml \
-        --proposed team_a_producer/contracts/customer_features.yaml \
+        --base /tmp/base/<demo>/features/customer_features/customer_features.yaml \
+        --proposed features/customer_features/customer_features.yaml \
         --var catalog=workspace --var producer_schema=team_a_features_staging \
         --var raw_schema=feature_demo_raw_staging
 
-The SQL folder is found next to each contract (../features/<table>/), so --base points into
+The SQL is found in the contract's own folder (features/<table>/), so --base points into
 a checkout of the base branch. Authenticates like the Databricks CLI (DATABRICKS_HOST and
 DATABRICKS_TOKEN or DATABRICKS_CLIENT_ID/SECRET in CI, DATABRICKS_CONFIG_PROFILE locally);
 SQL runs in DATABRICKS_WAREHOUSE_ID or the first serverless warehouse. --offline skips steps

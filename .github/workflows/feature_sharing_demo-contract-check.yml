@@ -1,11 +1,14 @@
-# Feature-sharing demo, PR gate. Every PR that touches the demo runs the contract-rule unit
-# tests and validates the bundle. Every PR that changes a feature table — its contract
-# (team_a_producer/contracts/) or its SQL (team_a_producer/features/) — is diffed against the
-# base branch by check_change.py: released features are immutable, the SQL must compile
-# (EXPLAIN), and a deprecated feature can only be removed once nothing in Unity Catalog
-# (live models, jobs, pipelines, dashboards; staging and prod) reads it.
-# Approval is a code-owner review (CODEOWNERS). Make "Downstream impact (live model
-# registry)" a required status check on main, together with "Require review from Code Owners".
+# Feature-sharing demo gate. The steps run in order and any failure stops the run, so the
+# feature tables are only (re)built when every check passed:
+#
+#   1. contract rules unit tests
+#   2. bundle config resolves
+#   3. each changed feature table is a safe change (released features immutable, SQL compiles,
+#      nothing in Unity Catalog that reads it would break)   <- fails here = stop, nothing created
+#   4. create the feature tables (producer)                  <- only reached if 1-3 passed
+#
+# On a pull request steps 1-3 run as the merge gate (make "Check, then create features" a
+# required status check on main). On a push to main / manual run, step 4 also runs.
 name: Feature contract check
 
 on:
@@ -15,6 +18,10 @@ on:
       - "databricks_mlops_platform/feature_sharing_demo/**"
       - "databricks_mlops_platform/resources/feature-sharing-demo-resource.yml"
       - ".github/workflows/feature_sharing_demo-contract-check.yml"
+  push:
+    branches: [main]
+    paths:
+      - "databricks_mlops_platform/feature_sharing_demo/**"
 
 defaults:
   run:
@@ -24,31 +31,14 @@ concurrency:
   group: feature-contract-check-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
-jobs:
-  unit:
-    name: Contract rules (unit tests)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-          cache-dependency-path: databricks_mlops_platform/feature_sharing_demo/requirements-ci.txt
-      - run: pip install -r requirements-ci.txt
-      - run: pytest tests -v
+env:
+  DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+  DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
 
-  downstream:
-    name: Downstream impact (live model registry)
+jobs:
+  check-and-create:
+    name: Check, then create features
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-    permissions:
-      contents: read
-      pull-requests: write
-    env:
-      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
-      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -58,101 +48,45 @@ jobs:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: databricks_mlops_platform/feature_sharing_demo/requirements-ci.txt
-      - uses: databricks/setup-cli@main
       - run: pip install -r requirements-ci.txt
-      - name: Check every changed feature table (contract or SQL)
+      - uses: databricks/setup-cli@main
+
+      # 1. Contract rules.
+      - name: Contract rule tests
+        run: pytest tests -q
+
+      # 2. Bundle config resolves for staging (the demo ships in the platform bundle).
+      - name: Validate bundle
+        working-directory: ./databricks_mlops_platform
+        run: databricks bundle validate -t staging
+
+      # 3. Every changed feature table (features/<table>/) is a safe change. A failure here
+      #    fails the job, so step 4 never runs.
+      - name: Feature contract check
         env:
-          BASE: origin/${{ github.base_ref }}
-          DEMO: databricks_mlops_platform/feature_sharing_demo
-          PR: ${{ github.event.pull_request.number }}
+          BASE: origin/${{ github.base_ref || 'main' }}
         run: |
           set -euo pipefail
-          # A feature table changes when its contract or any of its SQL files does.
-          tables=$(git diff --name-only --diff-filter=AMDR "$BASE"...HEAD -- team_a_producer/contracts team_a_producer/features \
-            | sed -E 's#.*/contracts/([^/]+)\.yaml$#\1#; s#.*/features/([^/]+)/.*#\1#' | sort -u)
-          if [[ -z "$tables" ]]; then
-            echo "No feature table changed in this PR." | tee -a "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          # The base branch as a checkout, so the check reads its contract and SQL side by side.
-          git worktree add -q /tmp/base "$BASE"
-          contracts=""
-          for t in $tables; do
-            c="team_a_producer/contracts/$t.yaml"
-            if [[ ! -f "$c" ]]; then echo "::error::$t: SQL changed but $c doesn't exist"; exit 1; fi
-            contracts="$contracts $DEMO/$c"
+          vars=$(cd .. && databricks bundle validate -t staging -o json | jq '.variables')
+          v() { jq -r ".$1.value" <<<"$vars"; }
+          git worktree add -q /tmp/base "$BASE" 2>/dev/null || true
+          for dir in features/*/; do
+            set -- "$dir"*.yaml          # the contract is the single *.yaml in the folder
+            contract="$1"
+            base="/tmp/base/databricks_mlops_platform/feature_sharing_demo/$contract"
+            [[ -f "$base" ]] || base="$contract"   # new table: nothing on base, compare with itself
+            echo "::group::$contract"
+            python governance/check_change.py --base "$base" --proposed "$contract" \
+              --var catalog="$(v catalog_name)" \
+              --var producer_schema="$(v feature_demo_producer_schema)" \
+              --var raw_schema="$(v feature_demo_raw_schema)"
+            echo "::endgroup::"
           done
-          status=0
-          : > /tmp/report.md
-          : > /tmp/summary.txt
-          for c in $contracts; do
-            base_contract="/tmp/base/$c"
-            # A new table has nothing on main to compare with: check it against itself.
-            [[ -f "$base_contract" ]] || base_contract="${c#"$DEMO"/}"
-            # Consumers live in every environment the contract is released to.
-            for target in staging prod; do
-              # Only the variables are needed; validate's warnings are noise here.
-              vars=$(cd .. && databricks bundle validate -t "$target" -o json 2>/tmp/validate.err | jq '.variables') \
-                || { cat /tmp/validate.err; exit 1; }
-              v() { jq -r ".$1.value" <<<"$vars"; }
-              echo "::group::${c##*/} in $target"
-              result=OK
-              python governance/check_change.py --base "$base_contract" --proposed "${c#"$DEMO"/}" \
-                --var catalog="$(v catalog_name)" \
-                --var producer_schema="$(v feature_demo_producer_schema)" \
-                --var raw_schema="$(v feature_demo_raw_schema)" \
-                > /tmp/check.txt 2> >(tee /tmp/progress.txt >&2) || { status=1; result=BLOCKED; }
-              # Progress streams live above (stderr); the report below is what goes into the PR comment.
-              [[ -s /tmp/check.txt ]] || { echo "The check crashed:"; tail -20 /tmp/progress.txt; } > /tmp/check.txt
-              echo "──────── report ($target) ────────"
-              cat /tmp/check.txt
-              echo "::endgroup::"
-              printf '  %-8s %-8s %s\n' "$target" "$result" "${c##*/}" >> /tmp/summary.txt
-              # Each reason as a PR annotation, plus an indented line for the summary.
-              grep '^  x ' /tmp/check.txt | sed 's/^  x //' | while read -r reason; do
-                echo "::error title=Blocked in $target::$reason"
-                echo "             $reason" >> /tmp/summary.txt
-              done || true
-              { echo "#### \`${c##*/}\` — $target: $result"; echo '```'; cat /tmp/check.txt; echo '```'; } >> /tmp/report.md
-            done
-          done
-          echo
-          echo "Feature contract check"
-          cat /tmp/summary.txt
-          if [[ $status == 0 ]]; then echo "Overall: OK to merge"
-          else echo "Overall: BLOCKED (expand the groups above for details)"; fi
-          cat /tmp/report.md >> "$GITHUB_STEP_SUMMARY"
-          {
-            if [[ $status == 0 ]]; then echo "### ✅ Feature contract check: safe to merge"
-            else echo "### ❌ Feature contract check: blocked (details below)"; fi
-            echo
-            echo '```'; cat /tmp/summary.txt; echo '```'
-            echo
-            cat /tmp/report.md
-          } > /tmp/comment.md
-          # One comment per PR, updated on every push.
-          gh pr comment "$PR" --body-file /tmp/comment.md --edit-last 2>/dev/null \
-            || gh pr comment "$PR" --body-file /tmp/comment.md
-          exit $status
 
-  # The demo is part of the platform bundle. The platform's own bundle-ci skips demo-only
-  # PRs (its staging run retrains the credit model), so the bundle is validated here instead.
-  bundle-validate:
-    name: Bundle config resolves (${{ matrix.target }})
-    runs-on: ubuntu-latest
-    # Skipped on forks, which cannot access repository secrets.
-    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'workflow_dispatch'
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [dev, staging, prod]
-    env:
-      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
-      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-    defaults:
-      run:
+      # 4. All checks passed — build the feature tables. Skipped on PRs (gate only).
+      - name: Create the feature tables
+        if: github.event_name != 'pull_request'
         working-directory: ./databricks_mlops_platform
-    steps:
-      - uses: actions/checkout@v4
-      - uses: databricks/setup-cli@main
-      - run: databricks bundle validate -t ${{ matrix.target }}
+        run: |
+          databricks bundle deploy -t staging
+          databricks bundle run feature_producer -t staging

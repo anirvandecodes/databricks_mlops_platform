@@ -1,0 +1,26 @@
+%% Feature-sharing demo — what GitHub Actions does, and when a PR may merge.
+flowchart TB
+  PR["Open a PR<br/>(change a feature's contract or SQL)"]
+  CHK["GitHub Action: contract-check<br/>• contract + SQL valid<br/>• released features immutable (semver + changelog)<br/>• SQL compiles<br/>• who depends on it? (Unity Catalog lineage)"]
+  REVIEW["Code-owner review approved"]
+  DECIDE{"Checks passed<br/>AND review approved?"}
+  BLOCK["Merge blocked<br/>fix, or ship new logic as &lt;name&gt;_v2"]
+  MERGE["Merge to main"]
+  RUN["GitHub Action: staging CD<br/>deploy → create feature tables (producer)<br/>→ read + lineage (consumer)"]
+
+  PR --> CHK
+  CHK --> DECIDE
+  REVIEW --> DECIDE
+  DECIDE -->|"no"| BLOCK
+  BLOCK -.->|"fix and push again"| PR
+  DECIDE -->|"yes"| MERGE
+  MERGE --> RUN
+
+  classDef pr fill:#E8F1FB,stroke:#1B4F8A,color:#0b2a4a;
+  classDef gha fill:#FFF4E5,stroke:#B9770E,color:#5a3a06;
+  classDef block fill:#FDE8E8,stroke:#B03030,color:#5a0f0f;
+  classDef ok fill:#E9F7EF,stroke:#1E7E45,color:#0c3a1f;
+  class PR,REVIEW pr;
+  class CHK,RUN gha;
+  class BLOCK block;
+  class MERGE ok;
