@@ -84,10 +84,14 @@ def added(base):
 
 
 def changed_in_place(base):
-    """Not-happy path: new SQL under a released feature's name (txn_count)."""
+    """Not-happy path: new SQL under a released feature's name (txn_count).
+
+    Derive the edited SQL from whatever txn_count currently is, so this is always a real
+    in-place change regardless of what the checked-in txn_count.sql happens to contain (a
+    demo branch may already have rewritten it)."""
     contract, sql = copy.deepcopy(base[0]), dict(base[1])
     _bump(contract, "major")
-    sql["txn_count"] = "count(CASE WHEN NOT t.is_refund THEN t.txn_id END)"
+    sql["txn_count"] = base[1]["txn_count"].rstrip() + " + 0"
     return contract, sql
 
 
