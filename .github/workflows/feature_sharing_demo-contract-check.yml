@@ -71,7 +71,8 @@ jobs:
           v() { jq -r ".$1.value" <<<"$vars"; }
           git worktree add -q /tmp/base "$BASE" 2>/dev/null || true
           for dir in features/*/; do
-            contract=$(ls "$dir"*.yaml | head -1)
+            set -- "$dir"*.yaml          # the contract is the single *.yaml in the folder
+            contract="$1"
             base="/tmp/base/databricks_mlops_platform/feature_sharing_demo/$contract"
             [[ -f "$base" ]] || base="$contract"   # new table: nothing on base, compare with itself
             echo "::group::$contract"
