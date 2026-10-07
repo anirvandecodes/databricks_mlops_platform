@@ -13,7 +13,7 @@ apiVersion: v3.0.1
 kind: DataContract
 id: 7c1e4f52-3b8a-4d6e-9f21-5a0c8b7d3e14  # unique per contract: new tables get a new UUID
 name: customer_features
-version: 1.0.2
+version: 1.1.0
 status: active
 description:
   purpose: >
@@ -98,8 +98,17 @@ schema:
         physicalType: int
         description: Total number of transactions, including refunds.
         customProperties:
-          - {property: status, value: active}
+          - {property: status, value: deprecated}
           - {property: since, value: 1.0.0}
+          - {property: sunsetDate, value: "2026-12-31"}
+          - {property: replacedBy, value: txn_count_v2}
+      - name: txn_count_v2
+        logicalType: integer
+        physicalType: int
+        description: Total number of purchases, excluding refunds.
+        customProperties:
+          - {property: status, value: active}
+          - {property: since, value: 1.1.0}
       - name: txn_amount_sum
         logicalType: number
         physicalType: double
@@ -153,3 +162,6 @@ customProperties:
       - version: 1.0.2
         date: "2026-10-09"
         change: Contract rewritten in ODCS v3.0.1 (refresh is now slaProperties frequency, 7d).
+      - version: 1.1.0
+        date: "2026-10-09"
+        change: Add txn_count_v2 (excludes refunds); deprecate txn_count.
