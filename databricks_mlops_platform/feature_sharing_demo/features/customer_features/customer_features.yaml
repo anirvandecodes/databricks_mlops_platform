@@ -1,0 +1,41 @@
+# Feature contract — owned by Team A. What this table promises: schema, meaning, ownership
+# and each feature's lifecycle. How each feature is computed is its SQL file in this folder
+# (_base.sql + one <feature>.sql per feature). producer.py applies both to Unity Catalog.
+#
+# Released features are immutable: new logic ships as a new feature (<name>_v2).
+table: ${catalog}.${producer_schema}.customer_features
+version: 1.0.0
+owner: team_a
+support_channel: "#team-a-features"
+description: >
+  Customer-level transaction behaviour features, one row per customer over all of the
+  customer's transactions.
+primary_keys: [customer_id]
+timestamp_key: as_of_date
+refresh: weekly
+freshness_sla_hours: 192
+online: false
+sources:
+  - ${catalog}.${raw_schema}.transactions
+
+features:
+  - name: txn_count
+    dtype: int
+    definition: Total number of transactions, including refunds.
+    status: active
+    since: 1.0.0
+  - name: txn_amount_sum
+    dtype: double
+    definition: Sum of all transaction amounts (refunds negative).
+    status: active
+    since: 1.0.0
+  - name: days_since_last_txn
+    dtype: int
+    definition: Days since the customer's last transaction (999 if none).
+    status: active
+    since: 1.0.0
+
+changelog:
+  - version: 1.0.0
+    date: "2026-10-07"
+    change: Initial release.

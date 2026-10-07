@@ -54,9 +54,8 @@ def _substitute(obj: Any, variables: dict[str, str]) -> Any:
 
 
 def feature_sql_dir(contract_path: str | Path) -> Path:
-    """team_a_producer/contracts/<table>.yaml -> team_a_producer/features/<table>/"""
-    p = Path(contract_path)
-    return p.parent.parent / "features" / p.stem
+    """features/<table>/<contract>.yaml -> that same folder (contract and SQL live together)."""
+    return Path(contract_path).parent
 
 
 def load_feature_sql(contract_path: str | Path, variables: dict[str, str] | None = None) -> dict[str, str]:
