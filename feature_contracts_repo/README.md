@@ -5,7 +5,7 @@ One repo where **every team publishes the feature tables it shares**. Each table
 lifecycle, who can read it) and its SQL. **Every PR is checked** before it can merge, whichever
 team opens it, and once it merges **GitHub Actions builds the tables and provisions access**.
 
-![End-to-end flow](diagrams/feature_demo_flow.png)
+![The PR lifecycle](diagrams/feature_demo_flow.png)
 
 ## The idea
 
@@ -42,7 +42,7 @@ feature_contracts_repo/
     notebooks/find_feature_consumers.py   the same lookup, runnable as a job
   tests/                         unit tests for the contract rules and the gate
   requirements-ci.txt            pinned deps for the checks
-  diagrams/                      the flow diagram (editable .mmd + rendered .png/.svg)
+  diagrams/                      PR lifecycle, contract anatomy, after-merge flow (.mmd + rendered .png/.svg)
 ```
 
 **Add a feature table** by opening a PR with a new folder under `features/` (contract + SQL)
@@ -50,6 +50,8 @@ and a line for your team in `.github/CODEOWNERS`. The jobs build every folder; n
 needs to change.
 
 ## A feature table, as code
+
+![Anatomy of a feature table](diagrams/contract_anatomy.png)
 
 `features/customer_features/customer_features.yaml` is the **contract** — what the table
 promises (keys, owner, SLA, who can read it, and each feature's type, meaning, status and
@@ -140,6 +142,8 @@ change. Merge is allowed only when the check passes and the table's code owners 
 Code Owners* on `main`).
 
 ## Who creates the features and grants access
+
+![After merge: the feature_tables job](diagrams/runtime_flow.png)
 
 **GitHub Actions does.** After a PR merges to `main` (or on a manual run of the workflow),
 the same workflow — having passed the checks — runs:

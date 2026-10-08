@@ -1,0 +1,41 @@
+%%{init: {"flowchart": {"wrappingWidth": 420, "nodeSpacing": 40, "rankSpacing": 50}}}%%
+%% After merge: the feature_tables job, Unity Catalog, and how consumers feed back into the gate.
+flowchart TB
+  GHA(["GitHub Action on main<br/>checks passed"])
+
+  subgraph JOB["Databricks job · feature_tables  (environment = bundle target)"]
+    direction LR
+    J1["mock_sources<br/><i>demo only — delete for real sources</i>"]
+    J2["build_feature_tables<br/>for every features/&lt;table&gt;/:<br/>create schema if missing · sync columns<br/>MERGE · comments + tags"]
+    J3["provision_access<br/>grant what access_list lists<br/>revoke SELECT / MODIFY from anyone else"]
+    J1 --> J2 --> J3
+  end
+
+  subgraph UC["Unity Catalog"]
+    direction LR
+    TBL["Feature tables<br/>one per contract, where it says"]
+    GR["Grants<br/>match access_list exactly"]
+    LIN["Lineage + model feature specs<br/>who reads which column"]
+  end
+
+  CONS["Consumers<br/>training jobs · models · dashboards"]
+  NEXT(["Next PR's dependency check<br/>blocks changes that would break a reader"])
+
+  GHA --> JOB
+  J2 --> TBL
+  J3 --> GR
+  GR -.-> TBL
+  CONS -->|read| TBL
+  CONS --> LIN
+  LIN --> NEXT
+
+  classDef start fill:#1B3139,stroke:#1B3139,color:#ffffff;
+  classDef step fill:#FFFFFF,stroke:#5A6F77,color:#1B3139;
+  classDef uc fill:#FFF1EC,stroke:#FF3621,color:#5A1A10;
+  classDef cons fill:#E8F5EE,stroke:#1E7E45,color:#0C3A1F;
+  class GHA,NEXT start;
+  class J1,J2,J3 step;
+  class TBL,GR,LIN uc;
+  class CONS cons;
+  style JOB fill:#F5F7F8,stroke:#5A6F77,color:#1B3139
+  style UC fill:#FFF8F5,stroke:#FF3621,color:#1B3139
