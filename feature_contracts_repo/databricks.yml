@@ -1,0 +1,58 @@
+# Feature contracts repo — every team's shared feature tables, as code, in one bundle.
+#
+# Each features/<table>/ folder is one governed feature table: its contract (schema, meaning,
+# lifecycle, who can read it) plus the SQL that computes it. Any team adds or changes a
+# table by PR; .github/workflows/contract-check.yml gates every PR and, on main, runs the
+# feature_tables job (build the tables, then provision access from each access_list).
+#
+# Self-contained: nothing here depends on the rest of the platform, so this folder can be
+# the root of its own repo.
+bundle:
+  name: feature_contracts
+
+variables:
+  catalog_name:
+    description: Unity Catalog catalog holding the feature schemas.
+    default: workspace
+  raw_schema:
+    description: Source (raw) data the feature SQL reads (mock data written by producer.py).
+    default: feature_demo_raw_${bundle.target}
+  producer_schema:
+    description: Schema the shared feature tables are published to.
+    default: team_a_features_${bundle.target}
+
+include:
+  - ./resources/*.yml
+
+targets:
+  # Hand-run deploys from a laptop (`databricks bundle deploy -t dev`).
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://dbc-aef35066-afa2.cloud.databricks.com
+
+  # CI deploys here on merge to main; no local deploys.
+  staging:
+    mode: production
+    workspace:
+      host: https://dbc-aef35066-afa2.cloud.databricks.com
+      # Not under /Workspace/Shared (writable by every user). In a real deployment this is
+      # the CI service principal's own path.
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    permissions:
+      - level: CAN_MANAGE
+        user_name: ${workspace.current_user.userName}
+      - level: CAN_VIEW
+        group_name: users
+
+  prod:
+    mode: production
+    workspace:
+      host: https://dbc-aef35066-afa2.cloud.databricks.com
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    permissions:
+      - level: CAN_MANAGE
+        user_name: ${workspace.current_user.userName}
+      - level: CAN_VIEW
+        group_name: users

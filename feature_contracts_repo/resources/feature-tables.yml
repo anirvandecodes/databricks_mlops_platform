@@ -1,0 +1,67 @@
+# Jobs for the feature contracts repo. feature_tables builds every feature table under
+# features/<table>/ from its contract + SQL, then provisions access from each access_list.
+# feature_consumer reads a table and shows Unity Catalog lineage; feature_consumers_check
+# reports what depends on a table/column (the same lookup as the PR check). CI/CD is
+# .github/workflows/contract-check.yml.
+resources:
+  jobs:
+    # Build the feature tables, then make their grants match the contracts.
+    feature_tables:
+      name: ${bundle.target}-feature-tables
+      tags: {project: feature-contracts, role: producer}
+      tasks:
+        - task_key: build_feature_tables
+          notebook_task:
+            notebook_path: ../producer.py
+            base_parameters:
+              features_root: ${workspace.file_path}/features
+              catalog: ${var.catalog_name}
+              raw_schema: ${var.raw_schema}
+              producer_schema: ${var.producer_schema}
+        - task_key: provision_access
+          depends_on:
+            - task_key: build_feature_tables
+          notebook_task:
+            notebook_path: ../provision_access.py
+            base_parameters:
+              features_root: ${workspace.file_path}/features
+              catalog: ${var.catalog_name}
+              raw_schema: ${var.raw_schema}
+              producer_schema: ${var.producer_schema}
+      max_concurrent_runs: 1
+
+    # Consumer: read the feature table(s) and show lineage.
+    feature_consumer:
+      name: ${bundle.target}-feature-consumer
+      tags: {project: feature-contracts, role: consumer}
+      tasks:
+        - task_key: show_lineage
+          notebook_task:
+            notebook_path: ../consumer.py
+            base_parameters:
+              catalog: ${var.catalog_name}
+              producer_schema: ${var.producer_schema}
+      max_concurrent_runs: 1
+
+    # Governance: what depends on a feature table / column? The same lookup as the PR check
+    # (governance/dependencies.py). With fail_if_active=true it is the removal gate (fails
+    # while anything still depends on the column).
+    feature_consumers_check:
+      name: ${bundle.target}-feature-consumers-check
+      tags: {project: feature-contracts, role: governance}
+      parameters:
+        - name: table
+          default: ${var.catalog_name}.${var.producer_schema}.customer_features
+        - name: column
+          default: ""
+        - name: fail_if_active
+          default: "false"
+      tasks:
+        - task_key: find_consumers
+          notebook_task:
+            notebook_path: ../governance/notebooks/find_feature_consumers.py
+            base_parameters:
+              table: "{{job.parameters.table}}"
+              column: "{{job.parameters.column}}"
+              fail_if_active: "{{job.parameters.fail_if_active}}"
+      max_concurrent_runs: 1

@@ -1,0 +1,9 @@
+# Each feature table is owned by the team that publishes it: a PR touching features/<table>/
+# can't merge without that team's review (turn on "Require review from Code Owners" on main).
+# A team adding a new table adds its own line here in the same PR. Replace the handles with
+# real team handles (e.g. @org/team-a) once the repo lives in an organisation.
+*                             @anirvandecodes
+/features/customer_features/  @anirvandecodes
+/governance/                  @anirvandecodes
+/shared/                      @anirvandecodes
+/.github/                     @anirvandecodes

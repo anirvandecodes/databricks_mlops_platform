@@ -4,7 +4,7 @@
 #
 # Released features are immutable: new logic ships as a new feature (<name>_v2).
 table: ${catalog}.${producer_schema}.customer_features
-version: 1.0.0
+version: 1.0.1
 owner: team_a
 support_channel: "#team-a-features"
 description: >
@@ -15,6 +15,14 @@ timestamp_key: as_of_date
 refresh: weekly
 freshness_sla_hours: 192
 online: false
+# Who can use this table. The feature_tables job makes Unity Catalog match this exactly:
+# it grants what's listed and revokes SELECT/MODIFY from anyone not listed (the table owner
+# keeps access). A bare name gets SELECT; give privileges for more. Groups must exist in
+# the account. Real setups list team groups, e.g.
+#   - team_b_data_science
+#   - {principal: team_a_engineers, privileges: [SELECT, MODIFY]}
+access_list:
+  - account users
 sources:
   - ${catalog}.${raw_schema}.transactions
 
@@ -39,3 +47,6 @@ changelog:
   - version: 1.0.0
     date: "2026-10-07"
     change: Initial release.
+  - version: 1.0.1
+    date: "2026-10-08"
+    change: Declare who can read the table (access_list); the feature_tables job provisions it.

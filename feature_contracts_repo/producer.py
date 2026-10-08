@@ -9,6 +9,9 @@
 # computed, inserted into _base.sql). Add a feature table by dropping in a new folder and
 # re-running — nothing else to change. Self-contained: this notebook generates its own mock
 # source data, so a run needs only the folders and a catalog/schema to write into.
+#
+# Task 1 of the feature_tables job; task 2 (provision_access.py) then applies each
+# contract's access_list.
 
 # COMMAND ----------
 
@@ -17,12 +20,18 @@
 
 # COMMAND ----------
 
+import os
 import re
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import yaml
+
+# Workspace files: this notebook's folder is the working directory; shared/ is beside it.
+sys.path.insert(0, os.path.abspath("shared"))
+import feature_contract_utils as fcu  # noqa: E402
 
 dbutils.widgets.text("features_root", "")
 dbutils.widgets.text("catalog", "")
@@ -116,13 +125,22 @@ def publish(folder: Path) -> str:
         TBLPROPERTIES (delta.enableChangeDataFeed = true)
         """)
         print(f"Created {table}")
+    else:
+        # Bring an existing table's columns in line with the contract: add new features, drop
+        # columns that left it (the PR gate only lets that through once nothing reads them).
+        if spark.sql(f"SHOW TBLPROPERTIES {table} ('delta.columnMapping.mode')").first()[1] != "name":
+            spark.sql(f"ALTER TABLE {table} SET TBLPROPERTIES ('delta.columnMapping.mode' = 'name')")
+        for stmt in fcu.schema_sync_statements(contract, spark.table(table).columns):
+            print(stmt)
+            spark.sql(stmt)
 
+    cols = [key, ts_key] + [f["name"] for f in contract["features"]]
     spark.sql(f"""
     MERGE INTO {table} AS tgt
     USING new_features AS src
       ON tgt.{key} = src.{key} AND tgt.{ts_key} = src.{ts_key}
-    WHEN MATCHED THEN UPDATE SET *
-    WHEN NOT MATCHED THEN INSERT *
+    WHEN MATCHED THEN UPDATE SET {", ".join(f"{c} = src.{c}" for c in cols[2:])}
+    WHEN NOT MATCHED THEN INSERT ({", ".join(cols)}) VALUES ({", ".join(f"src.{c}" for c in cols)})
     """)
 
     # Comments + tags from the contract, so the table is discoverable in Catalog Explorer.

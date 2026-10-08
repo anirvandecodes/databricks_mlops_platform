@@ -1,12 +1,12 @@
-%% Feature-sharing demo — what GitHub Actions does, and when a PR may merge.
+%% Feature contracts repo — what GitHub Actions does, and when a PR may merge.
 flowchart TB
-  PR["Open a PR<br/>(change a feature's contract or SQL)"]
-  CHK["GitHub Action: contract-check<br/>• contract + SQL valid<br/>• released features immutable (semver + changelog)<br/>• SQL compiles<br/>• who depends on it? (Unity Catalog lineage)"]
-  REVIEW["Code-owner review approved"]
+  PR["Any team opens a PR<br/>(new feature table, or a change to one)"]
+  CHK["GitHub Action: contract-check<br/>• every features/&lt;table&gt;/ checked<br/>• contract + SQL + access_list valid<br/>• released features immutable (semver + changelog)<br/>• SQL compiles<br/>• who depends on it? (Unity Catalog lineage)"]
+  REVIEW["Owning team (CODEOWNERS) approved"]
   DECIDE{"Checks passed<br/>AND review approved?"}
   BLOCK["Merge blocked<br/>fix, or ship new logic as &lt;name&gt;_v2"]
   MERGE["Merge to main"]
-  RUN["GitHub Action: staging CD<br/>deploy → create feature tables (producer)<br/>→ read + lineage (consumer)"]
+  RUN["GitHub Action: contract-check on main<br/>deploy → feature_tables job: build tables<br/>→ provision access (access_list)<br/>→ read + lineage (consumer)"]
 
   PR --> CHK
   CHK --> DECIDE

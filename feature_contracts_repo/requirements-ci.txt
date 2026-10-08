@@ -1,4 +1,4 @@
-# Pinned versions for the feature contract check (.github/workflows/feature_sharing_demo-contract-check.yml).
+# Pinned versions for the feature contract check (.github/workflows/contract-check.yml).
 # Upgrade deliberately: the check fails closed, so a breaking upstream release would block
 # every contract PR.
 databricks-sdk==0.147.0
