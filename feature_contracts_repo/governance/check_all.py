@@ -7,13 +7,12 @@ checks every folder against the base branch:
   - a folder only in the PR    -> a new table: valid, its SQL compiles, its name is free
   - a folder only on main      -> blocked: a published table is never deleted by a PR
                                   (deprecate its features and remove them instead)
-  - two contracts, one table   -> blocked: each UC table has exactly one contract
+  - two contracts, one table   -> blocked: each UC table has exactly one contract, in every
+                                  environment (dev, staging and prod)
 
 Exit code 0 = every table is safe to merge, 1 = something is blocked.
 
-    python governance/check_all.py --base-root /tmp/base \
-        --var catalog=workspace --var producer_schema=team_a_features_staging \
-        --var raw_schema=feature_demo_raw_staging
+    python governance/check_all.py --base-root /tmp/base --env staging
 
 --base-root is a checkout of the base branch at this repo's root (the folder holding
 features/). Takes --offline like check_change.py.
@@ -42,8 +41,9 @@ def contracts(features_root: Path) -> dict[str, Path]:
             for d in sorted(features_root.iterdir()) if d.is_dir() and any(d.glob("*.yaml"))}
 
 
-def run_all(base_root: Path, proposed_root: Path, variables: dict[str, str],
-            dependencies_of=find_dependencies, compile_with=compile_sql) -> int:
+def run_all(base_root: Path, proposed_root: Path, env: str,
+            dependencies_of=find_dependencies, compile_with=compile_sql,
+            legacy_vars: dict[str, str] | None = None) -> int:
     base, proposed = contracts(base_root / "features"), contracts(proposed_root / "features")
     blocked = []
 
@@ -54,17 +54,24 @@ def run_all(base_root: Path, proposed_root: Path, variables: dict[str, str],
         print("::endgroup::")
         blocked.append(name)
 
-    tables = {name: fcu.load_yaml(path, variables).get("table") for name, path in proposed.items()}
-    for table, n in Counter(tables.values()).items():
-        if n > 1:
-            owners = ", ".join(f"features/{k}" for k, t in tables.items() if t == table)
-            print(f"BLOCKED — {table} is declared by more than one contract ({owners})")
-            blocked.append(table)
+    raw = {name: fcu.load_yaml(path) for name, path in proposed.items()}
+    for e in fcu.ENVIRONMENTS:
+        tables = {}
+        for name, contract in raw.items():
+            try:
+                tables[name] = fcu.resolve(contract, e)["table"]
+            except ValueError:
+                pass  # check_change reports the invalid contract
+        for table, n in Counter(tables.values()).items():
+            if n > 1:
+                owners = ", ".join(f"features/{k}" for k, t in tables.items() if t == table)
+                print(f"BLOCKED — {table} ({e}) is declared by more than one contract ({owners})")
+                blocked.append(table)
 
     for name, path in proposed.items():
         print(f"::group::features/{name}" + ("" if name in base else " (new)"))
-        code = check_change.run(str(base[name]) if name in base else None, str(path), variables,
-                                dependencies_of, compile_with)
+        code = check_change.run(str(base[name]) if name in base else None, str(path), env,
+                                dependencies_of, compile_with, legacy_vars)
         print("::endgroup::")
         if code:
             blocked.append(name)
@@ -77,13 +84,15 @@ def run_all(base_root: Path, proposed_root: Path, variables: dict[str, str],
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--base-root", required=True, help="checkout of the base branch at the repo root")
-    parser.add_argument("--var", action="append", default=[], metavar="NAME=VALUE",
-                        help="value for a ${NAME} placeholder in the contracts (repeatable)")
+    parser.add_argument("--env", default="staging", choices=fcu.ENVIRONMENTS,
+                        help="environment to check the tables in (where each lives: environments.<env>)")
+    parser.add_argument("--legacy-var", action="append", default=[], metavar="NAME=VALUE",
+                        help="placeholder value for base contracts from before environments: (repeatable)")
     parser.add_argument("--offline", action="store_true", help="skip the SQL compile and dependency lookups")
     args = parser.parse_args()
-    variables = dict(v.split("=", 1) for v in args.var)
-    sys.exit(run_all(Path(args.base_root), ROOT, variables,
-                     *((None, None) if args.offline else (find_dependencies, compile_sql))))
+    legacy = dict(v.split("=", 1) for v in args.legacy_var)
+    sys.exit(run_all(Path(args.base_root), ROOT, args.env,
+                     *((None, None) if args.offline else (find_dependencies, compile_sql)), legacy_vars=legacy))
 
 
 if __name__ == "__main__":

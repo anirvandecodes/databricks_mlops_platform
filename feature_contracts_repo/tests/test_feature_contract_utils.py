@@ -24,8 +24,8 @@ import feature_contract_utils as fcu  # noqa: E402
 from dependencies import Dependency, Report  # noqa: E402
 
 CONTRACT = DEMO / "features" / "customer_features" / "customer_features.yaml"
-VARS = {"catalog": "demo", "raw_schema": "raw", "producer_schema": "team_a_features", "consumer_schema": "team_b_ml"}
-TABLE = "demo.team_a_features.customer_features"
+ENV = "staging"
+TABLE = "workspace.team_a_features_staging.customer_features"
 # A consumer's declared dependency on the table (inline — the demo's consumer just reads the
 # table and shows lineage, so there is no feature_config.yaml file to load).
 CONSUMER_CFG = {"feature_dependencies": [
@@ -40,7 +40,7 @@ COMPILES = lambda query, sources: None  # noqa: E731
 
 @pytest.fixture
 def base():
-    return fcu.load_yaml(CONTRACT, VARS), fcu.load_feature_sql(CONTRACT, VARS)
+    return fcu.load_table(CONTRACT, ENV)
 
 
 def active(base):
@@ -284,7 +284,7 @@ def _write(tmp_path, table):
 
 def _run(tmp_path, base_table, pr_table, deps=lambda t: report(TEAM_B), compiles=COMPILES):
     base_path = _write(tmp_path / "base", base_table) if base_table is not None else str(CONTRACT)
-    return check_change.run(base_path, _write(tmp_path / "pr", pr_table), VARS, deps, compiles)
+    return check_change.run(base_path, _write(tmp_path / "pr", pr_table), ENV, deps, compiles)
 
 
 def test_gate_happy_path_skips_the_dependency_lookup(tmp_path, base, capsys):
@@ -415,8 +415,8 @@ def test_grant_statements_match_the_list_exactly(base):
     current = {("team_b", "SELECT"), ("team_c", "SELECT"), ("team_a", "MODIFY"), ("me@x.com", "SELECT")}
     stmts = fcu.grant_statements(c, current, keep={"me@x.com"})
     assert f"GRANT SELECT ON TABLE {TABLE} TO `account users`" in stmts
-    assert f"GRANT USE SCHEMA ON SCHEMA demo.team_a_features TO `account users`" in stmts
-    assert f"GRANT USE CATALOG ON CATALOG demo TO `team_b`" in stmts
+    assert f"GRANT USE SCHEMA ON SCHEMA workspace.team_a_features_staging TO `account users`" in stmts
+    assert f"GRANT USE CATALOG ON CATALOG workspace TO `team_b`" in stmts
     assert not any(s.startswith(f"GRANT SELECT ON TABLE {TABLE} TO `team_b`") for s in stmts)  # already has it
     assert f"REVOKE SELECT ON TABLE {TABLE} FROM `team_c`" in stmts
     assert f"REVOKE MODIFY ON TABLE {TABLE} FROM `team_a`" in stmts
@@ -467,13 +467,13 @@ def _repo(root, *tables):
 
 def _new_table(base, name="other_features"):
     contract, sql = copy.deepcopy(base[0]), dict(base[1])
-    contract["table"] = f"demo.team_a_features.{name}"
+    contract["name"] = name
     return contract, sql
 
 
 def _run_all(tmp_path, base_tables, pr_tables, exists=lambda t: None, compiles=COMPILES):
     return check_all.run_all(_repo(tmp_path / "base", *base_tables), _repo(tmp_path / "pr", *pr_tables),
-                             VARS, exists, compiles)
+                             ENV, exists, compiles)
 
 
 def test_every_table_is_checked_and_a_new_table_passes(tmp_path, base, capsys):
@@ -515,6 +515,93 @@ def test_two_contracts_cannot_declare_one_table(tmp_path, base, capsys):
     assert _run_all(tmp_path, [("customer_features", base)],
                     [("customer_features", base), ("copy_features", base)]) == 1
     assert "declared by more than one contract" in capsys.readouterr().out
+
+
+# --- environments: where each table lives ------------------------------------------------
+
+def _raw():
+    return fcu.load_yaml(CONTRACT)
+
+
+def test_each_environment_has_its_own_table_and_sources():
+    dev, dev_sql = fcu.load_table(CONTRACT, "dev")
+    prod, _ = fcu.load_table(CONTRACT, "prod")
+    assert dev["table"] != prod["table"] and dev["sources"] != prod["sources"]
+    assert dev["sources"][0] in dev_sql["_base"] and "${transactions}" not in dev_sql["_base"]
+    assert dev["table"] == "{catalog}.{schema}.customer_features".format(**dev["environments"]["dev"])
+
+
+def test_every_environment_must_be_defined(base):
+    contract = copy.deepcopy(base[0])
+    del contract["environments"]["prod"]
+    assert any("prod missing" in e for e in fcu.validate_contract(contract))
+
+
+def test_environment_needs_catalog_schema_and_full_source_names(base):
+    contract = copy.deepcopy(base[0])
+    contract["environments"]["dev"].pop("schema")
+    contract["environments"]["prod"]["sources"] = {"transactions": "just_a_table"}
+    errors = fcu.validate_contract(contract)
+    assert any("dev: needs a schema" in e for e in errors)
+    assert any("must be catalog.schema.table" in e for e in errors)
+
+
+def test_source_names_must_match_across_environments(base):
+    contract = copy.deepcopy(base[0])
+    contract["environments"]["prod"]["sources"] = {"txns": "a.b.c"}
+    assert any("same names" in e for e in fcu.validate_contract(contract))
+
+
+def test_unfilled_placeholder_is_an_error(tmp_path, base):
+    contract, sql = base
+    sql = {**sql, "txn_count": "count(${typo})"}
+    path = _write(tmp_path, (contract, sql))
+    with pytest.raises(ValueError, match=r"\$\{typo\} not defined"):
+        fcu.load_table(path, ENV)
+
+
+def test_gate_blocks_unfilled_placeholder(tmp_path, base, capsys):
+    contract, sql = added(base)
+    sql["new_test_feature"] = "avg(${typo}.amount)"
+    assert _run(tmp_path, None, (contract, sql)) == 1
+    assert "${typo} not defined" in capsys.readouterr().out
+
+
+def test_moving_a_table_in_any_environment_needs_a_new_table(base):
+    contract = _bump(copy.deepcopy(base[0]), "major")
+    contract["environments"]["prod"]["schema"] = "somewhere_else"
+    kinds = {c["message"]: c["kind"] for c in fcu.diff_contract(base[0], contract)}
+    assert any(k.startswith("prod: table moves") and v == "keys" for k, v in kinds.items())
+    assert any("new table" in p for p in _problems(base, (contract, base[1])))
+
+
+def test_repointing_a_source_is_a_patch(base):
+    contract = _bump(copy.deepcopy(base[0]), "patch")
+    contract["environments"]["dev"]["sources"] = {"transactions": "other.raw.transactions"}
+    changes = fcu.diff_contract(base[0], contract)
+    assert [(c["kind"], c["message"]) for c in changes] == [("metadata", "dev sources changed")]
+    assert fcu.change_problems(base[0], contract, changes) == []
+
+
+def test_legacy_base_contract_compares_as_unchanged(tmp_path, base):
+    """main's contract from before environments: (table: ${catalog}.${producer_schema}...)."""
+    legacy = {k: v for k, v in base[0].items() if k not in ("environments", "name", "table", "sources", "environment")}
+    legacy.update(table="${catalog}.${producer_schema}.customer_features", sources=["${catalog}.${raw_schema}.transactions"])
+    legacy_sql = {**base[1], "_base": base[1]["_base"].replace(base[0]["sources"][0], "${catalog}.${raw_schema}.transactions")}
+    path = _write(tmp_path, (legacy, legacy_sql))
+    old = fcu.load_table(path, ENV, {"catalog": "workspace", "producer_schema": "team_a_features_staging",
+                                     "raw_schema": "feature_demo_raw_staging"})
+    assert fcu.diff_contract(old[0], base[0], old[1], base[1]) == []
+
+
+def test_two_contracts_cannot_share_a_table_in_any_environment(tmp_path, base, capsys):
+    """Different tables in dev and staging, but both claim the same prod table."""
+    other = copy.deepcopy(base[0])
+    for env in ("dev", "staging"):
+        other["environments"][env]["schema"] = "team_c_features"
+    assert _run_all(tmp_path, [], [("customer_features", base), ("team_c_copy", (other, base[1]))]) == 1
+    assert f"{base[0]['environments']['prod']['catalog']}.{base[0]['environments']['prod']['schema']}" \
+           f".customer_features (prod) is declared by more than one contract" in capsys.readouterr().out
 
 
 # --- consumer side ------------------------------------------------------------------------

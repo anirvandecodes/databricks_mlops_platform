@@ -7,16 +7,11 @@
 
 # COMMAND ----------
 
-dbutils.widgets.text("catalog", "")
-dbutils.widgets.text("producer_schema", "team_a_features")
-
-catalog = dbutils.widgets.get("catalog").strip()
-producer_schema = dbutils.widgets.get("producer_schema").strip()
-if not catalog:
-    raise ValueError("catalog is required")
-
-table = f"{catalog}.{producer_schema}.customer_features"
-schema, name = producer_schema, "customer_features"
+dbutils.widgets.text("table", "")
+table = dbutils.widgets.get("table").strip()
+if table.count(".") != 2:
+    raise ValueError(f"table must be catalog.schema.table, got {table!r}")
+_, schema, name = table.split(".")
 
 # COMMAND ----------
 

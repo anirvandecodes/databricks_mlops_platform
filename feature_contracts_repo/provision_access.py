@@ -24,19 +24,19 @@ from pathlib import Path
 sys.path.insert(0, os.path.abspath("shared"))
 import feature_contract_utils as fcu  # noqa: E402
 
-for w in ("features_root", "catalog", "raw_schema", "producer_schema"):
+for w in ("features_root", "environment"):
     dbutils.widgets.text(w, "")
 features_root = Path(dbutils.widgets.get("features_root").strip())
-variables = {w: dbutils.widgets.get(w).strip() for w in ("catalog", "raw_schema", "producer_schema")}
-if not variables["catalog"]:
-    raise ValueError("catalog is required")
+environment = dbutils.widgets.get("environment").strip()
+if environment not in fcu.ENVIRONMENTS:
+    raise ValueError(f"environment must be one of {fcu.ENVIRONMENTS}, got {environment!r}")
 
 me = spark.sql("SELECT current_user()").first()[0]
 
 # COMMAND ----------
 
 def provision(contract_path: Path) -> None:
-    contract = fcu.load_yaml(contract_path, variables)
+    contract, _ = fcu.load_table(contract_path, environment)
     table = contract["table"]
     if fcu.access_entries(contract) is None:
         print(f"{table}: no access_list — grants not managed")

@@ -27,10 +27,11 @@ feature_contracts_repo/
   resources/feature-tables.yml   the jobs (below)
   .github/                       CI/CD (contract-check.yml), CODEOWNERS, PR + issue templates
   features/<table>/              one self-contained folder per feature table, owned by one team
-    customer_features.yaml       the contract: schema, meaning, owner, access_list, lifecycle, semver, changelog
+    customer_features.yaml       the contract: where it lives per environment, schema, meaning, owner, access_list, lifecycle, semver, changelog
     _base.sql                    the query skeleton (grain + source), with a ${features} placeholder
     <feature>.sql                one SQL aggregate expression per feature (e.g. txn_count.sql)
   producer.py                    builds EVERY features/<table>/ into a UC feature table
+  demo/mock_sources.py           DEMO ONLY: writes the mock source data (delete in a real repo)
   provision_access.py            makes each table's UC grants match its access_list
   consumer.py                    reads a feature table and prints its Unity Catalog lineage
   shared/feature_contract_utils.py   the contract rules as plain, unit-tested functions
@@ -61,10 +62,43 @@ single aggregate expression inserted at `${features}`, for example:
 count(t.txn_id)
 ```
 
-`producer.py` substitutes the bundle's `${catalog}` / `${raw_schema}` / `${producer_schema}`,
-inserts every expression into `_base.sql`, and writes the table with a
+`producer.py` loads the contract for the environment it runs in (see below), inserts every
+expression into `_base.sql`, and writes the table with a
 `PRIMARY KEY (customer_id, as_of_date TIMESERIES)` and Change Data Feed — which is what makes
 it a feature table consumers can point-in-time join. It also sets discovery comments and tags.
+
+## Where a table lives (`environments:`)
+
+Each contract decides, per environment, which catalog and schema its table goes in and which
+source tables it reads. The bundle only says which environment this is (its target: `dev`,
+`staging` or `prod`), so different teams can publish to different catalogs and schemas.
+
+```yaml
+name: customer_features            # the table is <catalog>.<schema>.<name>
+environments:
+  dev:
+    catalog: workspace
+    schema: team_a_features_dev
+    sources:
+      transactions: workspace.feature_demo_raw_dev.transactions
+  staging: {...}
+  prod:
+    catalog: prod_features
+    schema: team_a
+    sources:
+      transactions: prod_raw.payments.transactions
+```
+
+The SQL refers to a source by its name — `FROM ${transactions} t` — and gets that
+environment's table. Rules (checked on every PR):
+- all three environments are defined, each with `catalog`, `schema` and `sources`
+  (`name: catalog.schema.table`), using the same source names everywhere;
+- any `${...}` in the SQL that isn't a source name blocks the PR (`${features}` is reserved);
+- moving a table (any environment's catalog or schema, or its `name`) is never allowed in
+  place — publish a new table; repointing a source is a patch;
+- no two contracts may claim the same table in any environment.
+
+The producer creates the schema if it's missing but never a catalog.
 
 ## Who can read it (`access_list`)
 
@@ -122,7 +156,7 @@ Defined in `resources/feature-tables.yml`:
 
 | Job | What it does |
 |---|---|
-| `feature_tables` | Task `build_feature_tables` builds every `features/<table>/` as a UC feature table; then task `provision_access` makes each table's grants match its `access_list` |
+| `feature_tables` | `mock_sources` writes the demo's source data (delete in a real repo); `build_feature_tables` builds every `features/<table>/` as a UC feature table where its contract says it lives in this environment; then `provision_access` makes each table's grants match its `access_list` |
 | `feature_consumer` | Reads a feature table and shows its lineage |
 | `feature_consumers_check` | Reports what depends on a table/column (the same lookup as the PR gate; `fail_if_active=true` makes it the removal gate) |
 
@@ -144,11 +178,10 @@ Check a PR locally the way CI does (compare every table against `main`):
 ```bash
 cd feature_contracts_repo
 git worktree add /tmp/base origin/main
-python governance/check_all.py --base-root /tmp/base \
-  --var catalog=workspace --var producer_schema=team_a_features_dev --var raw_schema=feature_demo_raw_dev
+python governance/check_all.py --base-root /tmp/base/feature_contracts_repo --env dev
 ```
 
-(While this folder still lives inside the platform repo, use `--base-root /tmp/base/feature_contracts_repo`.)
+(Once this folder is its own repo, use `--base-root /tmp/base`.)
 
 ## Making a change
 
@@ -158,6 +191,8 @@ python governance/check_all.py --base-root /tmp/base \
 | New feature | add a `<name>.sql` + a `features:` entry (with `since`) | minor |
 | New logic for an existing feature | add `<name>_v2`; deprecate `<name>` (`status`, `sunset_date`, `replaced_by`) | minor |
 | Remove a deprecated feature | delete it once nothing reads it | major |
+| Point a source at another table | change `environments.<env>.sources` | patch |
+| Move a table (catalog, schema or name) | **not allowed** — publish a new table | — |
 | Grant a team access | add it to `access_list` | patch |
 | Revoke a team's access | remove it from `access_list` (the check warns: make sure they've moved off) | minor |
 | Definition text, owner, SLA | metadata only | patch |

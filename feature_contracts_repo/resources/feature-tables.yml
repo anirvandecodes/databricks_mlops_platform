@@ -1,5 +1,6 @@
 # Jobs for the feature contracts repo. feature_tables builds every feature table under
 # features/<table>/ from its contract + SQL, then provisions access from each access_list.
+# They get only the environment (${bundle.target}); each contract says where it lives in it.
 # feature_consumer reads a table and shows Unity Catalog lineage; feature_consumers_check
 # reports what depends on a table/column (the same lookup as the PR check). CI/CD is
 # .github/workflows/contract-check.yml.
@@ -10,14 +11,20 @@ resources:
       name: ${bundle.target}-feature-tables
       tags: {project: feature-contracts, role: producer}
       tasks:
+        # DEMO ONLY — writes the mock source data; delete in a real repo.
+        - task_key: mock_sources
+          notebook_task:
+            notebook_path: ../demo/mock_sources.py
+            base_parameters:
+              table: ${var.demo_source_table}
         - task_key: build_feature_tables
+          depends_on:
+            - task_key: mock_sources
           notebook_task:
             notebook_path: ../producer.py
             base_parameters:
               features_root: ${workspace.file_path}/features
-              catalog: ${var.catalog_name}
-              raw_schema: ${var.raw_schema}
-              producer_schema: ${var.producer_schema}
+              environment: ${bundle.target}
         - task_key: provision_access
           depends_on:
             - task_key: build_feature_tables
@@ -25,9 +32,7 @@ resources:
             notebook_path: ../provision_access.py
             base_parameters:
               features_root: ${workspace.file_path}/features
-              catalog: ${var.catalog_name}
-              raw_schema: ${var.raw_schema}
-              producer_schema: ${var.producer_schema}
+              environment: ${bundle.target}
       max_concurrent_runs: 1
 
     # Consumer: read the feature table(s) and show lineage.
@@ -39,8 +44,7 @@ resources:
           notebook_task:
             notebook_path: ../consumer.py
             base_parameters:
-              catalog: ${var.catalog_name}
-              producer_schema: ${var.producer_schema}
+              table: ${var.demo_feature_table}
       max_concurrent_runs: 1
 
     # Governance: what depends on a feature table / column? The same lookup as the PR check
@@ -51,7 +55,7 @@ resources:
       tags: {project: feature-contracts, role: governance}
       parameters:
         - name: table
-          default: ${var.catalog_name}.${var.producer_schema}.customer_features
+          default: ${var.demo_feature_table}
         - name: column
           default: ""
         - name: fail_if_active
