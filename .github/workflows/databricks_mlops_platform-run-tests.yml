@@ -11,9 +11,6 @@ on:
   pull_request:
     paths:
       - "databricks_mlops_platform/**"
-      # The feature-sharing demo has its own gate: feature_sharing_demo-contract-check.yml.
-      - "!databricks_mlops_platform/feature_sharing_demo/**"
-      - "!databricks_mlops_platform/resources/feature-sharing-demo-resource.yml"
       - ".github/workflows/databricks_mlops_platform-run-tests.yml"
 
 defaults:

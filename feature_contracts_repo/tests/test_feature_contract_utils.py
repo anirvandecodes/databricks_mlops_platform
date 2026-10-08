@@ -385,6 +385,138 @@ def test_sql_strings_are_escaped(base):
     assert "Team A\\'s features" in fcu.uc_metadata_statements(*base)[0]
 
 
+# --- access_list: who can read the table ---------------------------------------------------
+
+def _with_access(contract: dict, access: list, part: str | None = None) -> dict:
+    c = copy.deepcopy(contract)
+    c["access_list"] = access
+    return _bump(c, part) if part else c
+
+
+def test_bare_name_gets_select_and_privileges_are_explicit(base):
+    c = _with_access(base[0], ["team_b", {"principal": "team_a_eng", "privileges": ["select", "MODIFY"]}])
+    assert fcu.validate_contract(c) == []
+    assert fcu.access_grants(c) == {("team_b", "SELECT"), ("team_a_eng", "SELECT"), ("team_a_eng", "MODIFY")}
+
+
+@pytest.mark.parametrize("access, error", [
+    ([{"principal": "team_b", "privileges": ["DROP"]}], "not one of"),
+    (["team_b", "team_b"], "listed twice"),
+    ([{"principal": "team_b", "privileges": []}], "non-empty list"),
+    ([{"privileges": ["SELECT"]}], "needs a principal"),
+    ("team_b", "must be a list"),
+])
+def test_access_list_validation(base, access, error):
+    assert any(error in e for e in fcu.validate_contract(_with_access(base[0], access)))
+
+
+def test_grant_statements_match_the_list_exactly(base):
+    c = _with_access(base[0], ["account users", "team_b"])
+    current = {("team_b", "SELECT"), ("team_c", "SELECT"), ("team_a", "MODIFY"), ("me@x.com", "SELECT")}
+    stmts = fcu.grant_statements(c, current, keep={"me@x.com"})
+    assert f"GRANT SELECT ON TABLE {TABLE} TO `account users`" in stmts
+    assert f"GRANT USE SCHEMA ON SCHEMA demo.team_a_features TO `account users`" in stmts
+    assert f"GRANT USE CATALOG ON CATALOG demo TO `team_b`" in stmts
+    assert not any(s.startswith(f"GRANT SELECT ON TABLE {TABLE} TO `team_b`") for s in stmts)  # already has it
+    assert f"REVOKE SELECT ON TABLE {TABLE} FROM `team_c`" in stmts
+    assert f"REVOKE MODIFY ON TABLE {TABLE} FROM `team_a`" in stmts
+    assert not any("me@x.com" in s for s in stmts)
+
+
+def test_no_access_list_means_grants_are_not_managed(base):
+    c = copy.deepcopy(base[0])
+    c.pop("access_list", None)
+    assert fcu.grant_statements(c, {("team_c", "SELECT")}, keep=set()) == []
+
+
+def test_granting_access_is_a_patch(base):
+    old = _with_access(base[0], ["team_b"])
+    new = _with_access(old, ["team_b", "team_c"], "patch")
+    changes = fcu.diff_contract(old, new)
+    assert [(c["kind"], c["message"]) for c in changes] == [("metadata", "team_c granted SELECT")]
+    assert fcu.change_problems(old, new, changes) == []
+
+
+def test_revoking_access_is_a_minor_bump_with_a_warning(base):
+    old = _with_access(base[0], ["team_b", "team_c"])
+    too_small = _with_access(old, ["team_b"], "patch")
+    assert any("needs a minor bump" in p for p in fcu.change_problems(old, too_small, fcu.diff_contract(old, too_small)))
+    new = _with_access(old, ["team_b"], "minor")
+    changes = fcu.diff_contract(old, new)
+    assert [c["kind"] for c in changes] == ["revoked"] and fcu.change_problems(old, new, changes) == []
+    assert any("team_c loses SELECT" in w for w in fcu.change_warnings(old, changes, "2026-01-01"))
+
+
+# --- check_all.py: every table in the repo, whichever team owns it ------------------------
+
+import check_all  # noqa: E402
+
+
+def _repo(root, *tables):
+    """A repo checkout at root with features/<folder>/ for each (folder, (contract, sql))."""
+    for folder, table in tables:
+        contract, sql = table
+        d = root / "features" / folder
+        d.mkdir(parents=True)
+        (d / f"{folder}.yaml").write_text(yaml.safe_dump(contract))
+        for name, text in sql.items():
+            (d / f"{name}.sql").write_text(text)
+    (root / "features").mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _new_table(base, name="other_features"):
+    contract, sql = copy.deepcopy(base[0]), dict(base[1])
+    contract["table"] = f"demo.team_a_features.{name}"
+    return contract, sql
+
+
+def _run_all(tmp_path, base_tables, pr_tables, exists=lambda t: None, compiles=COMPILES):
+    return check_all.run_all(_repo(tmp_path / "base", *base_tables), _repo(tmp_path / "pr", *pr_tables),
+                             VARS, exists, compiles)
+
+
+def test_every_table_is_checked_and_a_new_table_passes(tmp_path, base, capsys):
+    assert _run_all(tmp_path, [("customer_features", base)],
+                    [("customer_features", base), ("other_features", _new_table(base))]) == 0
+    out = capsys.readouterr().out
+    assert "(new table" in out and "2 feature table(s) checked" in out
+
+
+def test_a_bad_change_in_one_table_blocks_the_pr(tmp_path, base):
+    assert _run_all(tmp_path, [("customer_features", base)],
+                    [("customer_features", changed_in_place(base)), ("other_features", _new_table(base))],
+                    exists=lambda t: report()) == 1
+
+
+def test_new_table_sql_must_compile(tmp_path, base, capsys):
+    assert _run_all(tmp_path, [], [("other_features", _new_table(base))],
+                    compiles=lambda q, s: "UNRESOLVED_COLUMN") == 1
+    assert "doesn't compile" in capsys.readouterr().out
+
+
+def test_new_table_cannot_take_an_existing_name(tmp_path, base, capsys):
+    assert _run_all(tmp_path, [], [("other_features", _new_table(base))], exists=lambda t: report()) == 1
+    assert "already exists in Unity Catalog" in capsys.readouterr().out
+
+
+def test_new_table_needs_a_changelog_entry(tmp_path, base):
+    contract, sql = _new_table(base)
+    contract["changelog"] = []
+    assert _run_all(tmp_path, [], [("other_features", (contract, sql))]) == 1
+
+
+def test_deleting_a_table_folder_is_blocked(tmp_path, base, capsys):
+    assert _run_all(tmp_path, [("customer_features", base)], []) == 1
+    assert "was deleted" in capsys.readouterr().out
+
+
+def test_two_contracts_cannot_declare_one_table(tmp_path, base, capsys):
+    assert _run_all(tmp_path, [("customer_features", base)],
+                    [("customer_features", base), ("copy_features", base)]) == 1
+    assert "declared by more than one contract" in capsys.readouterr().out
+
+
 # --- consumer side ------------------------------------------------------------------------
 
 def test_lookup_specs_from_consumer_config():

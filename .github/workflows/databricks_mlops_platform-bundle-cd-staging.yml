@@ -54,24 +54,3 @@ jobs:
             echo "Promote to production by pushing a \`release/<name>\` branch. Production"
             echo "requires explicit model approval before any version serves traffic."
           } >> "$GITHUB_STEP_SUMMARY"
-
-  # Feature-sharing demo (feature_sharing_demo/). The bundle deploy above already shipped the
-  # producer, consumer and contracts; this builds the feature table(s) from their folders and
-  # then reads them to show lineage.
-  #
-  # The PR gate (feature_sharing_demo-contract-check.yml) has already blocked any contract
-  # change that would break a live model, so nothing here re-checks it.
-  feature_sharing_demo:
-    name: Feature sharing demo — produce and consume
-    needs: deploy
-    runs-on: ubuntu-latest
-    concurrency: staging-bundle-deploy
-    steps:
-      - uses: actions/checkout@v4
-      - uses: databricks/setup-cli@main
-
-      - name: Producer builds the feature table(s)
-        run: databricks bundle run feature_producer -t staging
-
-      - name: Consumer reads them and shows lineage
-        run: databricks bundle run feature_consumer -t staging

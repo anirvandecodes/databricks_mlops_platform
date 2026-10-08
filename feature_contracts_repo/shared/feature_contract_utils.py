@@ -1,12 +1,9 @@
-# Databricks notebook source
-# Feature-contract utilities shared by producers, consumers and the governance checks.
-# Usage from notebooks:  %run ../../shared/feature_contract_utils
-# Usage from tests/CI:   import feature_contract_utils
+# Feature-contract utilities shared by the jobs (producer.py, provision_access.py) and the
+# governance checks. A plain Python module (not a notebook), so it imports the same way
+# everywhere: notebooks put shared/ on sys.path; tests and CI import it directly.
 #
 # Plain functions only — no top-level spark/dbutils — so the same logic runs in the
-# workspace (%run), in pytest, and in the PR gate (governance/check_change.py).
-
-# COMMAND ----------
+# workspace, in pytest, and in the PR gate (governance/check_change.py).
 
 import hashlib
 import re
@@ -24,10 +21,11 @@ BASE_SQL = "_base"  # the query skeleton in a table's features/ folder; the rest
 FEATURE_STATUSES = ("active", "deprecated")
 FEATURE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+ACCESS_PRIVILEGES = ("SELECT", "MODIFY")  # table privileges an access_list entry can grant
 
 # Kinds of change (see diff_contract). The breaking ones change what an existing reader gets.
-ADDED, DEPRECATED, CHANGED, REMOVED, KEYS, METADATA = (
-    "added", "deprecated", "changed", "removed", "keys", "metadata")
+ADDED, DEPRECATED, CHANGED, REMOVED, KEYS, METADATA, REVOKED = (
+    "added", "deprecated", "changed", "removed", "keys", "metadata", "revoked")
 BREAKING_KINDS = (CHANGED, REMOVED, KEYS)
 
 
@@ -109,6 +107,35 @@ def validate_contract(contract: dict[str, Any]) -> list[str]:
                 errors.append(f"feature {name}: deprecated features need a sunset_date")
             if not feat.get("replaced_by"):
                 errors.append(f"feature {name}: deprecated features need replaced_by (or 'none')")
+    return errors + _validate_access(contract)
+
+
+def _validate_access(contract: dict[str, Any]) -> list[str]:
+    if "access_list" not in contract:
+        return []
+    if not isinstance(contract["access_list"], list):
+        return ["access_list must be a list of principals"]
+    errors, seen = [], set()
+    for entry in contract["access_list"]:
+        if isinstance(entry, str):
+            principal, privileges = entry, ["SELECT"]
+        elif isinstance(entry, dict):
+            principal, privileges = entry.get("principal"), entry.get("privileges")
+        else:
+            errors.append(f"access_list: {entry!r} must be a name or {{principal, privileges}}")
+            continue
+        if not isinstance(principal, str) or not principal.strip():
+            errors.append(f"access_list: {entry!r} needs a principal")
+            continue
+        if not privileges or not isinstance(privileges, list):
+            errors.append(f"access_list {principal}: privileges must be a non-empty list")
+        else:
+            bad = [p for p in privileges if str(p).upper() not in ACCESS_PRIVILEGES]
+            if bad:
+                errors.append(f"access_list {principal}: {', '.join(map(str, bad))} not one of {ACCESS_PRIVILEGES}")
+        if principal in seen:
+            errors.append(f"access_list {principal}: listed twice")
+        seen.add(principal)
     return errors
 
 
@@ -152,6 +179,8 @@ def diff_contract(base: dict[str, Any], proposed: dict[str, Any],
       changed     a released feature's SQL or dtype edited       never allowed
       keys        table, keys, or the query skeleton edited      never allowed
       metadata    definition text, description, owner, SLA, ...  patch bump
+                  (and access granted in access_list)
+      revoked     access removed from access_list               minor bump, with a warning
     SQL comments and whitespace don't count as changes. If main has no SQL for the table
     yet (the PR that first adds it), there's nothing to compare the SQL with.
     """
@@ -188,6 +217,11 @@ def diff_contract(base: dict[str, Any], proposed: dict[str, Any],
                                   f"replaced by {new.get('replaced_by')})")
         elif old["status"] == "deprecated" and new["status"] == "active":
             add(name, METADATA, "un-deprecated")
+    old_access, new_access = access_grants(base) or set(), access_grants(proposed) or set()
+    for principal, privilege in sorted(new_access - old_access):
+        add("<access>", METADATA, f"{principal} granted {privilege}")
+    for principal, privilege in sorted(old_access - new_access):
+        add("<access>", REVOKED, f"{principal} loses {privilege}")
     for name in prop_feats:
         if name not in base_feats:
             add(name, ADDED, "new feature")
@@ -222,7 +256,7 @@ def change_problems(base: dict[str, Any], proposed: dict[str, Any],
     kinds = {c["kind"] for c in changes}
     if kinds & set(BREAKING_KINDS):
         required, label = (old_v[0] + 1, 0, 0), "major"
-    elif kinds & {ADDED, DEPRECATED}:
+    elif kinds & {ADDED, DEPRECATED, REVOKED}:
         required, label = (old_v[0], old_v[1] + 1, 0), "minor"
     else:
         required, label = (old_v[0], old_v[1], old_v[2] + 1), "patch"
@@ -235,11 +269,15 @@ def change_problems(base: dict[str, Any], proposed: dict[str, Any],
 
 
 def change_warnings(base: dict[str, Any], changes: list[dict[str, str]], today: str) -> list[str]:
-    """Allowed, but worth flagging: removing a feature before the sunset date it promised."""
+    """Allowed, but worth flagging: removing a feature before the sunset date it promised, and
+    taking access away (lineage records users and jobs, not groups, so the gate can't tell
+    whether that team still reads the table)."""
     base_feats = {f["name"]: f for f in base["features"]}
     return [f"{c['feature']}: removed before its promised sunset date {base_feats[c['feature']]['sunset_date']}"
             for c in changes
-            if c["kind"] == REMOVED and str(base_feats[c["feature"]].get("sunset_date", "")) > today]
+            if c["kind"] == REMOVED and str(base_feats[c["feature"]].get("sunset_date", "")) > today] + [
+        f"access: {c['message']} on {base['table']} — make sure they've moved off it"
+        for c in changes if c["kind"] == REVOKED]
 
 
 def downstream_breaks(changes: list[dict[str, str]],
@@ -355,6 +393,52 @@ def uc_metadata_statements(contract: dict[str, Any], sql: dict[str, str]) -> lis
             tags["replaced_by"] = feat["replaced_by"]
         tag_sql = ", ".join(f"{_sql_str(k)} = {_sql_str(v)}" for k, v in tags.items())
         stmts.append(f"ALTER TABLE {col} SET TAGS ({tag_sql})")
+    return stmts
+
+
+# ---------------------------------------------------------------------------
+# Access: Unity Catalog grants derived from the contract's access_list
+# ---------------------------------------------------------------------------
+
+def access_entries(contract: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """access_list as [{"principal", "privileges"}] (a bare name gets SELECT), or None when
+    the contract has no access_list (then its grants aren't managed)."""
+    if "access_list" not in contract:
+        return None
+    return [{"principal": e, "privileges": ["SELECT"]} if isinstance(e, str)
+            else {"principal": e["principal"], "privileges": [str(p).upper() for p in e["privileges"]]}
+            for e in contract["access_list"]]
+
+
+def access_grants(contract: dict[str, Any]) -> set[tuple[str, str]] | None:
+    """{(principal, privilege)} the contract asks for, or None when access isn't managed."""
+    entries = access_entries(contract)
+    return None if entries is None else {(e["principal"], p) for e in entries for p in e["privileges"]}
+
+
+def grant_statements(contract: dict[str, Any], current: set[tuple[str, str]], keep: set[str]) -> list[str]:
+    """GRANT / REVOKE statements that make the table's grants match access_list exactly.
+
+    current: the (principal, privilege) pairs granted on the table itself today, limited to
+    ACCESS_PRIVILEGES. keep: principals never revoked (the table owner, the job's identity).
+    Listed principals also get USE CATALOG / USE SCHEMA so they can reach the table; those
+    are only ever granted, since other tables share the catalog and schema.
+    """
+    wanted = access_grants(contract)
+    if wanted is None:
+        return []
+    table = contract["table"]
+    catalog, schema = table.split(".")[0], ".".join(table.split(".")[:2])
+    stmts = []
+    for principal in sorted({p for p, _ in wanted}):
+        missing = sorted(priv for p, priv in wanted - current if p == principal)
+        if missing:
+            stmts.append(f"GRANT {', '.join(missing)} ON TABLE {table} TO `{principal}`")
+        stmts.append(f"GRANT USE CATALOG ON CATALOG {catalog} TO `{principal}`")
+        stmts.append(f"GRANT USE SCHEMA ON SCHEMA {schema} TO `{principal}`")
+    for principal, privilege in sorted(current - wanted):
+        if principal not in keep:
+            stmts.append(f"REVOKE {privilege} ON TABLE {table} FROM `{principal}`")
     return stmts
 
 

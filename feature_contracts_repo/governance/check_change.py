@@ -18,10 +18,13 @@ folder features/<table>/ (the <table>.yaml contract and its _base.sql + <feature
 Exit code 0 = safe to merge, 1 = blocked. Approval is a code-owner review (CODEOWNERS).
 
     python governance/check_change.py \
-        --base /tmp/base/<demo>/features/customer_features/customer_features.yaml \
+        --base /tmp/base/features/customer_features/customer_features.yaml \
         --proposed features/customer_features/customer_features.yaml \
         --var catalog=workspace --var producer_schema=team_a_features_staging \
         --var raw_schema=feature_demo_raw_staging
+
+For a table that isn't on main yet, leave out --base: the contract must be valid, every
+feature's SQL must compile and the table name must be free.
 
 The SQL is found in the contract's own folder (features/<table>/), so --base points into
 a checkout of the base branch. Authenticates like the Databricks CLI (DATABRICKS_HOST and
@@ -42,12 +45,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shared"))
 import feature_contract_utils as fcu  # noqa: E402
 from dependencies import Report, compile_sql, find_dependencies, log  # noqa: E402
 
-ICON = {"added": "+", "deprecated": "~", "metadata": "~", "changed": "!", "removed": "-", "keys": "!"}
+ICON = {"added": "+", "deprecated": "~", "metadata": "~", "changed": "!", "removed": "-", "keys": "!",
+        "revoked": "-"}
 
 
-def run(base_path: str, proposed_path: str, variables: dict[str, str],
+def run(base_path: str | None, proposed_path: str, variables: dict[str, str],
         dependencies_of: Callable[[str], Report | None] | None = find_dependencies,
         compile_with: Callable[[str, list[str]], str | None] | None = compile_sql) -> int:
+    if base_path is None:
+        return run_new(proposed_path, variables, dependencies_of, compile_with)
     base, proposed = fcu.load_yaml(base_path, variables), fcu.load_yaml(proposed_path, variables)
     base_sql = fcu.load_feature_sql(base_path, variables)
     proposed_sql = fcu.load_feature_sql(proposed_path, variables)
@@ -149,6 +155,52 @@ def run(base_path: str, proposed_path: str, variables: dict[str, str],
     return 1 if blocked else 0
 
 
+def run_new(proposed_path: str, variables: dict[str, str],
+            dependencies_of: Callable[[str], Report | None] | None = find_dependencies,
+            compile_with: Callable[[str, list[str]], str | None] | None = compile_sql) -> int:
+    """A feature table that isn't on main yet: valid, every feature's SQL compiles, and the
+    table name isn't already taken in Unity Catalog."""
+    proposed = fcu.load_yaml(proposed_path, variables)
+    proposed_sql = fcu.load_feature_sql(proposed_path, variables)
+    print(f"Feature contract check: {proposed['table']} (new table, {proposed['version']})\n")
+    log(f"Checking new table {proposed['table']} @ {proposed['version']}")
+
+    log("Step 1/3  Are the contract and its SQL valid, one SQL file per feature?")
+    problems = fcu.validate_contract(proposed) or fcu.validate_sql(proposed, proposed_sql)
+    if not problems and not any(str(e.get("version")) == str(proposed["version"])
+                                for e in proposed.get("changelog", [])):
+        problems = [f"changelog has no entry for {proposed['version']}"]
+    if problems:
+        print("BLOCKED — invalid contract or SQL:")
+        for p in problems:
+            print(f"  x {p}")
+        print("\nRESULT: BLOCKED")
+        return 1
+    print("Features:")
+    for f in proposed["features"]:
+        print(f"  + {f['name']:<22} {f['dtype']}")
+
+    blocked = False
+    if compile_with:
+        log("Step 2/3  Does the feature SQL compile? (EXPLAIN; every feature)")
+        error = compile_with(fcu.features_sql(proposed, proposed_sql), proposed["sources"])
+        if error:
+            blocked = True
+            print(f"\nBLOCKED — the feature SQL doesn't compile:\n  x {error}")
+    if dependencies_of:
+        log("Step 3/3  Is the table name free? (a new contract can't take over a published table)")
+        if dependencies_of(proposed["table"]) is not None:
+            blocked = True
+            print(f"\nBLOCKED — {proposed['table']} already exists in Unity Catalog but not on main. "
+                  "Pick another table name.")
+    else:
+        print("\n(offline: SQL and table name not checked)")
+
+    print("\nRESULT:", "BLOCKED" if blocked else "OK to merge")
+    log(f"Result: {'BLOCKED' if blocked else 'OK to merge'}")
+    return 1 if blocked else 0
+
+
 def _label(dep: dict[str, Any]) -> str:
     return f"{dep['kind']} {dep['name']}" + (f" {dep['detail']}" if dep["kind"] == "model" else "")
 
@@ -181,7 +233,7 @@ def print_dependencies(report: Report, keys: set[str]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--base", required=True, help="contract in a checkout of the base branch (main)")
+    parser.add_argument("--base", help="contract in a checkout of the base branch (main); omit for a new table")
     parser.add_argument("--proposed", required=True, help="contract in the PR")
     parser.add_argument("--var", action="append", default=[], metavar="NAME=VALUE",
                         help="value for a ${NAME} placeholder in the contract (repeatable)")
