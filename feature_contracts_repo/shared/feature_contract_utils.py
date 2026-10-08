@@ -13,9 +13,10 @@ from typing import Any
 import yaml
 
 REQUIRED_CONTRACT_FIELDS = (
-    "table", "version", "owner", "support_channel", "description",
-    "primary_keys", "timestamp_key", "refresh", "freshness_sla_hours", "sources", "features",
+    "name", "environments", "version", "owner", "support_channel", "description",
+    "primary_keys", "timestamp_key", "refresh", "freshness_sla_hours", "features",
 )
+ENVIRONMENTS = ("dev", "staging", "prod")  # bundle targets; every contract says where it lives in each
 REQUIRED_FEATURE_FIELDS = ("name", "dtype", "definition", "status", "since")
 BASE_SQL = "_base"  # the query skeleton in a table's features/ folder; the rest are <feature>.sql
 FEATURE_STATUSES = ("active", "deprecated")
@@ -31,13 +32,65 @@ BREAKING_KINDS = (CHANGED, REMOVED, KEYS)
 
 # ---------------------------------------------------------------------------
 # Loading & validation
+#
+# A contract says where its table lives in each environment:
+#
+#   name: customer_features
+#   environments:
+#     dev:  {catalog: ..., schema: ..., sources: {transactions: <catalog.schema.table>}}
+#     staging: ...
+#     prod: ...
+#
+# load_table(path, env) picks one environment: the table is <catalog>.<schema>.<name>, and
+# each ${<source name>} in the SQL becomes that environment's source table.
 # ---------------------------------------------------------------------------
+
+PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+SQL_RESERVED = {"features"}  # ${features} in _base.sql is where the feature expressions go
+FULL_NAME_RE = re.compile(r"^[^.\s]+\.[^.\s]+\.[^.\s]+$")
+
 
 def load_yaml(path: str | Path, variables: dict[str, str] | None = None) -> dict[str, Any]:
     """Load a YAML file, substituting ${var} placeholders in string values."""
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     return _substitute(data, variables or {})
+
+
+def resolve(contract: dict[str, Any], env: str) -> dict[str, Any]:
+    """The contract as it applies in `env`: adds "table" (<catalog>.<schema>.<name>), "sources"
+    (that environment's source tables) and "environment". Resolving again is a no-op."""
+    envs = contract.get("environments")
+    if not isinstance(envs, dict) or not isinstance(envs.get(env), dict):
+        raise ValueError(f"no environments.{env} (where the table lives in {env})")
+    e = envs[env]
+    sources = e.get("sources") if isinstance(e.get("sources"), dict) else {}
+    return {**contract, "table": f"{e.get('catalog')}.{e.get('schema')}.{contract.get('name')}",
+            "sources": list(sources.values()), "environment": env}
+
+
+def load_table(path: str | Path, env: str,
+               legacy_vars: dict[str, str] | None = None) -> tuple[dict[str, Any], dict[str, str]]:
+    """(contract, {feature: SQL}) for one feature table in `env`.
+
+    Raises ValueError when `env` isn't defined or a ${placeholder} can't be filled. A contract
+    from before environments: existed (a `table:` with ${catalog}-style placeholders) is
+    filled from legacy_vars instead — only so the PR that migrates a table can compare it
+    with main; remove once every contract on main has environments:.
+    """
+    raw = load_yaml(path)
+    if "environments" not in raw and "table" in raw:
+        contract, values = _substitute(raw, legacy_vars or {}), dict(legacy_vars or {})
+    else:
+        contract = resolve(raw, env)
+        values = dict(raw["environments"][env].get("sources") or {})
+    sql = load_feature_sql(path, values)
+    unfilled = sorted({m for text in [*sql.values()] for m in PLACEHOLDER_RE.findall(_strip_comments(text))}
+                      - SQL_RESERVED) + sorted(set(PLACEHOLDER_RE.findall(yaml.safe_dump(contract))))
+    if unfilled:
+        names = ", ".join("${" + n + "}" for n in dict.fromkeys(unfilled))
+        raise ValueError(f"{Path(path).parent.name}: {names} not defined — add it to every environment's sources")
+    return contract, sql
 
 
 def _substitute(obj: Any, variables: dict[str, str]) -> Any:
@@ -84,6 +137,7 @@ def validate_contract(contract: dict[str, Any]) -> list[str]:
 
     if not contract["primary_keys"]:
         errors.append("primary_keys must not be empty")
+    errors += _validate_environments(contract)
 
     seen: set[str] = set()
     key_cols = set(contract["primary_keys"]) | {contract["timestamp_key"]}
@@ -108,6 +162,39 @@ def validate_contract(contract: dict[str, Any]) -> list[str]:
             if not feat.get("replaced_by"):
                 errors.append(f"feature {name}: deprecated features need replaced_by (or 'none')")
     return errors + _validate_access(contract)
+
+
+def _validate_environments(contract: dict[str, Any]) -> list[str]:
+    if not FEATURE_NAME_RE.match(str(contract["name"])):
+        return [f"name {contract['name']!r} must be lower_snake_case (it's the table name)"]
+    envs = contract["environments"]
+    if not isinstance(envs, dict):
+        return ["environments must map each environment to its catalog, schema and sources"]
+    errors = [f"environments: {env} missing (every table needs {', '.join(ENVIRONMENTS)})"
+              for env in ENVIRONMENTS if env not in envs]
+    errors += [f"environments: {env} isn't a bundle target ({', '.join(ENVIRONMENTS)})"
+               for env in envs if env not in ENVIRONMENTS]
+    source_names = None
+    for env in [e for e in ENVIRONMENTS if e in envs]:
+        e = envs[env] if isinstance(envs[env], dict) else {}
+        for field in ("catalog", "schema"):
+            if not isinstance(e.get(field), str) or not e[field].strip():
+                errors.append(f"environments.{env}: needs a {field}")
+        sources = e.get("sources")
+        if not isinstance(sources, dict) or not sources:
+            errors.append(f"environments.{env}: needs sources (name: catalog.schema.table)")
+            continue
+        for name, table in sources.items():
+            if not FEATURE_NAME_RE.match(str(name)) or name in SQL_RESERVED:
+                errors.append(f"environments.{env}.sources: {name!r} must be lower_snake_case (not 'features')")
+            if not FULL_NAME_RE.match(str(table)):
+                errors.append(f"environments.{env}.sources.{name}: {table!r} must be catalog.schema.table")
+        if source_names is None:
+            source_names = set(sources)
+        elif set(sources) != source_names:
+            errors.append(f"environments.{env}: sources {sorted(sources)} must have the same names as "
+                          f"the other environments {sorted(source_names)} (the SQL uses them)")
+    return errors
 
 
 def _validate_access(contract: dict[str, Any]) -> list[str]:
@@ -177,7 +264,8 @@ def diff_contract(base: dict[str, Any], proposed: dict[str, Any],
       deprecated  active -> deprecated                           minor bump
       removed     feature dropped                                major bump, deprecated features only
       changed     a released feature's SQL or dtype edited       never allowed
-      keys        table, keys, or the query skeleton edited      never allowed
+      keys        table moved (any environment's catalog/schema,  never allowed
+                  or its name), keys, or the query skeleton edited
       metadata    definition text, description, owner, SLA, ...  patch bump
                   (and access granted in access_list)
       revoked     access removed from access_list               minor bump, with a warning
@@ -191,8 +279,25 @@ def diff_contract(base: dict[str, Any], proposed: dict[str, Any],
     def add(feature: str, kind: str, message: str) -> None:
         changes.append({"feature": feature, "kind": kind, "message": message})
 
-    if base["table"] != proposed["table"]:
-        add("<table>", KEYS, f"table renamed {base['table']} -> {proposed['table']}")
+    if isinstance(base.get("environments"), dict) and isinstance(proposed.get("environments"), dict):
+        for env in ENVIRONMENTS:
+            old, new = base["environments"].get(env), proposed["environments"].get(env)
+            if not isinstance(new, dict):
+                continue
+            if not isinstance(old, dict):
+                add("<table>", METADATA, f"{env} environment added")
+                continue
+            old_t = f"{old.get('catalog')}.{old.get('schema')}.{base.get('name')}"
+            new_t = f"{new.get('catalog')}.{new.get('schema')}.{proposed.get('name')}"
+            if old_t != new_t:
+                add("<table>", KEYS, f"{env}: table moves {old_t} -> {new_t}")
+            if old.get("sources") != new.get("sources"):
+                add("<table>", METADATA, f"{env} sources changed")
+    else:  # main's contract predates environments: compare the environment being checked
+        if base["table"] != proposed["table"]:
+            add("<table>", KEYS, f"table renamed {base['table']} -> {proposed['table']}")
+        if list(base.get("sources", [])) != list(proposed.get("sources", [])):
+            add("<table>", METADATA, "sources changed")
     if (list(base["primary_keys"]) != list(proposed["primary_keys"])
             or base["timestamp_key"] != proposed["timestamp_key"]):
         add("<keys>", KEYS, "primary/timestamp key changed")
@@ -225,7 +330,7 @@ def diff_contract(base: dict[str, Any], proposed: dict[str, Any],
     for name in prop_feats:
         if name not in base_feats:
             add(name, ADDED, "new feature")
-    for field in ("description", "owner", "support_channel", "refresh", "freshness_sla_hours", "sources"):
+    for field in ("description", "owner", "support_channel", "refresh", "freshness_sla_hours"):
         if base.get(field) != proposed.get(field):
             add("<table>", METADATA, f"{field} changed")
     return changes

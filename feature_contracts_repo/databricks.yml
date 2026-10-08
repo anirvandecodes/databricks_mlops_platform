@@ -11,15 +11,15 @@ bundle:
   name: feature_contracts
 
 variables:
-  catalog_name:
-    description: Unity Catalog catalog holding the feature schemas.
-    default: workspace
-  raw_schema:
-    description: Source (raw) data the feature SQL reads (mock data written by producer.py).
-    default: feature_demo_raw_${bundle.target}
-  producer_schema:
-    description: Schema the shared feature tables are published to.
-    default: team_a_features_${bundle.target}
+  # Nothing here says where feature tables live: each contract decides its own catalog,
+  # schema and sources per environment (environments: in features/<table>/<table>.yaml).
+  # The jobs pass only the environment, which is the bundle target.
+  demo_source_table:
+    description: DEMO ONLY — where the mock transactions are written (customer_features' source).
+    default: workspace.feature_demo_raw_${bundle.target}.transactions
+  demo_feature_table:
+    description: DEMO ONLY — the table the demo consumer and dependency check read.
+    default: workspace.team_a_features_${bundle.target}.customer_features
 
 include:
   - ./resources/*.yml

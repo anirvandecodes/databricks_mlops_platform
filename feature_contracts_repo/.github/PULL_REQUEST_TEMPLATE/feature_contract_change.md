@@ -7,6 +7,7 @@
 
 Checklist:
 - [ ] New table: a new `features/<table>/` folder (contract + `_base.sql` + one `<name>.sql` per feature), with your team in CODEOWNERS
+- [ ] `environments:` defines dev, staging and prod (catalog, schema, sources); no table moved in place
 - [ ] New features: contract entry **and** `features/<table>/<name>.sql`
 - [ ] No released feature's SQL or type changed — new logic ships as `<name>_v2`, with `<name>` deprecated
 - [ ] Deprecated features have `sunset_date` and `replaced_by`

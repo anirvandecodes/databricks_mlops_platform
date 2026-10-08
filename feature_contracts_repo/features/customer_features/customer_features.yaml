@@ -3,7 +3,28 @@
 # (_base.sql + one <feature>.sql per feature). producer.py applies both to Unity Catalog.
 #
 # Released features are immutable: new logic ships as a new feature (<name>_v2).
-table: ${catalog}.${producer_schema}.customer_features
+name: customer_features
+# Where this table lives, and what it reads, in each environment (the bundle target the job
+# runs in). The table is <catalog>.<schema>.<name>; each source is referenced in the SQL by
+# its name, e.g. FROM ${transactions}. Every environment needs the same source names. Moving
+# a table (catalog, schema or name) is never allowed in place: publish a new table instead.
+# Prod can live anywhere, e.g. {catalog: prod_features, schema: team_a, sources: {...}}.
+environments:
+  dev:
+    catalog: workspace
+    schema: team_a_features_dev
+    sources:
+      transactions: workspace.feature_demo_raw_dev.transactions
+  staging:
+    catalog: workspace
+    schema: team_a_features_staging
+    sources:
+      transactions: workspace.feature_demo_raw_staging.transactions
+  prod:
+    catalog: workspace
+    schema: team_a_features_prod
+    sources:
+      transactions: workspace.feature_demo_raw_prod.transactions
 version: 1.0.1
 owner: team_a
 support_channel: "#team-a-features"
@@ -23,8 +44,6 @@ online: false
 #   - {principal: team_a_engineers, privileges: [SELECT, MODIFY]}
 access_list:
   - account users
-sources:
-  - ${catalog}.${raw_schema}.transactions
 
 features:
   - name: txn_count

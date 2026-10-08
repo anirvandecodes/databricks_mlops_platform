@@ -20,8 +20,7 @@ Exit code 0 = safe to merge, 1 = blocked. Approval is a code-owner review (CODEO
     python governance/check_change.py \
         --base /tmp/base/features/customer_features/customer_features.yaml \
         --proposed features/customer_features/customer_features.yaml \
-        --var catalog=workspace --var producer_schema=team_a_features_staging \
-        --var raw_schema=feature_demo_raw_staging
+        --env staging
 
 For a table that isn't on main yet, leave out --base: the contract must be valid, every
 feature's SQL must compile and the table name must be free.
@@ -49,14 +48,26 @@ ICON = {"added": "+", "deprecated": "~", "metadata": "~", "changed": "!", "remov
         "revoked": "-"}
 
 
-def run(base_path: str | None, proposed_path: str, variables: dict[str, str],
+def _load(path: str, env: str, legacy_vars: dict[str, str] | None = None):
+    """(contract, sql), or None after printing why the contract can't be loaded."""
+    try:
+        return fcu.load_table(path, env, legacy_vars)
+    except ValueError as e:
+        print(f"BLOCKED — invalid contract or SQL:\n  x {e}\n\nRESULT: BLOCKED")
+        return None
+
+
+def run(base_path: str | None, proposed_path: str, env: str,
         dependencies_of: Callable[[str], Report | None] | None = find_dependencies,
-        compile_with: Callable[[str, list[str]], str | None] | None = compile_sql) -> int:
+        compile_with: Callable[[str, list[str]], str | None] | None = compile_sql,
+        legacy_vars: dict[str, str] | None = None) -> int:
     if base_path is None:
-        return run_new(proposed_path, variables, dependencies_of, compile_with)
-    base, proposed = fcu.load_yaml(base_path, variables), fcu.load_yaml(proposed_path, variables)
-    base_sql = fcu.load_feature_sql(base_path, variables)
-    proposed_sql = fcu.load_feature_sql(proposed_path, variables)
+        return run_new(proposed_path, env, dependencies_of, compile_with)
+    loaded = _load(proposed_path, env)
+    if loaded is None:
+        return 1
+    proposed, proposed_sql = loaded
+    base, base_sql = fcu.load_table(base_path, env, legacy_vars)
 
     print(f"Feature contract check: {proposed['table']}")
     print(f"  main {base['version']}  ->  PR {proposed['version']}\n")
@@ -155,13 +166,15 @@ def run(base_path: str | None, proposed_path: str, variables: dict[str, str],
     return 1 if blocked else 0
 
 
-def run_new(proposed_path: str, variables: dict[str, str],
+def run_new(proposed_path: str, env: str,
             dependencies_of: Callable[[str], Report | None] | None = find_dependencies,
             compile_with: Callable[[str, list[str]], str | None] | None = compile_sql) -> int:
     """A feature table that isn't on main yet: valid, every feature's SQL compiles, and the
     table name isn't already taken in Unity Catalog."""
-    proposed = fcu.load_yaml(proposed_path, variables)
-    proposed_sql = fcu.load_feature_sql(proposed_path, variables)
+    loaded = _load(proposed_path, env)
+    if loaded is None:
+        return 1
+    proposed, proposed_sql = loaded
     print(f"Feature contract check: {proposed['table']} (new table, {proposed['version']})\n")
     log(f"Checking new table {proposed['table']} @ {proposed['version']}")
 
@@ -235,13 +248,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--base", help="contract in a checkout of the base branch (main); omit for a new table")
     parser.add_argument("--proposed", required=True, help="contract in the PR")
-    parser.add_argument("--var", action="append", default=[], metavar="NAME=VALUE",
-                        help="value for a ${NAME} placeholder in the contract (repeatable)")
+    parser.add_argument("--env", default="staging", choices=fcu.ENVIRONMENTS,
+                        help="environment to check the table in (where it lives: environments.<env>)")
+    parser.add_argument("--legacy-var", action="append", default=[], metavar="NAME=VALUE",
+                        help="placeholder value for a base contract from before environments: (repeatable)")
     parser.add_argument("--offline", action="store_true", help="skip the SQL compile and dependency lookups")
     args = parser.parse_args()
-    variables = dict(v.split("=", 1) for v in args.var)
-    sys.exit(run(args.base, args.proposed, variables, *((None, None) if args.offline
-                                                          else (find_dependencies, compile_sql))))
+    legacy = dict(v.split("=", 1) for v in args.legacy_var)
+    sys.exit(run(args.base, args.proposed, args.env,
+                 *((None, None) if args.offline else (find_dependencies, compile_sql)), legacy_vars=legacy))
 
 
 if __name__ == "__main__":

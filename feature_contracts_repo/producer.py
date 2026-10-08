@@ -1,17 +1,18 @@
 # Databricks notebook source
 # Producer — build every feature table under features/ from its own self-contained folder.
 #
-#   mock transactions  ->  for each features/<table>/: contract (YAML) + SQL files
-#                          ->  UC feature table (PK + TIMESERIES, CDF) + discovery comments/tags
+#   for each features/<table>/: contract (YAML) + SQL files, in this environment
+#     ->  UC feature table (PK + TIMESERIES, CDF) + discovery comments/tags
 #
 # Each folder in features/ is one feature table: a <name>.yaml contract (schema, meaning,
-# lifecycle) plus _base.sql (the query skeleton) and one <feature>.sql per feature (how it's
-# computed, inserted into _base.sql). Add a feature table by dropping in a new folder and
-# re-running — nothing else to change. Self-contained: this notebook generates its own mock
-# source data, so a run needs only the folders and a catalog/schema to write into.
+# lifecycle, and where it lives and what it reads in each environment) plus _base.sql (the
+# query skeleton) and one <feature>.sql per feature (how it's computed, inserted into
+# _base.sql). Add a feature table by dropping in a new folder and re-running — nothing else
+# to change. The job passes only the environment (the bundle target); each contract decides
+# its own catalog, schema and sources for it.
 #
-# Task 1 of the feature_tables job; task 2 (provision_access.py) then applies each
-# contract's access_list.
+# Task 2 of the feature_tables job (after the demo's mock_sources); task 3
+# (provision_access.py) then applies each contract's access_list.
 
 # COMMAND ----------
 
@@ -25,36 +26,19 @@ import re
 import sys
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
-import yaml
-
 # Workspace files: this notebook's folder is the working directory; shared/ is beside it.
 sys.path.insert(0, os.path.abspath("shared"))
 import feature_contract_utils as fcu  # noqa: E402
 
 dbutils.widgets.text("features_root", "")
-dbutils.widgets.text("catalog", "")
-dbutils.widgets.text("raw_schema", "feature_demo_raw")
-dbutils.widgets.text("producer_schema", "team_a_features")
-
-catalog = dbutils.widgets.get("catalog").strip()
-raw_schema = dbutils.widgets.get("raw_schema").strip()
-producer_schema = dbutils.widgets.get("producer_schema").strip()
+dbutils.widgets.text("environment", "")
 features_root = Path(dbutils.widgets.get("features_root").strip())
-if not catalog:
-    raise ValueError("catalog is required")
-
-variables = {"catalog": catalog, "raw_schema": raw_schema, "producer_schema": producer_schema}
-source = f"{catalog}.{raw_schema}.transactions"
+environment = dbutils.widgets.get("environment").strip()
+if environment not in fcu.ENVIRONMENTS:
+    raise ValueError(f"environment must be one of {fcu.ENVIRONMENTS}, got {environment!r}")
 
 _SPARK_TYPES = {"int": "INT", "bigint": "BIGINT", "double": "DOUBLE", "float": "FLOAT",
                 "string": "STRING", "boolean": "BOOLEAN", "date": "DATE", "timestamp": "TIMESTAMP"}
-
-def substitute(text: str) -> str:
-    for name, value in variables.items():
-        text = text.replace(f"${{{name}}}", value)
-    return text
 
 def strip_comments(s: str) -> str:
     return re.sub(r"--[^\n]*", "", s)
@@ -64,45 +48,23 @@ def q(value) -> str:
 
 # COMMAND ----------
 
-# Mock transactions, shared by every feature table: 2,000 customers, Jan–Sep 2026,
-# risky customers refund more.
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog}.{raw_schema}")
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog}.{producer_schema}")
-
-rng = np.random.default_rng(7)
-n_customers = 2_000
-days = pd.date_range("2026-01-01", "2026-09-30", freq="D")
-risk = rng.uniform(0, 1, n_customers)
-purchases = rng.poisson(((8 * (1 - risk) + 2) / 30)[:, None], (n_customers, len(days)))
-refunds = rng.poisson(((9 * risk ** 2) / 30)[:, None], (n_customers, len(days)))
-
-def expand(counts, is_refund):
-    cust, day = np.nonzero(counts)
-    cust, day = np.repeat(cust, counts[cust, day]), np.repeat(day, counts[cust, day])
-    amount = rng.lognormal(mean=3.5 - 0.5 * risk[cust], sigma=0.6)
-    seconds = rng.integers(0, 86_400, len(cust))
-    return pd.DataFrame({
-        "customer_id": cust.astype("int64") + 1,
-        "txn_ts": days.values[day] + pd.to_timedelta(seconds, unit="s"),
-        "amount": np.round(np.where(is_refund, -amount, amount), 2),
-        "is_refund": is_refund,
-    })
-
-txns = pd.concat([expand(purchases, False), expand(refunds, True)], ignore_index=True)
-txns.insert(0, "txn_id", np.arange(1, len(txns) + 1))
-spark.createDataFrame(txns).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(source)
-print(f"{source}: {len(txns):,} rows ({int(txns.is_refund.sum()):,} refunds)")
-
-# COMMAND ----------
-
 def publish(folder: Path) -> str:
     """Build one feature table from its self-contained folder (contract + SQL)."""
-    contract = yaml.safe_load(substitute(next(folder.glob("*.yaml")).read_text(encoding="utf-8")))
-    sql = {f.stem: substitute(f.read_text(encoding="utf-8")) for f in sorted(folder.glob("*.sql"))}
+    contract, sql = fcu.load_table(sorted(folder.glob("*.yaml"))[0], environment)
+    problems = fcu.validate_contract(contract) + fcu.validate_sql(contract, sql)
+    if problems:
+        raise ValueError(f"features/{folder.name}: " + "; ".join(problems))
 
     table = contract["table"]
+    catalog, schema = table.split(".")[:2]
+    if not spark.catalog.databaseExists(f"{catalog}.{schema}"):
+        if not any(r[0] == catalog for r in spark.sql("SHOW CATALOGS").collect()):
+            raise ValueError(f"{table}: catalog {catalog} doesn't exist in this workspace (the producer "
+                             f"never creates catalogs; ask the platform team, or fix environments.{environment})")
+        spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}")
+
     key, ts_key = contract["primary_keys"][0], contract["timestamp_key"]
-    print(f"\n=== {table} @ contract {contract['version']} ===")
+    print(f"\n=== {table} ({environment}) @ contract {contract['version']} ===")
     print("Features:", ", ".join(f"{f['name']}[{f['status']}]" for f in contract["features"]))
 
     # Feature logic: _base.sql with each feature's expression inserted (point-in-time
