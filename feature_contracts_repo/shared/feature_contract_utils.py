@@ -5,6 +5,7 @@
 # Plain functions only — no top-level spark/dbutils — so the same logic runs in the
 # workspace, in pytest, and in the PR gate (governance/check_change.py).
 
+import functools
 import hashlib
 import re
 from pathlib import Path
@@ -24,7 +25,7 @@ ODCS_FIELDS = {
     "owner": "team (a member with role: owner)", "support_channel": "support", "description": "description.purpose",
     "primary_keys": "a primaryKey property", "timestamp_key": "a property with customProperty timestampKey: true",
     "refresh": "slaProperties frequency", "freshness_sla_hours": "slaProperties latency",
-    "features": "schema[0].properties", "dtype": "physicalType", "definition": "description",
+    "features": "schema[0].properties (at least one feature besides the keys)", "dtype": "physicalType", "definition": "description",
     "status": "customProperty status", "since": "customProperty since",
 }
 BASE_SQL = "_base"  # the query skeleton in a table's features/ folder; the rest are <feature>.sql
@@ -66,32 +67,41 @@ ACCESS_LEVELS = {"read": ["SELECT"], "write": ["SELECT", "MODIFY"]}  # ODCS role
 _HOURS = {"h": 1, "hour": 1, "hours": 1, "d": 24, "day": 24, "days": 24}
 
 
+def _dicts(value: Any) -> list[dict[str, Any]]:
+    """The objects in an ODCS list; anything else (a malformed entry) is skipped here and
+    reported by the ODCS schema check."""
+    return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
+
+
 def _custom(obj: dict[str, Any]) -> dict[str, Any]:
     """An ODCS object's customProperties as {property: value}."""
-    items = obj.get("customProperties") if isinstance(obj, dict) else None
-    return {c.get("property"): c.get("value") for c in items or [] if isinstance(c, dict)}
+    return {c.get("property"): c.get("value") for c in _dicts(obj.get("customProperties"))} if isinstance(obj, dict) else {}
 
 
 def from_odcs(odcs: dict[str, Any]) -> dict[str, Any]:
     """The flat contract (see above) for an ODCS data contract. Lenient: whatever is missing
-    is left out, for validate_contract to report. A contract that isn't ODCS (no apiVersion)
-    is returned as is (bare access_list names get SELECT) — only so the PR that migrates a
-    table can compare it with main; remove once every contract on main is ODCS."""
+    or malformed is left out, for validate_contract (and the ODCS schema check) to report.
+    A contract that isn't ODCS (no apiVersion) is returned as is (bare access_list names get
+    SELECT) — only so the PR that migrates a table can compare it with main; remove once
+    every contract on main is ODCS."""
+    if not isinstance(odcs, dict):
+        return {"problems": ["the contract must be a YAML mapping (an ODCS data contract)"], "features": []}
     if "apiVersion" not in odcs:
         if isinstance(odcs.get("access_list"), list):
             odcs = {**odcs, "access_list": [{"principal": e, "privileges": ["SELECT"]} if isinstance(e, str) else e
                                             for e in odcs["access_list"]]}
         return odcs
-    c: dict[str, Any] = {"id": odcs.get("id"), "version": odcs.get("version"), "problems": []}
-    tables = odcs.get("schema") or []
-    if len(tables) != 1 or not isinstance(tables[0], dict):
+    c: dict[str, Any] = {"id": odcs.get("id"), "version": odcs.get("version"), "status": odcs.get("status"),
+                         "problems": []}
+    tables = odcs.get("schema")
+    if not isinstance(tables, list) or len(tables) != 1 or not isinstance(tables[0], dict):
         c["problems"].append("schema must have exactly one entry: the feature table")
-    table = tables[0] if tables and isinstance(tables[0], dict) else {}
+    table = (_dicts(tables) or [{}])[0]
     if table.get("name"):
         c["name"] = table["name"]
 
     envs: dict[str, Any] = {}
-    for server in odcs.get("servers") or []:
+    for server in _dicts(odcs.get("servers")):
         env = server.get("environment")
         if env in envs:
             c["problems"].append(f"servers: more than one {env} server")
@@ -100,18 +110,22 @@ def from_odcs(odcs: dict[str, Any]) -> dict[str, Any]:
     if envs:
         c["environments"] = envs
 
-    owners = [m.get("username") for m in odcs.get("team") or [] if m.get("role") == "owner"]
+    owners = [m.get("username") for m in _dicts(odcs.get("team")) if m.get("role") == "owner"]
     if len(owners) == 1:
         c["owner"] = owners[0]
     elif owners:
         c["problems"].append(f"team: one member with role owner, not {len(owners)}")
-    if odcs.get("support"):
-        c["support_channel"] = odcs["support"][0].get("channel")
+    support = _dicts(odcs.get("support"))
+    if support and support[0].get("channel"):
+        c["support_channel"] = support[0]["channel"]
     if isinstance(odcs.get("description"), dict) and odcs["description"].get("purpose"):
         c["description"] = odcs["description"]["purpose"]
 
-    props = [p for p in table.get("properties") or [] if isinstance(p, dict)]
-    keys = sorted((p for p in props if p.get("primaryKey")), key=lambda p: p.get("primaryKeyPosition", -1))
+    props = [p for p in _dicts(table.get("properties")) if p.get("name")]
+    # Keys in primaryKeyPosition order; keys without a position follow, in file order.
+    keys = sorted((p for p in props if p.get("primaryKey")),
+                  key=lambda p: (not isinstance(p.get("primaryKeyPosition"), int) or p["primaryKeyPosition"] < 1,
+                                 p.get("primaryKeyPosition") if isinstance(p.get("primaryKeyPosition"), int) else 0))
     if keys:
         c["primary_keys"] = [p["name"] for p in keys]
     ts = [p["name"] for p in props if _custom(p).get("timestampKey") is True]
@@ -119,51 +133,90 @@ def from_odcs(odcs: dict[str, Any]) -> dict[str, Any]:
         c["timestamp_key"] = ts[0]
     elif ts:
         c["problems"].append(f"schema: one timestampKey property, not {len(ts)} ({', '.join(ts)})")
-    c["features"] = []
+    features = []
     for p in props:
-        if p.get("primaryKey") or p.get("name") in ts:
+        if p.get("primaryKey") or p["name"] in ts:
             continue
         custom = _custom(p)
-        feat = {"name": p.get("name"), "dtype": p.get("physicalType"), "definition": p.get("description"),
+        feat = {"name": p["name"], "dtype": p.get("physicalType"), "definition": p.get("description"),
                 "status": custom.get("status"), "since": custom.get("since"),
                 "sunset_date": custom.get("sunsetDate"), "replaced_by": custom.get("replacedBy")}
-        c["features"].append({k: v for k, v in feat.items() if v is not None})
+        features.append({k: v for k, v in feat.items() if v is not None})
+    if features:  # a table needs at least one feature: no features -> "missing field"
+        c["features"] = features
 
-    sla = {s.get("property"): s for s in odcs.get("slaProperties") or [] if isinstance(s, dict)}
+    sla = {s.get("property"): s for s in _dicts(odcs.get("slaProperties"))}
     if "frequency" in sla:
         c["refresh"] = f"{sla['frequency'].get('value')}{sla['frequency'].get('unit') or ''}"
     if "latency" in sla:
         value, unit = sla["latency"].get("value"), str(sla["latency"].get("unit", "")).lower()
-        if isinstance(value, (int, float)) and unit in _HOURS:
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and unit in _HOURS:
             c["freshness_sla_hours"] = value * _HOURS[unit]
         else:
             c["problems"].append("slaProperties latency: needs a number of hours (unit h) or days (unit d)")
 
     if "roles" in odcs:
-        roles = odcs["roles"]
-        c["access_list"] = roles if not isinstance(roles, list) else [
-            {"principal": r.get("role"),
-             "privileges": ACCESS_LEVELS.get(str(r.get("access", "read")).lower(), [r.get("access")])}
-            if isinstance(r, dict) else r for r in roles]
+        if not isinstance(odcs["roles"], list):
+            c["problems"].append("roles must be a list of {role, access}")
+        c["access_list"] = []
+        for r in odcs["roles"] if isinstance(odcs["roles"], list) else []:
+            if not isinstance(r, dict):
+                c["problems"].append(f"roles: {r!r} must be {{role, access}}")
+                continue
+            access = r.get("access")
+            privileges = ACCESS_LEVELS.get(access) if isinstance(access, str) else None
+            if privileges is None:
+                c["problems"].append(f"roles {r.get('role')}: access must be one of {', '.join(ACCESS_LEVELS)}, "
+                                     f"not {access!r}" if access is not None else
+                                     f"roles {r.get('role')}: needs access ({', '.join(ACCESS_LEVELS)})")
+            c["access_list"].append({"principal": r.get("role"), "privileges": list(privileges or [])})
     custom = _custom(odcs)
-    c["changelog"] = custom.get("changelog") or []
+    c["changelog"] = custom.get("changelog") if isinstance(custom.get("changelog"), list) else []
     if "online" in custom:
         c["online"] = custom["online"]
     return c
 
 
-def odcs_errors(path: str | Path) -> list[str]:
-    """Where the contract file breaks the ODCS v3.0.1 JSON schema (empty list = compliant)."""
+def _is_uri(value: object) -> bool:
+    if not isinstance(value, str):
+        return True
+    from urllib.parse import urlsplit
+    parts = urlsplit(value)
+    return bool(parts.scheme) and bool(parts.netloc or parts.path) and not any(ch.isspace() for ch in value)
+
+
+def _is_datetime(value: object) -> bool:
+    if not isinstance(value, str):
+        return True
+    import datetime
+    try:
+        datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return "T" in value.upper()
+
+
+@functools.lru_cache(maxsize=1)
+def _odcs_validator():
+    """The ODCS v3.0.1 JSON schema validator, built once. uri and date-time are checked here
+    with the standard library (jsonschema skips them unless optional packages are installed)."""
     import json
 
     import jsonschema  # only the PR gate needs it
 
-    with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    validator = jsonschema.Draft201909Validator(json.loads(ODCS_SCHEMA.read_text(encoding="utf-8")),
-                                                format_checker=jsonschema.FormatChecker())
+    checker = jsonschema.FormatChecker()
+    checker.checks("uri")(_is_uri)
+    checker.checks("date-time")(_is_datetime)
+    return jsonschema.Draft201909Validator(json.loads(ODCS_SCHEMA.read_text(encoding="utf-8")), format_checker=checker)
+
+
+def odcs_errors(contract: str | Path | dict[str, Any]) -> list[str]:
+    """Where a contract (a file, or its parsed YAML) breaks the ODCS v3.0.1 JSON schema
+    (empty list = compliant)."""
+    if isinstance(contract, (str, Path)):
+        contract = _read_yaml(contract)
     return [f"ODCS {'.'.join(map(str, e.absolute_path)) or '<root>'}: {e.message}"
-            for e in sorted(validator.iter_errors(data), key=lambda e: list(map(str, e.absolute_path)))]
+            for e in sorted(_odcs_validator().iter_errors(contract), key=lambda e: list(map(str, e.absolute_path)))]
 
 
 PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -171,11 +224,18 @@ SQL_RESERVED = {"features"}  # ${features} in _base.sql is where the feature exp
 FULL_NAME_RE = re.compile(r"^[^.\s]+\.[^.\s]+\.[^.\s]+$")
 
 
+def _read_yaml(path: str | Path) -> Any:
+    """A YAML file's content; a syntax error is a ValueError naming the file."""
+    with open(path, "r", encoding="utf-8") as f:
+        try:
+            return yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            raise ValueError(f"{Path(path).name} isn't valid YAML: {e}") from None
+
+
 def load_yaml(path: str | Path, variables: dict[str, str] | None = None) -> dict[str, Any]:
     """Load a contract (from_odcs), substituting ${var} placeholders in string values."""
-    with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    return _substitute(from_odcs(data), variables or {})
+    return _substitute(from_odcs(_read_yaml(path) or {}), variables or {})
 
 
 def resolve(contract: dict[str, Any], env: str) -> dict[str, Any]:
@@ -320,6 +380,7 @@ def _validate_environments(contract: dict[str, Any]) -> list[str]:
 
 
 def _validate_access(contract: dict[str, Any]) -> list[str]:
+    """Roles problems from_odcs couldn't already report (bad access values are reported there)."""
     if "access_list" not in contract:
         return []
     if not isinstance(contract["access_list"], list):
@@ -327,15 +388,14 @@ def _validate_access(contract: dict[str, Any]) -> list[str]:
     errors, seen = [], set()
     for entry in contract["access_list"]:
         if not isinstance(entry, dict):
-            errors.append(f"roles: {entry!r} must be {{role, access}}")
-            continue
-        principal, privileges = entry.get("principal"), entry.get("privileges")
+            continue  # reported by from_odcs
+        principal = entry.get("principal")
         if not isinstance(principal, str) or not principal.strip():
             errors.append("roles: every entry needs a role (the principal)")
             continue
-        bad = [p for p in privileges or [] if str(p).upper() not in ACCESS_PRIVILEGES]
-        if bad or not privileges:
-            errors.append(f"roles {principal}: access {', '.join(map(str, bad))} must be one of {', '.join(ACCESS_LEVELS)}")
+        bad = [p for p in entry.get("privileges") or [] if str(p).upper() not in ACCESS_PRIVILEGES]
+        if bad:
+            errors.append(f"roles {principal}: privileges {', '.join(map(str, bad))} not one of {', '.join(ACCESS_PRIVILEGES)}")
         if principal in seen:
             errors.append(f"roles {principal}: listed twice")
         seen.add(principal)
@@ -446,7 +506,7 @@ def diff_contract(base: dict[str, Any], proposed: dict[str, Any],
     for name in prop_feats:
         if name not in base_feats:
             add(name, ADDED, "new feature")
-    for field in ("description", "owner", "support_channel", "refresh", "freshness_sla_hours"):
+    for field in ("description", "owner", "support_channel", "refresh", "freshness_sla_hours", "online", "status"):
         if base.get(field) != proposed.get(field):
             add("<table>", METADATA, f"{field} changed")
     return changes
@@ -456,6 +516,9 @@ def change_problems(base: dict[str, Any], proposed: dict[str, Any],
                     changes: list[dict[str, str]]) -> list[str]:
     """Rule breaks that block the PR, whoever depends on the table."""
     problems = []
+    if base.get("id") and base.get("id") != proposed.get("id"):
+        problems.append(f"contract id changed {base['id']} -> {proposed.get('id')}: the id identifies this "
+                        "contract for good, keep it (a new table gets a new contract and id)")
     base_feats = {f["name"]: f for f in base["features"]}
     for c in changes:
         if c["kind"] == KEYS:

@@ -465,6 +465,88 @@ def test_odcs_structure_problems(edit, error):
     assert any(error in e for e in fcu.validate_contract(fcu.from_odcs(doc)))
 
 
+@pytest.mark.parametrize("edit", [
+    lambda d: d.__setitem__("servers", ["dev"]),
+    lambda d: d.__setitem__("team", ["team_a"]),
+    lambda d: d.__setitem__("support", {"channel": "x"}),
+    lambda d: d.__setitem__("schema", {"name": "t"}),
+    lambda d: d["schema"][0].__setitem__("properties", ["txn_count"]),
+    lambda d: d.__setitem__("roles", "everyone"),
+    lambda d: d.__setitem__("slaProperties", [7]),
+], ids=["servers", "team", "support", "schema", "properties", "roles", "sla"])
+def test_malformed_contract_is_blocked_not_a_crash(tmp_path, base, capsys, edit):
+    path = Path(_write(tmp_path / "pr" / "features", base))
+    doc = yaml.safe_load(path.read_text())
+    edit(doc)
+    path.write_text(yaml.safe_dump(doc))
+    fcu.from_odcs(doc)  # never raises
+    assert check_change.run(None, str(path), ENV, None, COMPILES) == 1
+    assert "BLOCKED — invalid contract" in capsys.readouterr().out
+    assert check_all.run_all(tmp_path / "nothing", tmp_path / "pr", ENV, None, COMPILES) == 1
+
+
+def test_invalid_yaml_is_blocked_not_a_crash(tmp_path, base, capsys):
+    path = Path(_write(tmp_path / "pr" / "features", base))
+    path.write_text("schema: [unclosed\n")
+    assert check_change.run(None, str(path), ENV, None, COMPILES) == 1
+    assert "isn't valid YAML" in capsys.readouterr().out
+    assert check_all.run_all(tmp_path / "nothing", tmp_path / "pr", ENV, None, COMPILES) == 1
+
+
+def test_a_table_needs_at_least_one_feature():
+    doc = yaml.safe_load(CONTRACT.read_text())
+    doc["schema"][0]["properties"] = [p for p in doc["schema"][0]["properties"]
+                                      if p.get("primaryKey") or p["name"] == "as_of_date"]
+    assert f"missing field: {fcu.ODCS_FIELDS['features']}" in fcu.validate_contract(fcu.from_odcs(doc))
+
+
+def test_contract_id_never_changes(base):
+    contract = _bump(copy.deepcopy(base[0]), "patch")
+    contract["id"] = "a-new-id"
+    contract["support_channel"] = "#elsewhere"
+    assert any("contract id changed" in p for p in _problems(base, (contract, base[1])))
+
+
+def test_online_and_status_changes_are_metadata(base):
+    contract = _bump(copy.deepcopy(base[0]), "patch")
+    contract.update(online=not base[0].get("online"), status="deprecated")
+    changes = fcu.diff_contract(base[0], contract)
+    assert {c["message"] for c in changes} == {"online changed", "status changed"}
+    assert fcu.change_problems(base[0], contract, changes) == []
+
+
+def test_primary_keys_follow_their_position_then_file_order():
+    doc = {"apiVersion": "v3.0.1", "schema": [{"name": "t", "properties": [
+        {"name": "region", "primaryKey": True},
+        {"name": "day", "primaryKey": True, "primaryKeyPosition": 2},
+        {"name": "customer_id", "primaryKey": True, "primaryKeyPosition": 1},
+        {"name": "channel", "primaryKey": True}]}]}
+    assert fcu.from_odcs(doc)["primary_keys"] == ["customer_id", "day", "region", "channel"]
+
+
+def test_odcs_validator_is_built_once():
+    assert fcu._odcs_validator() is fcu._odcs_validator()
+
+
+@pytest.mark.parametrize("edit, error", [
+    (lambda d: d["servers"].append({"server": "files", "type": "s3", "location": "not a url"}), "'not a url' is not a 'uri'"),
+    (lambda d: d["team"][0].__setitem__("dateIn", "last week"), "'last week' is not a 'date'"),
+    (lambda d: d.__setitem__("contractCreatedTs", "yesterday"), "is not a 'date-time'"),
+    (lambda d: d.__setitem__("contractCreatedTs", "2026-10-09"), "is not a 'date-time'"),
+])
+def test_odcs_formats_are_checked(edit, error):
+    doc = yaml.safe_load(CONTRACT.read_text())
+    edit(doc)
+    assert any(error in e for e in fcu.odcs_errors(doc))
+
+
+def test_valid_odcs_formats_pass():
+    doc = yaml.safe_load(CONTRACT.read_text())
+    doc["contractCreatedTs"] = "2026-10-09T04:00:00Z"
+    doc["servers"].append({"server": "files", "type": "s3", "location": "s3://bucket/features/"})
+    assert fcu.odcs_errors(doc) == []
+
+
 # --- SQL and UC metadata derived from the table -------------------------------------------
 
 def test_features_sql_inserts_every_expression_outside_comments(base):
@@ -498,10 +580,14 @@ def test_sql_strings_are_escaped(base):
 # --- roles: who can read the table ----------------------------------------------------------
 
 def _with_access(contract: dict, roles: list | str, part: str | None = None) -> dict:
-    """The contract with these ODCS roles (a name means {role: name, access: read})."""
+    """The contract with these ODCS roles (a name means {role: name, access: read}), plus any
+    problems from_odcs found in them."""
     c = copy.deepcopy(contract)
-    roles = roles if not isinstance(roles, list) else [{"role": r} if isinstance(r, str) else r for r in roles]
-    c["access_list"] = fcu.from_odcs({"apiVersion": "v3.0.1", "roles": roles})["access_list"]
+    roles = roles if not isinstance(roles, list) else [{"role": r, "access": "read"} if isinstance(r, str) else r
+                                                       for r in roles]
+    flat = fcu.from_odcs({"apiVersion": "v3.0.1", "roles": roles})
+    c["access_list"] = flat["access_list"]
+    c["problems"] = c.get("problems", []) + [p for p in flat["problems"] if p.startswith("roles")]
     return _bump(c, part) if part else c
 
 
@@ -512,10 +598,14 @@ def test_read_gets_select_and_write_gets_modify(base):
 
 
 @pytest.mark.parametrize("access, error", [
-    ([{"role": "team_b", "access": "drop"}], "must be one of read, write"),
+    ([{"role": "team_b", "access": "drop"}], "access must be one of read, write, not 'drop'"),
+    ([{"role": "team_b", "access": "modify"}], "access must be one of read, write, not 'modify'"),
+    ([{"role": "team_b", "access": "SELECT"}], "access must be one of read, write"),
+    ([{"role": "team_b"}], "team_b: needs access (read, write)"),
     (["team_b", "team_b"], "listed twice"),
     ([{"access": "read"}], "needs a role"),
     ("team_b", "must be a list"),
+    (["team_b", 7], "7 must be {role, access}"),
 ])
 def test_access_list_validation(base, access, error):
     assert any(error in e for e in fcu.validate_contract(_with_access(base[0], access)))

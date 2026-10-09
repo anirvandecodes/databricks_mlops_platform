@@ -50,18 +50,25 @@ ICON = {"added": "+", "deprecated": "~", "metadata": "~", "changed": "!", "remov
         "revoked": "-"}
 
 
-def _load(path: str, env: str, legacy_vars: dict[str, str] | None = None):
-    """(contract, sql), or None after printing why the contract can't be loaded."""
+def _load(path: str, env: str):
+    """The PR's (contract, sql), or None after printing why it can't be loaded. The ODCS
+    schema is checked first, so a malformed contract is reported, not half-read."""
     try:
-        return fcu.load_table(path, env, legacy_vars)
+        problems = fcu.odcs_errors(path)
+        if not problems:
+            return fcu.load_table(path, env)
     except ValueError as e:
-        print(f"BLOCKED — invalid contract or SQL:\n  x {e}\n\nRESULT: BLOCKED")
-        return None
+        problems = [str(e)]
+    print("BLOCKED — invalid contract or SQL:")
+    for p in problems:
+        print(f"  x {p}")
+    print("\nRESULT: BLOCKED")
+    return None
 
 
-def _validate(path: str, contract: dict[str, Any], sql: dict[str, str]) -> list[str]:
-    """ODCS schema first, then this repo's contract rules, then the SQL files."""
-    return fcu.odcs_errors(path) or fcu.validate_contract(contract) or fcu.validate_sql(contract, sql)
+def _validate(contract: dict[str, Any], sql: dict[str, str]) -> list[str]:
+    """This repo's contract rules, then the SQL files (_load already checked the ODCS schema)."""
+    return fcu.validate_contract(contract) or fcu.validate_sql(contract, sql)
 
 
 def run(base_path: str | None, proposed_path: str, env: str,
@@ -81,7 +88,7 @@ def run(base_path: str | None, proposed_path: str, env: str,
     log(f"Checking {proposed['table']}: main {base['version']} -> PR {proposed['version']}")
 
     log("Step 1/5  Are the contract (ODCS) and its SQL valid, one SQL file per feature?")
-    problems = _validate(proposed_path, proposed, proposed_sql)
+    problems = _validate(proposed, proposed_sql)
     log("          " + ("no: " + "; ".join(problems) if problems else "yes"))
     if problems:
         print("BLOCKED — invalid contract or SQL:")
@@ -186,7 +193,7 @@ def run_new(proposed_path: str, env: str,
     log(f"Checking new table {proposed['table']} @ {proposed['version']}")
 
     log("Step 1/3  Are the contract (ODCS) and its SQL valid, one SQL file per feature?")
-    problems = _validate(proposed_path, proposed, proposed_sql)
+    problems = _validate(proposed, proposed_sql)
     if not problems and not any(str(e.get("version")) == str(proposed["version"])
                                 for e in proposed.get("changelog", [])):
         problems = [f"changelog has no entry for {proposed['version']}"]
