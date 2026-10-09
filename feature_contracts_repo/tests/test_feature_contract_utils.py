@@ -323,14 +323,14 @@ def test_unknown_columns_count_as_every_column(base):
 
 # --- check_change.py end to end (the PR gate) ---------------------------------------------
 
-def _write(tmp_path, table, odcs=True):
-    """features/customer_features/ with the contract.yaml (as ODCS, unless odcs=False) beside
-    its *.sql, as in the repo."""
+def _write(tmp_path, table):
+    """features/customer_features/ with the contract.yaml (as ODCS) beside its *.sql, as in
+    the repo."""
     contract, sql = table
     folder = tmp_path / "customer_features"
     folder.mkdir(parents=True)
     path = folder / "customer_features.yaml"
-    path.write_text(yaml.safe_dump(_odcs(contract) if odcs else contract))
+    path.write_text(yaml.safe_dump(_odcs(contract)))
     for name, text in sql.items():
         (folder / f"{name}.sql").write_text(text)
     return str(path)
@@ -437,12 +437,16 @@ def test_gate_blocks_non_odcs_fields_in_a_feature(tmp_path, base, capsys):
     assert "'dtype' was unexpected" in capsys.readouterr().out
 
 
-def test_main_before_odcs_compares_as_unchanged(tmp_path, base):
-    """main's flat contract (before ODCS) against the same contract written as ODCS."""
-    flat = {k: v for k, v in base[0].items() if k not in ("table", "sources", "environment", "problems", "id")}
-    flat["access_list"] = [e["principal"] for e in flat["access_list"]]  # bare names, as main had them
-    old = fcu.load_table(_write(tmp_path, (flat, base[1]), odcs=False), ENV)
-    assert fcu.diff_contract(old[0], base[0], old[1], base[1]) == []
+
+
+def test_a_contract_that_isnt_odcs_is_rejected(tmp_path, base, capsys):
+    """The flat format from before ODCS (environments:, access_list:, features:)."""
+    flat = {k: v for k, v in base[0].items() if k not in ("table", "sources", "environment", "problems")}
+    assert any("must be an ODCS v3.0.1 data contract" in e for e in fcu.validate_contract(fcu.from_odcs(flat)))
+    path = Path(_write(tmp_path / "pr", base))
+    path.write_text(yaml.safe_dump(flat))
+    assert check_change.run(None, str(path), ENV, None, COMPILES) == 1
+    assert "'apiVersion' is a required property" in capsys.readouterr().out
 
 
 def test_contract_ids_must_be_unique(tmp_path, base, capsys):
@@ -784,15 +788,6 @@ def test_repointing_a_source_is_a_patch(base):
     assert fcu.change_problems(base[0], contract, changes) == []
 
 
-def test_legacy_base_contract_compares_as_unchanged(tmp_path, base):
-    """main's contract from before environments: (table: ${catalog}.${producer_schema}...)."""
-    legacy = {k: v for k, v in base[0].items() if k not in ("environments", "name", "table", "sources", "environment")}
-    legacy.update(table="${catalog}.${producer_schema}.customer_features", sources=["${catalog}.${raw_schema}.transactions"])
-    legacy_sql = {**base[1], "_base": base[1]["_base"].replace(base[0]["sources"][0], "${catalog}.${raw_schema}.transactions")}
-    path = _write(tmp_path, (legacy, legacy_sql), odcs=False)
-    old = fcu.load_table(path, ENV, {"catalog": "workspace", "producer_schema": "team_a_features_staging",
-                                     "raw_schema": "feature_demo_raw_staging"})
-    assert fcu.diff_contract(old[0], base[0], old[1], base[1]) == []
 
 
 def test_two_contracts_cannot_share_a_table_in_any_environment(tmp_path, base, capsys):
