@@ -13,7 +13,7 @@ apiVersion: v3.0.1
 kind: DataContract
 id: 7c1e4f52-3b8a-4d6e-9f21-5a0c8b7d3e14  # unique per contract: new tables get a new UUID
 name: customer_features
-version: 1.0.2
+version: 1.1.0
 status: active
 description:
   purpose: >
@@ -114,6 +114,13 @@ schema:
         customProperties:
           - {property: status, value: active}
           - {property: since, value: 1.0.0}
+      - name: avg_txn_amount
+        logicalType: number
+        physicalType: double
+        description: Average purchase amount, excluding refunds (0 if none).
+        customProperties:
+          - {property: status, value: active}
+          - {property: since, value: 1.1.0}
 
 # ODCS §Service-Level Agreement (SLA):
 # https://bitol-io.github.io/open-data-contract-standard/v3.0.1/#service-level-agreement-sla
@@ -153,3 +160,6 @@ customProperties:
       - version: 1.0.2
         date: "2026-10-09"
         change: Contract rewritten in ODCS v3.0.1 (refresh is now slaProperties frequency, 7d).
+      - version: 1.1.0
+        date: "2026-10-09"
+        change: Add avg_txn_amount.
