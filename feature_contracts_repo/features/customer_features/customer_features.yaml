@@ -1,71 +1,155 @@
-# Feature contract — owned by Team A. What this table promises: schema, meaning, ownership
-# and each feature's lifecycle. How each feature is computed is its SQL file in this folder
-# (_base.sql + one <feature>.sql per feature). producer.py applies both to Unity Catalog.
+# Feature contract — owned by Team A, written in the Open Data Contract Standard (ODCS v3.0.1,
+# https://bitol-io.github.io/open-data-contract-standard/v3.0.1/). What this table promises:
+# schema, meaning, ownership and each feature's lifecycle. How each feature is computed is its
+# SQL file in this folder (_base.sql + one <feature>.sql per feature). producer.py applies both
+# to Unity Catalog. Anything ODCS has no field for is a customProperty.
+#
+# Each block below names the ODCS section it follows (ODCS §...: link to that section).
 #
 # Released features are immutable: new logic ships as a new feature (<name>_v2).
+
+# ODCS §Fundamentals: https://bitol-io.github.io/open-data-contract-standard/v3.0.1/#fundamentals
+apiVersion: v3.0.1
+kind: DataContract
+id: 7c1e4f52-3b8a-4d6e-9f21-5a0c8b7d3e14  # unique per contract: new tables get a new UUID
 name: customer_features
+version: 1.0.2
+status: active
+description:
+  purpose: >
+    Customer-level transaction behaviour features, one row per customer over all of the
+    customer's transactions.
+
+# ODCS §Team: https://bitol-io.github.io/open-data-contract-standard/v3.0.1/#team
+team:
+  - username: team_a
+    role: owner
+
+# ODCS §Support & Communication Channels:
+# https://bitol-io.github.io/open-data-contract-standard/v3.0.1/#support-and-communication-channels
+support:
+  - channel: "#team-a-features"
+    tool: slack
+    url: https://slack.com/app_redirect?channel=team-a-features
+
+# ODCS §Infrastructure & Servers (Databricks server):
+# https://bitol-io.github.io/open-data-contract-standard/v3.0.1/#databricks-server
 # Where this table lives, and what it reads, in each environment (the bundle target the job
-# runs in). The table is <catalog>.<schema>.<name>; each source is referenced in the SQL by
-# its name, e.g. FROM ${transactions}. Every environment needs the same source names. Moving
-# a table (catalog, schema or name) is never allowed in place: publish a new table instead.
-# Prod can live anywhere, e.g. {catalog: prod_features, schema: team_a, sources: {...}}.
-environments:
-  dev:
+# runs in): one databricks server per environment. The table is <catalog>.<schema>.<table>,
+# <table> being the schema entry's name below. Each source is referenced in the SQL by its
+# name, e.g. FROM ${transactions}; every environment needs the same source names. Moving a
+# table (catalog, schema or name) is never allowed in place: publish a new table instead.
+servers:
+  - server: dev
+    type: databricks
+    environment: dev
     catalog: workspace
     schema: team_a_features_dev
-    sources:
-      transactions: workspace.feature_demo_raw_dev.transactions
-  staging:
+    customProperties:
+      - property: sources
+        value:
+          transactions: workspace.feature_demo_raw_dev.transactions
+  - server: staging
+    type: databricks
+    environment: staging
     catalog: workspace
     schema: team_a_features_staging
-    sources:
-      transactions: workspace.feature_demo_raw_staging.transactions
-  prod:
+    customProperties:
+      - property: sources
+        value:
+          transactions: workspace.feature_demo_raw_staging.transactions
+  - server: prod
+    type: databricks
+    environment: prod
     catalog: workspace
     schema: team_a_features_prod
-    sources:
-      transactions: workspace.feature_demo_raw_prod.transactions
-version: 1.0.1
-owner: team_a
-support_channel: "#team-a-features"
-description: >
-  Customer-level transaction behaviour features, one row per customer over all of the
-  customer's transactions.
-primary_keys: [customer_id]
-timestamp_key: as_of_date
-refresh: weekly
-freshness_sla_hours: 192
-online: false
+    customProperties:
+      - property: sources
+        value:
+          transactions: workspace.feature_demo_raw_prod.transactions
+
+# ODCS §Schema: https://bitol-io.github.io/open-data-contract-standard/v3.0.1/#schema
+# (object level: #object-level, property level: #property-level)
+# The table: its keys (primaryKey, and the timestampKey column), then one property per
+# feature. physicalType is the feature's type (int, bigint, double, float, string, boolean,
+# date, timestamp). status is active or deprecated; a deprecated feature also needs a
+# sunsetDate and replacedBy (another feature, or 'none').
+schema:
+  - name: customer_features
+    physicalType: table
+    logicalType: object
+    dataGranularityDescription: One row per customer per as_of_date.
+    properties:
+      - name: customer_id
+        logicalType: integer
+        physicalType: bigint
+        primaryKey: true
+        primaryKeyPosition: 1
+        required: true
+      - name: as_of_date
+        logicalType: date
+        physicalType: date
+        required: true
+        customProperties:
+          - property: timestampKey
+            value: true
+      - name: txn_count
+        logicalType: integer
+        physicalType: int
+        description: Total number of transactions, including refunds.
+        customProperties:
+          - {property: status, value: active}
+          - {property: since, value: 1.0.0}
+      - name: txn_amount_sum
+        logicalType: number
+        physicalType: double
+        description: Sum of all transaction amounts (refunds negative).
+        customProperties:
+          - {property: status, value: active}
+          - {property: since, value: 1.0.0}
+      - name: days_since_last_txn
+        logicalType: integer
+        physicalType: int
+        description: Days since the customer's last transaction (999 if none).
+        customProperties:
+          - {property: status, value: active}
+          - {property: since, value: 1.0.0}
+
+# ODCS §Service-Level Agreement (SLA):
+# https://bitol-io.github.io/open-data-contract-standard/v3.0.1/#service-level-agreement-sla
+# Refreshed every 7 days; data is never more than 192 hours old.
+slaDefaultElement: customer_features.as_of_date
+slaProperties:
+  - property: frequency
+    value: 7
+    unit: d
+  - property: latency
+    value: 192
+    unit: h
+
+# ODCS §Roles: https://bitol-io.github.io/open-data-contract-standard/v3.0.1/#roles
 # Who can use this table. The feature_tables job makes Unity Catalog match this exactly:
-# it grants what's listed and revokes SELECT/MODIFY from anyone not listed (the table owner
-# keeps access). A bare name gets SELECT; give privileges for more. Groups must exist in
-# the account. Real setups list team groups, e.g.
-#   - team_b_data_science
-#   - {principal: team_a_engineers, privileges: [SELECT, MODIFY]}
-access_list:
-  - account users
+# access read gets SELECT, write gets SELECT and MODIFY, and SELECT/MODIFY is revoked from
+# anyone not listed (the table owner keeps access). Groups must exist in the account. Real
+# setups list team groups, e.g.
+#   - {role: team_b_data_science, access: read}
+#   - {role: team_a_engineers, access: write}
+roles:
+  - role: account users
+    access: read
 
-features:
-  - name: txn_count
-    dtype: int
-    definition: Total number of transactions, including refunds.
-    status: active
-    since: 1.0.0
-  - name: txn_amount_sum
-    dtype: double
-    definition: Sum of all transaction amounts (refunds negative).
-    status: active
-    since: 1.0.0
-  - name: days_since_last_txn
-    dtype: int
-    definition: Days since the customer's last transaction (999 if none).
-    status: active
-    since: 1.0.0
-
-changelog:
-  - version: 1.0.0
-    date: "2026-10-07"
-    change: Initial release.
-  - version: 1.0.1
-    date: "2026-10-08"
-    change: Declare who can read the table (access_list); the feature_tables job provisions it.
+# ODCS §Custom & Other Properties: https://bitol-io.github.io/open-data-contract-standard/v3.0.1/#custom-properties
+customProperties:
+  - property: online
+    value: false
+  - property: changelog
+    value:
+      - version: 1.0.0
+        date: "2026-10-07"
+        change: Initial release.
+      - version: 1.0.1
+        date: "2026-10-08"
+        change: Declare who can read the table (access_list); the feature_tables job provisions it.
+      - version: 1.0.2
+        date: "2026-10-09"
+        change: Contract rewritten in ODCS v3.0.1 (refresh is now slaProperties frequency, 7d).

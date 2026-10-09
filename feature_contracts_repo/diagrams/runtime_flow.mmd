@@ -7,14 +7,14 @@ flowchart TB
     direction LR
     J1["mock_sources<br/><i>demo only — delete for real sources</i>"]
     J2["build_feature_tables<br/>for every features/&lt;table&gt;/:<br/>create schema if missing · sync columns<br/>MERGE · comments + tags"]
-    J3["provision_access<br/>grant what access_list lists<br/>revoke SELECT / MODIFY from anyone else"]
+    J3["provision_access<br/>grant what roles lists<br/>revoke SELECT / MODIFY from anyone else"]
     J1 --> J2 --> J3
   end
 
   subgraph UC["Unity Catalog"]
     direction LR
     TBL["Feature tables<br/>one per contract, where it says"]
-    GR["Grants<br/>match access_list exactly"]
+    GR["Grants<br/>match roles exactly"]
     LIN["Lineage + model feature specs<br/>who reads which column"]
   end
 

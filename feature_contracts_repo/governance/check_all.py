@@ -9,6 +9,8 @@ checks every folder against the base branch:
                                   (deprecate its features and remove them instead)
   - two contracts, one table   -> blocked: each UC table has exactly one contract, in every
                                   environment (dev, staging and prod)
+  - two contracts, one id      -> blocked: every ODCS contract id is unique (a copied folder
+                                  needs a new one)
 
 Exit code 0 = every table is safe to merge, 1 = something is blocked.
 
@@ -68,6 +70,13 @@ def run_all(base_root: Path, proposed_root: Path, env: str,
                 print(f"BLOCKED — {table} ({e}) is declared by more than one contract ({owners})")
                 blocked.append(table)
 
+    for contract_id, n in Counter(c.get("id") for c in raw.values() if c.get("id")).items():
+        if n > 1:
+            owners = ", ".join(f"features/{k}" for k, c in raw.items() if c.get("id") == contract_id)
+            print(f"BLOCKED — contract id {contract_id} is used by more than one contract ({owners}); "
+                  "give each its own UUID")
+            blocked.append(contract_id)
+
     for name, path in proposed.items():
         print(f"::group::features/{name}" + ("" if name in base else " (new)"))
         code = check_change.run(str(base[name]) if name in base else None, str(path), env,
@@ -85,7 +94,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--base-root", required=True, help="checkout of the base branch at the repo root")
     parser.add_argument("--env", default="staging", choices=fcu.ENVIRONMENTS,
-                        help="environment to check the tables in (where each lives: environments.<env>)")
+                        help="environment to check the tables in (where each lives: its server for <env>)")
     parser.add_argument("--legacy-var", action="append", default=[], metavar="NAME=VALUE",
                         help="placeholder value for base contracts from before environments: (repeatable)")
     parser.add_argument("--offline", action="store_true", help="skip the SQL compile and dependency lookups")

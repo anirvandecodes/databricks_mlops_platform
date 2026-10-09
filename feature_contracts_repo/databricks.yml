@@ -3,7 +3,7 @@
 # Each features/<table>/ folder is one governed feature table: its contract (schema, meaning,
 # lifecycle, who can read it) plus the SQL that computes it. Any team adds or changes a
 # table by PR; .github/workflows/contract-check.yml gates every PR and, on main, runs the
-# feature_tables job (build the tables, then provision access from each access_list).
+# feature_tables job (build the tables, then provision access from each contract's roles).
 #
 # Self-contained: nothing here depends on the rest of the platform, so this folder can be
 # the root of its own repo.
@@ -12,7 +12,7 @@ bundle:
 
 variables:
   # Nothing here says where feature tables live: each contract decides its own catalog,
-  # schema and sources per environment (environments: in features/<table>/<table>.yaml).
+  # schema and sources per environment (its servers: in features/<table>/<table>.yaml).
   # The jobs pass only the environment, which is the bundle target.
   demo_source_table:
     description: DEMO ONLY — where the mock transactions are written (customer_features' source).
