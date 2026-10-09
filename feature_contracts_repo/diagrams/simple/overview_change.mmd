@@ -1,0 +1,9 @@
+%%{init: {"flowchart": {"wrappingWidth": 180, "nodeSpacing": 25, "rankSpacing": 35}}}%%
+flowchart LR
+  A["<b>txn_count</b><br/>in use by models"] --> B["<b>Add txn_count_v2</b><br/>with the new logic"]
+  B --> C["<b>Mark txn_count<br/>as retiring</b><br/>with an end date"]
+  C --> D["<b>Teams move</b><br/>to v2 in their<br/>own time"]
+  D --> E["<b>Remove txn_count</b><br/>once nobody<br/>uses it"]
+  classDef s fill:#FFFFFF,stroke:#1B3139,color:#1B3139,stroke-width:1.5px;
+  classDef e fill:#E8F5EE,stroke:#00A972,color:#0B3D2A,stroke-width:1.5px;
+  class A,B,C,D s; class E e;

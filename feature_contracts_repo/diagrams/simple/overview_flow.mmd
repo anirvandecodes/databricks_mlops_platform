@@ -1,0 +1,10 @@
+%%{init: {"flowchart": {"wrappingWidth": 200, "nodeSpacing": 30, "rankSpacing": 40}}}%%
+flowchart LR
+  A["<b>1. Propose</b><br/>A team suggests a change<br/>(pull request)"] --> B["<b>2. Check</b><br/>Automatic checks run"]
+  B -->|safe| C["<b>3. Approve</b><br/>The owning team<br/>signs off"]
+  B -->|would break<br/>someone| X["<b>Stopped</b><br/>with advice on<br/>the safe way"]
+  C --> D["<b>4. Publish</b><br/>The table is built and<br/>access is set up"]
+  classDef step fill:#FFFFFF,stroke:#1B3139,color:#1B3139,stroke-width:1.5px;
+  classDef stop fill:#FFF1EC,stroke:#FF3621,color:#5A1A10,stroke-width:1.5px;
+  classDef done fill:#E8F5EE,stroke:#00A972,color:#0B3D2A,stroke-width:1.5px;
+  class A,B,C step; class X stop; class D done;

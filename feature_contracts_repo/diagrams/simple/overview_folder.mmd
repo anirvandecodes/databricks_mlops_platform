@@ -1,0 +1,13 @@
+%%{init: {"flowchart": {"wrappingWidth": 220, "nodeSpacing": 30, "rankSpacing": 50}}}%%
+flowchart LR
+  subgraph F["One folder per table"]
+    direction TB
+    Y["<b>Contract file</b><br/>what the table promises:<br/>owner, columns, meaning,<br/>who may read it"]
+    S["<b>SQL files</b><br/>how each feature<br/>is calculated"]
+  end
+  F --> T["<b>Feature table</b><br/>in Databricks"]
+  F --> P["<b>Access</b><br/>only the teams listed"]
+  classDef box fill:#FFFFFF,stroke:#1B3139,color:#1B3139,stroke-width:1.5px;
+  classDef out fill:#E8F5EE,stroke:#00A972,color:#0B3D2A,stroke-width:1.5px;
+  class Y,S box; class T,P out;
+  style F fill:#F5F7F8,stroke:#5A6F77,color:#1B3139
