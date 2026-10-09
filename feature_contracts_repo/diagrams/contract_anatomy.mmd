@@ -1,0 +1,35 @@
+%%{init: {"flowchart": {"wrappingWidth": 420, "nodeSpacing": 40, "rankSpacing": 50}}}%%
+%% Anatomy of a feature table: one folder in Git, resolved per environment into a UC table.
+flowchart LR
+  subgraph FOLDER["features/customer_features/  — one folder per table, owned by one team"]
+    direction TB
+    Y["<b>customer_features.yaml</b> — the contract<br/>name · keys · owner · SLA · version + changelog<br/><b>environments</b>: dev / staging / prod →<br/>catalog · schema · sources<br/><b>access_list</b>: who may read it<br/><b>features</b>: dtype · meaning · status · since"]
+    B["<b>_base.sql</b><br/>grain + source<br/>FROM ${transactions} t"]
+    F["<b>&lt;feature&gt;.sql</b><br/>one expression each<br/>count(t.txn_id)"]
+  end
+
+  ENV{{"Environment<br/>(bundle target)<br/>dev · staging · prod"}}
+
+  subgraph UC["Unity Catalog — in that environment"]
+    direction TB
+    T["<b>catalog.schema.customer_features</b><br/>feature table: PK + TIMESERIES key, CDF<br/>column comments + tags (status, owner, version)"]
+    S["Source tables<br/>from environments.&lt;env&gt;.sources"]
+    A["Grants from access_list<br/>USE CATALOG · USE SCHEMA · SELECT"]
+  end
+
+  Y --> ENV
+  B --> ENV
+  F --> ENV
+  ENV -->|"resolve + build"| T
+  S -->|read by SQL| T
+  ENV -->|provision| A
+  A -.-> T
+
+  classDef file fill:#FFFFFF,stroke:#5A6F77,color:#1B3139;
+  classDef env fill:#1B3139,stroke:#1B3139,color:#ffffff;
+  classDef uc fill:#FFF1EC,stroke:#FF3621,color:#5A1A10;
+  class Y,B,F file;
+  class ENV env;
+  class T,S,A uc;
+  style FOLDER fill:#F5F7F8,stroke:#5A6F77,color:#1B3139
+  style UC fill:#FFF8F5,stroke:#FF3621,color:#1B3139
