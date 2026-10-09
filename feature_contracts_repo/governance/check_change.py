@@ -3,7 +3,9 @@
 Compares one feature table on the base branch (main) with the PR — its self-contained
 folder features/<table>/ (the <table>.yaml contract and its _base.sql + <feature>.sql):
 
-  1. Are the contract and SQL valid, and do they match one to one?
+  1. Are the contract and SQL valid, and do they match one to one? The contract must be a
+     valid ODCS v3.0.1 data contract (shared/odcs-json-schema-v3.0.1.json) and follow
+     this repo's rules on top (feature_contract_utils.validate_contract).
   2. What changed?                 added / deprecated / removed / changed / metadata
   3. Is it allowed?                released features are immutable (no SQL, dtype, key or
                                    query-skeleton edits in place); only deprecated features can
@@ -57,6 +59,11 @@ def _load(path: str, env: str, legacy_vars: dict[str, str] | None = None):
         return None
 
 
+def _validate(path: str, contract: dict[str, Any], sql: dict[str, str]) -> list[str]:
+    """ODCS schema first, then this repo's contract rules, then the SQL files."""
+    return fcu.odcs_errors(path) or fcu.validate_contract(contract) or fcu.validate_sql(contract, sql)
+
+
 def run(base_path: str | None, proposed_path: str, env: str,
         dependencies_of: Callable[[str], Report | None] | None = find_dependencies,
         compile_with: Callable[[str, list[str]], str | None] | None = compile_sql,
@@ -73,8 +80,8 @@ def run(base_path: str | None, proposed_path: str, env: str,
     print(f"  main {base['version']}  ->  PR {proposed['version']}\n")
     log(f"Checking {proposed['table']}: main {base['version']} -> PR {proposed['version']}")
 
-    log("Step 1/5  Are the contract and its SQL valid, one SQL file per feature?")
-    problems = fcu.validate_contract(proposed) or fcu.validate_sql(proposed, proposed_sql)
+    log("Step 1/5  Are the contract (ODCS) and its SQL valid, one SQL file per feature?")
+    problems = _validate(proposed_path, proposed, proposed_sql)
     log("          " + ("no: " + "; ".join(problems) if problems else "yes"))
     if problems:
         print("BLOCKED — invalid contract or SQL:")
@@ -145,7 +152,7 @@ def run(base_path: str | None, proposed_path: str, env: str,
                 new = fcu.next_version_name(feature)
                 print(f"\nHow to ship it without breaking anyone:\n"
                       f"  1. Add the new logic as a new feature, {new} (contract entry + {new}.sql).\n"
-                      f"  2. Deprecate {feature} (sunset_date, replaced_by: {new}).\n"
+                      f"  2. Deprecate {feature} (sunsetDate, replacedBy: {new}).\n"
                       f"  3. Each dependency above moves to {new} in its own PR.\n"
                       f"  4. Once nothing reads {feature}, remove it (major version).")
         elif not report.errors:
@@ -178,8 +185,8 @@ def run_new(proposed_path: str, env: str,
     print(f"Feature contract check: {proposed['table']} (new table, {proposed['version']})\n")
     log(f"Checking new table {proposed['table']} @ {proposed['version']}")
 
-    log("Step 1/3  Are the contract and its SQL valid, one SQL file per feature?")
-    problems = fcu.validate_contract(proposed) or fcu.validate_sql(proposed, proposed_sql)
+    log("Step 1/3  Are the contract (ODCS) and its SQL valid, one SQL file per feature?")
+    problems = _validate(proposed_path, proposed, proposed_sql)
     if not problems and not any(str(e.get("version")) == str(proposed["version"])
                                 for e in proposed.get("changelog", [])):
         problems = [f"changelog has no entry for {proposed['version']}"]
@@ -249,7 +256,7 @@ def main() -> None:
     parser.add_argument("--base", help="contract in a checkout of the base branch (main); omit for a new table")
     parser.add_argument("--proposed", required=True, help="contract in the PR")
     parser.add_argument("--env", default="staging", choices=fcu.ENVIRONMENTS,
-                        help="environment to check the table in (where it lives: environments.<env>)")
+                        help="environment to check the table in (where it lives: its server for <env>)")
     parser.add_argument("--legacy-var", action="append", default=[], metavar="NAME=VALUE",
                         help="placeholder value for a base contract from before environments: (repeatable)")
     parser.add_argument("--offline", action="store_true", help="skip the SQL compile and dependency lookups")

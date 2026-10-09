@@ -1,13 +1,13 @@
 # Databricks notebook source
 # Provision access — make each feature table's Unity Catalog grants match its contract.
 #
-#   features/<table>/<table>.yaml  access_list  ->  GRANT / REVOKE on the table
+#   features/<table>/<table>.yaml  roles  ->  GRANT / REVOKE on the table
 #
 # Runs after producer.py in the feature_tables job, so every table it touches exists. The
-# access_list is the source of truth: listed principals get their privileges (plus USE
-# CATALOG / USE SCHEMA to reach the table), and SELECT/MODIFY is revoked from anyone not
-# listed — except the table owner and this job's identity. A contract without an
-# access_list is left alone.
+# contract's roles (ODCS §Roles) are the source of truth: listed principals get their
+# privileges (access read = SELECT, write = SELECT + MODIFY; plus USE CATALOG / USE SCHEMA to
+# reach the table), and SELECT/MODIFY is revoked from anyone not listed — except the table
+# owner and this job's identity. A contract without roles is left alone.
 
 # COMMAND ----------
 
@@ -39,7 +39,7 @@ def provision(contract_path: Path) -> None:
     contract, _ = fcu.load_table(contract_path, environment)
     table = contract["table"]
     if fcu.access_entries(contract) is None:
-        print(f"{table}: no access_list — grants not managed")
+        print(f"{table}: no roles — grants not managed")
         return
     problems = fcu.validate_contract(contract)
     if problems:

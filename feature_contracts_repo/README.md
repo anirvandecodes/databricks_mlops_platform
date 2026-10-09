@@ -27,14 +27,15 @@ feature_contracts_repo/
   resources/feature-tables.yml   the jobs (below)
   .github/                       CI/CD (contract-check.yml), CODEOWNERS, PR + issue templates
   features/<table>/              one self-contained folder per feature table, owned by one team
-    customer_features.yaml       the contract: where it lives per environment, schema, meaning, owner, access_list, lifecycle, semver, changelog
+    customer_features.yaml       the contract (ODCS v3.0.1): where it lives per environment, schema, meaning, owner, roles, lifecycle, semver, changelog
     _base.sql                    the query skeleton (grain + source), with a ${features} placeholder
     <feature>.sql                one SQL aggregate expression per feature (e.g. txn_count.sql)
   producer.py                    builds EVERY features/<table>/ into a UC feature table
   demo/mock_sources.py           DEMO ONLY: writes the mock source data (delete in a real repo)
-  provision_access.py            makes each table's UC grants match its access_list
+  provision_access.py            makes each table's UC grants match its contract's roles
   consumer.py                    reads a feature table and prints its Unity Catalog lineage
   shared/feature_contract_utils.py   the contract rules as plain, unit-tested functions
+  shared/odcs-json-schema-v3.0.1.json  the official ODCS JSON schema every contract is checked against
   governance/
     check_all.py                 the PR gate for the whole repo: every features/<table>/
     check_change.py              the gate for one table (immutability, semver, SQL compile, downstream impact)
@@ -55,7 +56,8 @@ needs to change.
 
 `features/customer_features/customer_features.yaml` is the **contract** — what the table
 promises (keys, owner, SLA, who can read it, and each feature's type, meaning, status and
-`since` version). Each feature's **logic** is the SQL file beside it: `_base.sql` is the query
+`since` version). It is an [Open Data Contract Standard (ODCS) v3.0.1](https://bitol-io.github.io/open-data-contract-standard/v3.0.1/) data contract,
+and every PR checks it against the official JSON schema. Each feature's **logic** is the SQL file beside it: `_base.sql` is the query
 skeleton (one row per customer over the source `transactions`), and each `<feature>.sql` is a
 single aggregate expression inserted at `${features}`, for example:
 
@@ -69,51 +71,74 @@ expression into `_base.sql`, and writes the table with a
 `PRIMARY KEY (customer_id, as_of_date TIMESERIES)` and Change Data Feed — which is what makes
 it a feature table consumers can point-in-time join. It also sets discovery comments and tags.
 
-## Where a table lives (`environments:`)
+## The contract, block by block (ODCS v3.0.1)
+
+Each block in the YAML follows an ODCS section; the file has a comment with a link to that
+section above each one. Whatever ODCS has no field for is a `customProperty`.
+
+| Block | ODCS section | What this repo uses it for |
+|---|---|---|
+| `apiVersion`, `kind`, `id`, `name`, `version`, `status`, `description.purpose` | [Fundamentals](https://bitol-io.github.io/open-data-contract-standard/v3.0.1/#fundamentals) | contract identity (`id` a UUID, unique in the repo), semver, table comment |
+| `team` (one member with `role: owner`) | [Team](https://bitol-io.github.io/open-data-contract-standard/v3.0.1/#team) | the owning team (`feature_owner` tag) |
+| `support` | [Support & Communication Channels](https://bitol-io.github.io/open-data-contract-standard/v3.0.1/#support-and-communication-channels) | the support channel (`support_channel` tag) |
+| `servers` (one `type: databricks` per environment) | [Infrastructure & Servers](https://bitol-io.github.io/open-data-contract-standard/v3.0.1/#databricks-server) | where the table lives per environment; `sources` is a customProperty |
+| `schema[0]` and its `properties` | [Schema](https://bitol-io.github.io/open-data-contract-standard/v3.0.1/#schema) | the table (its `name`), keys (`primaryKey`; `timestampKey` customProperty) and one property per feature (`physicalType`, `description`; `status`, `since`, `sunsetDate`, `replacedBy` customProperties) |
+| `slaProperties` (`frequency`, `latency`) | [Service-Level Agreement](https://bitol-io.github.io/open-data-contract-standard/v3.0.1/#service-level-agreement-sla) | refresh cadence and freshness SLA (tags) |
+| `roles` (`access: read` / `write`) | [Roles](https://bitol-io.github.io/open-data-contract-standard/v3.0.1/#roles) | Unity Catalog grants (below) |
+| `customProperties` (`changelog`, `online`) | [Custom & Other Properties](https://bitol-io.github.io/open-data-contract-standard/v3.0.1/#custom-properties) | the changelog the gate checks |
+
+## Where a table lives (`servers:`)
 
 Each contract decides, per environment, which catalog and schema its table goes in and which
 source tables it reads. The bundle only says which environment this is (its target: `dev`,
 `staging` or `prod`), so different teams can publish to different catalogs and schemas.
 
 ```yaml
-name: customer_features            # the table is <catalog>.<schema>.<name>
-environments:
-  dev:
+servers:                           # the table is <catalog>.<schema>.<schema[0].name>
+  - server: dev
+    type: databricks
+    environment: dev
     catalog: workspace
     schema: team_a_features_dev
-    sources:
-      transactions: workspace.feature_demo_raw_dev.transactions
-  staging: {...}
-  prod:
+    customProperties:
+      - property: sources
+        value:
+          transactions: workspace.feature_demo_raw_dev.transactions
+  - {server: staging, environment: staging, ...}
+  - server: prod
+    type: databricks
+    environment: prod
     catalog: prod_features
     schema: team_a
-    sources:
-      transactions: prod_raw.payments.transactions
+    customProperties:
+      - property: sources
+        value:
+          transactions: prod_raw.payments.transactions
 ```
 
 The SQL refers to a source by its name — `FROM ${transactions} t` — and gets that
 environment's table. Rules (checked on every PR):
-- all three environments are defined, each with `catalog`, `schema` and `sources`
-  (`name: catalog.schema.table`), using the same source names everywhere;
+- there is one server per environment (dev, staging, prod), each with `catalog`, `schema`
+  and `sources` (`name: catalog.schema.table`), using the same source names everywhere;
 - any `${...}` in the SQL that isn't a source name blocks the PR (`${features}` is reserved);
-- moving a table (any environment's catalog or schema, or its `name`) is never allowed in
+- moving a table (any environment's catalog or schema, or its `schema[0].name`) is never allowed in
   place — publish a new table; repointing a source is a patch;
 - no two contracts may claim the same table in any environment.
 
 The producer creates the schema if it's missing but never a catalog.
 
-## Who can read it (`access_list`)
+## Who can read it (`roles:`)
 
 ```yaml
-access_list:
-  - team_b_data_science                                     # a bare name gets SELECT
-  - {principal: team_a_engineers, privileges: [SELECT, MODIFY]}
+roles:
+  - {role: team_b_data_science, access: read}     # SELECT
+  - {role: team_a_engineers, access: write}       # SELECT + MODIFY
 ```
 
 The `provision_access` task makes Unity Catalog match this list **exactly**: listed principals
 get their privileges on the table (plus `USE CATALOG` / `USE SCHEMA` to reach it), and SELECT /
 MODIFY is **revoked** from anyone not listed — except the table owner and the job's identity.
-Principals must exist as account groups or users. A contract without `access_list` leaves its
+Principals must exist as account groups or users. A contract without `roles` leaves its
 grants alone. The checked-in demo grants `account users` so it runs without setup. The table
 gets a `readers` tag listing who has access, visible in Catalog Explorer.
 
@@ -123,7 +148,8 @@ On **every PR**, `.github/workflows/contract-check.yml` runs `governance/check_a
 compares every `features/<table>/` with `main`:
 
 - **A changed table** goes through `check_change.py`:
-  1. **Valid?** contract (including `access_list`) and SQL parse, one SQL file per feature.
+  1. **Valid?** the contract is valid ODCS v3.0.1 (JSON schema) and follows the rules here
+     (including `roles`), the SQL parses, one SQL file per feature.
   2. **What changed?** added / deprecated / changed / removed / metadata / access revoked.
   3. **Allowed?** released features are immutable (no in-place SQL or type change); an active
      feature can't be removed; the semver bump and changelog entry must match the change.
@@ -134,7 +160,7 @@ compares every `features/<table>/` with `main`:
 - **A new table** must have a valid contract with a changelog entry, SQL that compiles, and a
   table name that isn't already taken in Unity Catalog.
 - **A deleted table folder** is blocked — deprecate and remove its features instead.
-- **Two contracts declaring the same table** are blocked.
+- **Two contracts declaring the same table**, or sharing an `id`, are blocked.
 
 Any failing step **stops the run and fails the check**, so nothing is created from an unsafe
 change. Merge is allowed only when the check passes and the table's code owners approve
@@ -160,7 +186,7 @@ Defined in `resources/feature-tables.yml`:
 
 | Job | What it does |
 |---|---|
-| `feature_tables` | `mock_sources` writes the demo's source data (delete in a real repo); `build_feature_tables` builds every `features/<table>/` as a UC feature table where its contract says it lives in this environment; then `provision_access` makes each table's grants match its `access_list` |
+| `feature_tables` | `mock_sources` writes the demo's source data (delete in a real repo); `build_feature_tables` builds every `features/<table>/` as a UC feature table where its contract says it lives in this environment; then `provision_access` makes each table's grants match its contract's `roles` |
 | `feature_consumer` | Reads a feature table and shows its lineage |
 | `feature_consumers_check` | Reports what depends on a table/column (the same lookup as the PR gate; `fail_if_active=true` makes it the removal gate) |
 
@@ -192,17 +218,17 @@ python governance/check_all.py --base-root /tmp/base/feature_contracts_repo --en
 | Change | How | Version |
 |---|---|---|
 | New feature table | a new `features/<table>/` folder + your team in CODEOWNERS | its first version |
-| New feature | add a `<name>.sql` + a `features:` entry (with `since`) | minor |
-| New logic for an existing feature | add `<name>_v2`; deprecate `<name>` (`status`, `sunset_date`, `replaced_by`) | minor |
+| New feature | add a `<name>.sql` + a `schema` property (with `status: active`, `since`) | minor |
+| New logic for an existing feature | add `<name>_v2`; deprecate `<name>` (`status`, `sunsetDate`, `replacedBy`) | minor |
 | Remove a deprecated feature | delete it once nothing reads it | major |
-| Point a source at another table | change `environments.<env>.sources` | patch |
+| Point a source at another table | change that server's `sources` | patch |
 | Move a table (catalog, schema or name) | **not allowed** — publish a new table | — |
-| Grant a team access | add it to `access_list` | patch |
-| Revoke a team's access | remove it from `access_list` (the check warns: make sure they've moved off) | minor |
+| Grant a team access | add it to `roles` | patch |
+| Revoke a team's access | remove it from `roles` (the check warns: make sure they've moved off) | minor |
 | Definition text, owner, SLA | metadata only | patch |
 | Change a released feature's SQL or type in place | **not allowed** — ship `<name>_v2` | — |
 
-Every change needs a changelog entry; SQL comments and whitespace don't count as changes.
+Every change needs a `changelog` entry (a customProperty); SQL comments and whitespace don't count as changes.
 
 ## Moving to its own repo
 

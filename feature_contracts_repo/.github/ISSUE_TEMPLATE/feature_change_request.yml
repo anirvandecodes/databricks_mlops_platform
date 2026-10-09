@@ -29,7 +29,7 @@ body:
         - label: "Key or grain change (ships as a new table)"
         - label: "Bug fix to existing values (ships as <name>_v2 too: released features never change)"
         - label: "Deprecation / removal"
-        - label: "Access (add my team to the table's access_list)"
+        - label: "Access (add my team to the table's roles)"
   - type: textarea
     id: reason
     attributes: {label: Business reason and expected impact}
