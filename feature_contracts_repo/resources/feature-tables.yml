@@ -1,5 +1,5 @@
 # Jobs for the feature contracts repo. feature_tables builds every feature table under
-# features/<table>/ from its contract + SQL, then provisions access from each access_list.
+# features/<table>/ from its contract + SQL, then provisions access from each contract's roles.
 # They get only the environment (${bundle.target}); each contract says where it lives in it.
 # feature_consumer reads a table and shows Unity Catalog lineage; feature_consumers_check
 # reports what depends on a table/column (the same lookup as the PR check). CI/CD is

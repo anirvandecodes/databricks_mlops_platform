@@ -12,7 +12,7 @@
 # its own catalog, schema and sources for it.
 #
 # Task 2 of the feature_tables job (after the demo's mock_sources); task 3
-# (provision_access.py) then applies each contract's access_list.
+# (provision_access.py) then applies each contract's roles.
 
 # COMMAND ----------
 
@@ -60,7 +60,7 @@ def publish(folder: Path) -> str:
     if not spark.catalog.databaseExists(f"{catalog}.{schema}"):
         if not any(r[0] == catalog for r in spark.sql("SHOW CATALOGS").collect()):
             raise ValueError(f"{table}: catalog {catalog} doesn't exist in this workspace (the producer "
-                             f"never creates catalogs; ask the platform team, or fix environments.{environment})")
+                             f"never creates catalogs; ask the platform team, or fix its {environment} server)")
         spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}")
 
     key, ts_key = contract["primary_keys"][0], contract["timestamp_key"]

@@ -3,7 +3,7 @@
 flowchart LR
   subgraph FOLDER["features/customer_features/  — one folder per table, owned by one team"]
     direction TB
-    Y["<b>customer_features.yaml</b> — the contract<br/>name · keys · owner · SLA · version + changelog<br/><b>environments</b>: dev / staging / prod →<br/>catalog · schema · sources<br/><b>access_list</b>: who may read it<br/><b>features</b>: dtype · meaning · status · since"]
+    Y["<b>customer_features.yaml</b> — the contract (ODCS v3.0.1)<br/>id · version · team · support · slaProperties · changelog<br/><b>servers</b>: dev / staging / prod →<br/>catalog · schema · sources<br/><b>roles</b>: who may read it<br/><b>schema</b>: keys + features (type · meaning · status · since)"]
     B["<b>_base.sql</b><br/>grain + source<br/>FROM ${transactions} t"]
     F["<b>&lt;feature&gt;.sql</b><br/>one expression each<br/>count(t.txn_id)"]
   end
@@ -13,8 +13,8 @@ flowchart LR
   subgraph UC["Unity Catalog — in that environment"]
     direction TB
     T["<b>catalog.schema.customer_features</b><br/>feature table: PK + TIMESERIES key, CDF<br/>column comments + tags (status, owner, version)"]
-    S["Source tables<br/>from environments.&lt;env&gt;.sources"]
-    A["Grants from access_list<br/>USE CATALOG · USE SCHEMA · SELECT"]
+    S["Source tables<br/>from that server's sources"]
+    A["Grants from roles<br/>USE CATALOG · USE SCHEMA · SELECT"]
   end
 
   Y --> ENV

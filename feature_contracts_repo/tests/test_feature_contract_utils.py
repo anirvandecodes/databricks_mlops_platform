@@ -8,6 +8,7 @@ change them.
 """
 
 import copy
+import re
 import sys
 from pathlib import Path
 
@@ -55,6 +56,58 @@ def active(base):
 
 def report(*deps: dict, errors: tuple = ()) -> Report:
     return Report(TABLE, [Dependency(**d) for d in deps], [], list(errors))
+
+
+# --- writing a flat contract back as the ODCS file a team commits -----------------------
+
+def _props(items: dict) -> list[dict]:
+    return [{"property": k, "value": v} for k, v in items.items() if v is not None]
+
+
+def _odcs(c: dict) -> dict:
+    """The ODCS v3.0.1 file for a flat contract: the inverse of fcu.from_odcs, so a test can
+    edit the flat dict and write what a team would commit. Fields the flat dict lacks are
+    left out (for the gate to catch)."""
+    doc = {"apiVersion": "v3.0.1", "kind": "DataContract", "id": c.get("id") or "test-id",
+           "status": "active", "version": c.get("version")}
+    if "name" in c:
+        doc["name"] = c["name"]
+    if "description" in c:
+        doc["description"] = {"purpose": c["description"]}
+    if "owner" in c:
+        doc["team"] = [{"username": c["owner"], "role": "owner"}]
+    if "support_channel" in c:
+        doc["support"] = [{"channel": c["support_channel"], "url": "https://slack.com/app_redirect"}]
+    if isinstance(c.get("environments"), dict):
+        doc["servers"] = [{"server": env, "type": "databricks", "environment": env,
+                           **{k: e[k] for k in ("catalog", "schema") if k in e},
+                           "customProperties": _props({"sources": e.get("sources")})}
+                          for env, e in c["environments"].items()]
+    props = [{"name": k, "physicalType": "bigint", "primaryKey": True, "primaryKeyPosition": i}
+             for i, k in enumerate(c.get("primary_keys", []), 1)]
+    if "timestamp_key" in c:
+        props.append({"name": c["timestamp_key"], "physicalType": "date",
+                      "customProperties": _props({"timestampKey": True})})
+    for f in c.get("features", []):
+        props.append({"name": f["name"], **({"physicalType": f["dtype"]} if "dtype" in f else {}),
+                      **({"description": f["definition"]} if "definition" in f else {}),
+                      "customProperties": _props({"status": f.get("status"), "since": f.get("since"),
+                                                  "sunsetDate": f.get("sunset_date"),
+                                                  "replacedBy": f.get("replaced_by")})})
+    doc["schema"] = [{"name": c.get("name", "unnamed"), "physicalType": "table", "properties": props}]
+    sla = []
+    if "refresh" in c:
+        value, unit = re.match(r"^(\d+)(\w*)$", str(c["refresh"])).groups()
+        sla.append({"property": "frequency", "value": int(value), "unit": unit})
+    if "freshness_sla_hours" in c:
+        sla.append({"property": "latency", "value": c["freshness_sla_hours"], "unit": "h"})
+    if sla:
+        doc["slaProperties"] = sla
+    if "access_list" in c:
+        doc["roles"] = [{"role": e["principal"], "access": "write" if "MODIFY" in e["privileges"] else "read"}
+                        for e in c["access_list"]]
+    doc["customProperties"] = _props({"online": c.get("online"), "changelog": c.get("changelog")})
+    return doc
 
 
 # --- building PR variants of the released table -----------------------------------------
@@ -135,7 +188,7 @@ def test_released_contract_and_sql_are_valid(base):
 
 def test_validation_catches_missing_metadata(base):
     del base[0]["owner"]
-    assert "missing field: owner" in fcu.validate_contract(base[0])
+    assert f"missing field: {fcu.ODCS_FIELDS['owner']}" in fcu.validate_contract(base[0])
 
 
 def test_deprecated_feature_needs_sunset_and_replacement(base):
@@ -144,7 +197,7 @@ def test_deprecated_feature_needs_sunset_and_replacement(base):
     f.pop("sunset_date", None)
     f.pop("replaced_by", None)
     errors = fcu.validate_contract(base[0])
-    assert any("sunset_date" in e for e in errors) and any("replaced_by" in e for e in errors)
+    assert any("sunsetDate" in e for e in errors) and any("replacedBy" in e for e in errors)
 
 
 def test_every_feature_needs_exactly_one_sql_file(base):
@@ -270,13 +323,14 @@ def test_unknown_columns_count_as_every_column(base):
 
 # --- check_change.py end to end (the PR gate) ---------------------------------------------
 
-def _write(tmp_path, table):
-    """features/customer_features/ with the contract.yaml beside its *.sql, as in the repo."""
+def _write(tmp_path, table, odcs=True):
+    """features/customer_features/ with the contract.yaml (as ODCS, unless odcs=False) beside
+    its *.sql, as in the repo."""
     contract, sql = table
     folder = tmp_path / "customer_features"
     folder.mkdir(parents=True)
     path = folder / "customer_features.yaml"
-    path.write_text(yaml.safe_dump(contract))
+    path.write_text(yaml.safe_dump(_odcs(contract) if odcs else contract))
     for name, text in sql.items():
         (folder / f"{name}.sql").write_text(text)
     return str(path)
@@ -355,6 +409,62 @@ def test_gate_blocks_invalid_contract(tmp_path, base):
     assert _run(tmp_path, None, (contract, sql)) == 1
 
 
+# --- ODCS v3.0.1 -------------------------------------------------------------------------
+
+def test_contract_file_is_odcs_compliant():
+    assert fcu.odcs_errors(CONTRACT) == []
+
+
+def test_test_writer_is_the_inverse_of_from_odcs():
+    flat = fcu.load_yaml(CONTRACT)
+    assert fcu.from_odcs(_odcs(flat)) == flat
+
+
+def test_gate_blocks_a_contract_that_isnt_odcs(tmp_path, base, capsys):
+    contract, sql = added(base)
+    path = Path(_write(tmp_path / "pr", (contract, sql)))
+    path.write_text(path.read_text() + "access_list: [team_b]\n")  # not an ODCS field
+    assert check_change.run(None, str(path), ENV, None, COMPILES) == 1
+    assert "ODCS <root>: Additional properties are not allowed ('access_list' was unexpected)" in capsys.readouterr().out
+
+
+def test_gate_blocks_non_odcs_fields_in_a_feature(tmp_path, base, capsys):
+    path = Path(_write(tmp_path / "pr", added(base)))
+    doc = yaml.safe_load(path.read_text())
+    doc["schema"][0]["properties"][-1]["dtype"] = "double"
+    path.write_text(yaml.safe_dump(doc))
+    assert check_change.run(None, str(path), ENV, None, COMPILES) == 1
+    assert "'dtype' was unexpected" in capsys.readouterr().out
+
+
+def test_main_before_odcs_compares_as_unchanged(tmp_path, base):
+    """main's flat contract (before ODCS) against the same contract written as ODCS."""
+    flat = {k: v for k, v in base[0].items() if k not in ("table", "sources", "environment", "problems", "id")}
+    flat["access_list"] = [e["principal"] for e in flat["access_list"]]  # bare names, as main had them
+    old = fcu.load_table(_write(tmp_path, (flat, base[1]), odcs=False), ENV)
+    assert fcu.diff_contract(old[0], base[0], old[1], base[1]) == []
+
+
+def test_contract_ids_must_be_unique(tmp_path, base, capsys):
+    other = _new_table(base)
+    other[0]["id"] = base[0]["id"]
+    assert _run_all(tmp_path, [], [("customer_features", base), ("other_features", other)]) == 1
+    assert "used by more than one contract" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("edit, error", [
+    (lambda d: d["team"].append({"username": "team_z", "role": "owner"}), "one member with role owner"),
+    (lambda d: d["servers"].append(dict(d["servers"][0])), "more than one dev server"),
+    (lambda d: d["slaProperties"].__setitem__(1, {"property": "latency", "value": 3, "unit": "w"}),
+     "slaProperties latency"),
+    (lambda d: d.pop("servers"), "missing field: servers"),
+])
+def test_odcs_structure_problems(edit, error):
+    doc = yaml.safe_load(CONTRACT.read_text())
+    edit(doc)
+    assert any(error in e for e in fcu.validate_contract(fcu.from_odcs(doc)))
+
+
 # --- SQL and UC metadata derived from the table -------------------------------------------
 
 def test_features_sql_inserts_every_expression_outside_comments(base):
@@ -385,25 +495,26 @@ def test_sql_strings_are_escaped(base):
     assert "Team A\\'s features" in fcu.uc_metadata_statements(*base)[0]
 
 
-# --- access_list: who can read the table ---------------------------------------------------
+# --- roles: who can read the table ----------------------------------------------------------
 
-def _with_access(contract: dict, access: list, part: str | None = None) -> dict:
+def _with_access(contract: dict, roles: list | str, part: str | None = None) -> dict:
+    """The contract with these ODCS roles (a name means {role: name, access: read})."""
     c = copy.deepcopy(contract)
-    c["access_list"] = access
+    roles = roles if not isinstance(roles, list) else [{"role": r} if isinstance(r, str) else r for r in roles]
+    c["access_list"] = fcu.from_odcs({"apiVersion": "v3.0.1", "roles": roles})["access_list"]
     return _bump(c, part) if part else c
 
 
-def test_bare_name_gets_select_and_privileges_are_explicit(base):
-    c = _with_access(base[0], ["team_b", {"principal": "team_a_eng", "privileges": ["select", "MODIFY"]}])
+def test_read_gets_select_and_write_gets_modify(base):
+    c = _with_access(base[0], ["team_b", {"role": "team_a_eng", "access": "write"}])
     assert fcu.validate_contract(c) == []
     assert fcu.access_grants(c) == {("team_b", "SELECT"), ("team_a_eng", "SELECT"), ("team_a_eng", "MODIFY")}
 
 
 @pytest.mark.parametrize("access, error", [
-    ([{"principal": "team_b", "privileges": ["DROP"]}], "not one of"),
+    ([{"role": "team_b", "access": "drop"}], "must be one of read, write"),
     (["team_b", "team_b"], "listed twice"),
-    ([{"principal": "team_b", "privileges": []}], "non-empty list"),
-    ([{"privileges": ["SELECT"]}], "needs a principal"),
+    ([{"access": "read"}], "needs a role"),
     ("team_b", "must be a list"),
 ])
 def test_access_list_validation(base, access, error):
@@ -458,7 +569,7 @@ def _repo(root, *tables):
         contract, sql = table
         d = root / "features" / folder
         d.mkdir(parents=True)
-        (d / f"{folder}.yaml").write_text(yaml.safe_dump(contract))
+        (d / f"{folder}.yaml").write_text(yaml.safe_dump(_odcs(contract)))
         for name, text in sql.items():
             (d / f"{name}.sql").write_text(text)
     (root / "features").mkdir(parents=True, exist_ok=True)
@@ -467,7 +578,7 @@ def _repo(root, *tables):
 
 def _new_table(base, name="other_features"):
     contract, sql = copy.deepcopy(base[0]), dict(base[1])
-    contract["name"] = name
+    contract.update(name=name, id=f"{name}-id")
     return contract, sql
 
 
@@ -588,7 +699,7 @@ def test_legacy_base_contract_compares_as_unchanged(tmp_path, base):
     legacy = {k: v for k, v in base[0].items() if k not in ("environments", "name", "table", "sources", "environment")}
     legacy.update(table="${catalog}.${producer_schema}.customer_features", sources=["${catalog}.${raw_schema}.transactions"])
     legacy_sql = {**base[1], "_base": base[1]["_base"].replace(base[0]["sources"][0], "${catalog}.${raw_schema}.transactions")}
-    path = _write(tmp_path, (legacy, legacy_sql))
+    path = _write(tmp_path, (legacy, legacy_sql), odcs=False)
     old = fcu.load_table(path, ENV, {"catalog": "workspace", "producer_schema": "team_a_features_staging",
                                      "raw_schema": "feature_demo_raw_staging"})
     assert fcu.diff_contract(old[0], base[0], old[1], base[1]) == []

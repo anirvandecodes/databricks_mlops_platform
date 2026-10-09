@@ -21,7 +21,7 @@
 # So the feature_tables job never runs from a PR: a PR only gets checks 1-3, and the tables
 # are built once it has merged to main — where 1-3 run again first, comparing main with the
 # commit before the merge, so a push that skipped the PR is checked too. Each table is
-# checked where it lives in staging (environments.staging in its contract). In staging/prod
+# checked where it lives in staging (its staging server in the contract). In staging/prod
 # only the CI identity can deploy or run jobs (other users get CAN_VIEW in databricks.yml).
 #
 # Make "Check, then create features" a required status check on main, and turn on "Require
@@ -74,7 +74,7 @@ jobs:
         run: pytest tests -q
 
       # 2. Bundle config resolves for staging. (Where each table lives comes from its contract's
-      #    environments:, checked in step 3 — the bundle only says which environment this is.)
+      #    servers:, checked in step 3 — the bundle only says which environment this is.)
       - name: Validate bundle
         run: databricks bundle validate -t staging
 

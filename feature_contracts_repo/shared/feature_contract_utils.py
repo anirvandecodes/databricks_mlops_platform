@@ -18,11 +18,20 @@ REQUIRED_CONTRACT_FIELDS = (
 )
 ENVIRONMENTS = ("dev", "staging", "prod")  # bundle targets; every contract says where it lives in each
 REQUIRED_FEATURE_FIELDS = ("name", "dtype", "definition", "status", "since")
+# Where each flat field comes from in the ODCS file, for error messages.
+ODCS_FIELDS = {
+    "name": "schema[0].name", "environments": "servers (one per environment)", "version": "version",
+    "owner": "team (a member with role: owner)", "support_channel": "support", "description": "description.purpose",
+    "primary_keys": "a primaryKey property", "timestamp_key": "a property with customProperty timestampKey: true",
+    "refresh": "slaProperties frequency", "freshness_sla_hours": "slaProperties latency",
+    "features": "schema[0].properties", "dtype": "physicalType", "definition": "description",
+    "status": "customProperty status", "since": "customProperty since",
+}
 BASE_SQL = "_base"  # the query skeleton in a table's features/ folder; the rest are <feature>.sql
 FEATURE_STATUSES = ("active", "deprecated")
 FEATURE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
-ACCESS_PRIVILEGES = ("SELECT", "MODIFY")  # table privileges an access_list entry can grant
+ACCESS_PRIVILEGES = ("SELECT", "MODIFY")  # table privileges a role's access can grant
 
 # Kinds of change (see diff_contract). The breaking ones change what an existing reader gets.
 ADDED, DEPRECATED, CHANGED, REMOVED, KEYS, METADATA, REVOKED = (
@@ -33,17 +42,129 @@ BREAKING_KINDS = (CHANGED, REMOVED, KEYS)
 # ---------------------------------------------------------------------------
 # Loading & validation
 #
-# A contract says where its table lives in each environment:
+# A contract is an ODCS v3.0.1 data contract (https://bitol-io.github.io/open-data-contract-standard/v3.0.1/):
+# one databricks server per environment (catalog, schema, and its sources as a
+# customProperty), one schema object for the table, one property per key or feature.
+# from_odcs() turns it into the flat dict the rest of this module works on:
 #
-#   name: customer_features
-#   environments:
+#   name: customer_features                     schema[0].name
+#   environments:                               servers, by environment
 #     dev:  {catalog: ..., schema: ..., sources: {transactions: <catalog.schema.table>}}
-#     staging: ...
-#     prod: ...
+#   owner, support_channel, description         team (role owner), support, description.purpose
+#   primary_keys, timestamp_key                 properties with primaryKey / timestampKey
+#   refresh, freshness_sla_hours                slaProperties frequency / latency
+#   features: [{name, dtype, definition, status, since, sunset_date, replaced_by}]
+#   access_list: [{principal, privileges}]      roles (access read / write)
+#   changelog, online                           customProperties
 #
 # load_table(path, env) picks one environment: the table is <catalog>.<schema>.<name>, and
 # each ${<source name>} in the SQL becomes that environment's source table.
 # ---------------------------------------------------------------------------
+
+ODCS_SCHEMA = Path(__file__).with_name("odcs-json-schema-v3.0.1.json")
+ACCESS_LEVELS = {"read": ["SELECT"], "write": ["SELECT", "MODIFY"]}  # ODCS role access -> UC privileges
+_HOURS = {"h": 1, "hour": 1, "hours": 1, "d": 24, "day": 24, "days": 24}
+
+
+def _custom(obj: dict[str, Any]) -> dict[str, Any]:
+    """An ODCS object's customProperties as {property: value}."""
+    items = obj.get("customProperties") if isinstance(obj, dict) else None
+    return {c.get("property"): c.get("value") for c in items or [] if isinstance(c, dict)}
+
+
+def from_odcs(odcs: dict[str, Any]) -> dict[str, Any]:
+    """The flat contract (see above) for an ODCS data contract. Lenient: whatever is missing
+    is left out, for validate_contract to report. A contract that isn't ODCS (no apiVersion)
+    is returned as is (bare access_list names get SELECT) — only so the PR that migrates a
+    table can compare it with main; remove once every contract on main is ODCS."""
+    if "apiVersion" not in odcs:
+        if isinstance(odcs.get("access_list"), list):
+            odcs = {**odcs, "access_list": [{"principal": e, "privileges": ["SELECT"]} if isinstance(e, str) else e
+                                            for e in odcs["access_list"]]}
+        return odcs
+    c: dict[str, Any] = {"id": odcs.get("id"), "version": odcs.get("version"), "problems": []}
+    tables = odcs.get("schema") or []
+    if len(tables) != 1 or not isinstance(tables[0], dict):
+        c["problems"].append("schema must have exactly one entry: the feature table")
+    table = tables[0] if tables and isinstance(tables[0], dict) else {}
+    if table.get("name"):
+        c["name"] = table["name"]
+
+    envs: dict[str, Any] = {}
+    for server in odcs.get("servers") or []:
+        env = server.get("environment")
+        if env in envs:
+            c["problems"].append(f"servers: more than one {env} server")
+        envs[env] = {"catalog": server.get("catalog"), "schema": server.get("schema"),
+                     "sources": _custom(server).get("sources")}
+    if envs:
+        c["environments"] = envs
+
+    owners = [m.get("username") for m in odcs.get("team") or [] if m.get("role") == "owner"]
+    if len(owners) == 1:
+        c["owner"] = owners[0]
+    elif owners:
+        c["problems"].append(f"team: one member with role owner, not {len(owners)}")
+    if odcs.get("support"):
+        c["support_channel"] = odcs["support"][0].get("channel")
+    if isinstance(odcs.get("description"), dict) and odcs["description"].get("purpose"):
+        c["description"] = odcs["description"]["purpose"]
+
+    props = [p for p in table.get("properties") or [] if isinstance(p, dict)]
+    keys = sorted((p for p in props if p.get("primaryKey")), key=lambda p: p.get("primaryKeyPosition", -1))
+    if keys:
+        c["primary_keys"] = [p["name"] for p in keys]
+    ts = [p["name"] for p in props if _custom(p).get("timestampKey") is True]
+    if len(ts) == 1:
+        c["timestamp_key"] = ts[0]
+    elif ts:
+        c["problems"].append(f"schema: one timestampKey property, not {len(ts)} ({', '.join(ts)})")
+    c["features"] = []
+    for p in props:
+        if p.get("primaryKey") or p.get("name") in ts:
+            continue
+        custom = _custom(p)
+        feat = {"name": p.get("name"), "dtype": p.get("physicalType"), "definition": p.get("description"),
+                "status": custom.get("status"), "since": custom.get("since"),
+                "sunset_date": custom.get("sunsetDate"), "replaced_by": custom.get("replacedBy")}
+        c["features"].append({k: v for k, v in feat.items() if v is not None})
+
+    sla = {s.get("property"): s for s in odcs.get("slaProperties") or [] if isinstance(s, dict)}
+    if "frequency" in sla:
+        c["refresh"] = f"{sla['frequency'].get('value')}{sla['frequency'].get('unit') or ''}"
+    if "latency" in sla:
+        value, unit = sla["latency"].get("value"), str(sla["latency"].get("unit", "")).lower()
+        if isinstance(value, (int, float)) and unit in _HOURS:
+            c["freshness_sla_hours"] = value * _HOURS[unit]
+        else:
+            c["problems"].append("slaProperties latency: needs a number of hours (unit h) or days (unit d)")
+
+    if "roles" in odcs:
+        roles = odcs["roles"]
+        c["access_list"] = roles if not isinstance(roles, list) else [
+            {"principal": r.get("role"),
+             "privileges": ACCESS_LEVELS.get(str(r.get("access", "read")).lower(), [r.get("access")])}
+            if isinstance(r, dict) else r for r in roles]
+    custom = _custom(odcs)
+    c["changelog"] = custom.get("changelog") or []
+    if "online" in custom:
+        c["online"] = custom["online"]
+    return c
+
+
+def odcs_errors(path: str | Path) -> list[str]:
+    """Where the contract file breaks the ODCS v3.0.1 JSON schema (empty list = compliant)."""
+    import json
+
+    import jsonschema  # only the PR gate needs it
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    validator = jsonschema.Draft201909Validator(json.loads(ODCS_SCHEMA.read_text(encoding="utf-8")),
+                                                format_checker=jsonschema.FormatChecker())
+    return [f"ODCS {'.'.join(map(str, e.absolute_path)) or '<root>'}: {e.message}"
+            for e in sorted(validator.iter_errors(data), key=lambda e: list(map(str, e.absolute_path)))]
+
 
 PLACEHOLDER_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 SQL_RESERVED = {"features"}  # ${features} in _base.sql is where the feature expressions go
@@ -51,10 +172,10 @@ FULL_NAME_RE = re.compile(r"^[^.\s]+\.[^.\s]+\.[^.\s]+$")
 
 
 def load_yaml(path: str | Path, variables: dict[str, str] | None = None) -> dict[str, Any]:
-    """Load a YAML file, substituting ${var} placeholders in string values."""
+    """Load a contract (from_odcs), substituting ${var} placeholders in string values."""
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
-    return _substitute(data, variables or {})
+    return _substitute(from_odcs(data), variables or {})
 
 
 def resolve(contract: dict[str, Any], env: str) -> dict[str, Any]:
@@ -62,7 +183,7 @@ def resolve(contract: dict[str, Any], env: str) -> dict[str, Any]:
     (that environment's source tables) and "environment". Resolving again is a no-op."""
     envs = contract.get("environments")
     if not isinstance(envs, dict) or not isinstance(envs.get(env), dict):
-        raise ValueError(f"no environments.{env} (where the table lives in {env})")
+        raise ValueError(f"no {env} server (where the table lives in {env})")
     e = envs[env]
     sources = e.get("sources") if isinstance(e.get("sources"), dict) else {}
     return {**contract, "table": f"{e.get('catalog')}.{e.get('schema')}.{contract.get('name')}",
@@ -89,7 +210,7 @@ def load_table(path: str | Path, env: str,
                       - SQL_RESERVED) + sorted(set(PLACEHOLDER_RE.findall(yaml.safe_dump(contract))))
     if unfilled:
         names = ", ".join("${" + n + "}" for n in dict.fromkeys(unfilled))
-        raise ValueError(f"{Path(path).parent.name}: {names} not defined — add it to every environment's sources")
+        raise ValueError(f"{Path(path).parent.name}: {names} not defined — add it to every server's sources")
     return contract, sql
 
 
@@ -126,7 +247,8 @@ def parse_version(version: str) -> tuple[int, int, int]:
 
 def validate_contract(contract: dict[str, Any]) -> list[str]:
     """Return a list of problems with the contract (empty list = valid)."""
-    errors = [f"missing field: {f}" for f in REQUIRED_CONTRACT_FIELDS if f not in contract]
+    errors = list(contract.get("problems", []))
+    errors += [f"missing field: {ODCS_FIELDS[f]}" for f in REQUIRED_CONTRACT_FIELDS if f not in contract]
     if errors:
         return errors
 
@@ -145,7 +267,7 @@ def validate_contract(contract: dict[str, Any]) -> list[str]:
         name = feat.get("name", "<unnamed>")
         missing = [f for f in REQUIRED_FEATURE_FIELDS if f not in feat]
         if missing:
-            errors.append(f"feature {name}: missing {', '.join(missing)}")
+            errors.append(f"feature {name}: missing {', '.join(ODCS_FIELDS.get(f, f) for f in missing)}")
             continue
         if not FEATURE_NAME_RE.match(name):
             errors.append(f"feature {name}: name must be lower_snake_case")
@@ -158,42 +280,42 @@ def validate_contract(contract: dict[str, Any]) -> list[str]:
             errors.append(f"feature {name}: status must be one of {FEATURE_STATUSES}")
         if feat["status"] == "deprecated":
             if not feat.get("sunset_date"):
-                errors.append(f"feature {name}: deprecated features need a sunset_date")
+                errors.append(f"feature {name}: deprecated features need a sunsetDate")
             if not feat.get("replaced_by"):
-                errors.append(f"feature {name}: deprecated features need replaced_by (or 'none')")
+                errors.append(f"feature {name}: deprecated features need replacedBy (or 'none')")
     return errors + _validate_access(contract)
 
 
 def _validate_environments(contract: dict[str, Any]) -> list[str]:
     if not FEATURE_NAME_RE.match(str(contract["name"])):
-        return [f"name {contract['name']!r} must be lower_snake_case (it's the table name)"]
+        return [f"schema[0].name {contract['name']!r} must be lower_snake_case (it's the table name)"]
     envs = contract["environments"]
     if not isinstance(envs, dict):
-        return ["environments must map each environment to its catalog, schema and sources"]
-    errors = [f"environments: {env} missing (every table needs {', '.join(ENVIRONMENTS)})"
+        return ["servers must give each environment its catalog, schema and sources"]
+    errors = [f"servers: {env} missing (every table needs a server per environment: {', '.join(ENVIRONMENTS)})"
               for env in ENVIRONMENTS if env not in envs]
-    errors += [f"environments: {env} isn't a bundle target ({', '.join(ENVIRONMENTS)})"
+    errors += [f"servers: environment {env} isn't a bundle target ({', '.join(ENVIRONMENTS)})"
                for env in envs if env not in ENVIRONMENTS]
     source_names = None
     for env in [e for e in ENVIRONMENTS if e in envs]:
         e = envs[env] if isinstance(envs[env], dict) else {}
         for field in ("catalog", "schema"):
             if not isinstance(e.get(field), str) or not e[field].strip():
-                errors.append(f"environments.{env}: needs a {field}")
+                errors.append(f"servers {env}: needs a {field}")
         sources = e.get("sources")
         if not isinstance(sources, dict) or not sources:
-            errors.append(f"environments.{env}: needs sources (name: catalog.schema.table)")
+            errors.append(f"servers {env}: needs a sources customProperty (name: catalog.schema.table)")
             continue
         for name, table in sources.items():
             if not FEATURE_NAME_RE.match(str(name)) or name in SQL_RESERVED:
-                errors.append(f"environments.{env}.sources: {name!r} must be lower_snake_case (not 'features')")
+                errors.append(f"servers {env} sources: {name!r} must be lower_snake_case (not 'features')")
             if not FULL_NAME_RE.match(str(table)):
-                errors.append(f"environments.{env}.sources.{name}: {table!r} must be catalog.schema.table")
+                errors.append(f"servers {env} sources.{name}: {table!r} must be catalog.schema.table")
         if source_names is None:
             source_names = set(sources)
         elif set(sources) != source_names:
-            errors.append(f"environments.{env}: sources {sorted(sources)} must have the same names as "
-                          f"the other environments {sorted(source_names)} (the SQL uses them)")
+            errors.append(f"servers {env}: sources {sorted(sources)} must have the same names as "
+                          f"the other servers {sorted(source_names)} (the SQL uses them)")
     return errors
 
 
@@ -201,27 +323,21 @@ def _validate_access(contract: dict[str, Any]) -> list[str]:
     if "access_list" not in contract:
         return []
     if not isinstance(contract["access_list"], list):
-        return ["access_list must be a list of principals"]
+        return ["roles must be a list of {role, access}"]
     errors, seen = [], set()
     for entry in contract["access_list"]:
-        if isinstance(entry, str):
-            principal, privileges = entry, ["SELECT"]
-        elif isinstance(entry, dict):
-            principal, privileges = entry.get("principal"), entry.get("privileges")
-        else:
-            errors.append(f"access_list: {entry!r} must be a name or {{principal, privileges}}")
+        if not isinstance(entry, dict):
+            errors.append(f"roles: {entry!r} must be {{role, access}}")
             continue
+        principal, privileges = entry.get("principal"), entry.get("privileges")
         if not isinstance(principal, str) or not principal.strip():
-            errors.append(f"access_list: {entry!r} needs a principal")
+            errors.append("roles: every entry needs a role (the principal)")
             continue
-        if not privileges or not isinstance(privileges, list):
-            errors.append(f"access_list {principal}: privileges must be a non-empty list")
-        else:
-            bad = [p for p in privileges if str(p).upper() not in ACCESS_PRIVILEGES]
-            if bad:
-                errors.append(f"access_list {principal}: {', '.join(map(str, bad))} not one of {ACCESS_PRIVILEGES}")
+        bad = [p for p in privileges or [] if str(p).upper() not in ACCESS_PRIVILEGES]
+        if bad or not privileges:
+            errors.append(f"roles {principal}: access {', '.join(map(str, bad))} must be one of {', '.join(ACCESS_LEVELS)}")
         if principal in seen:
-            errors.append(f"access_list {principal}: listed twice")
+            errors.append(f"roles {principal}: listed twice")
         seen.add(principal)
     return errors
 
@@ -235,7 +351,7 @@ def validate_sql(contract: dict[str, Any], sql: dict[str, str]) -> list[str]:
         errors.append(f"{BASE_SQL}.sql must contain ${{features}} where the feature expressions go")
     names = {f["name"] for f in contract["features"]}
     errors += [f"feature {n}: no {n}.sql" for n in sorted(names - set(sql))]
-    errors += [f"{n}.sql: not in the contract (add it to features: or delete the file)"
+    errors += [f"{n}.sql: not in the contract (add it to the schema properties or delete the file)"
                for n in sorted(set(sql) - names - {BASE_SQL})]
     errors += [f"{n}.sql: empty" for n in sorted(names & set(sql)) if not sql_norm(sql[n])]
     return errors
@@ -267,8 +383,8 @@ def diff_contract(base: dict[str, Any], proposed: dict[str, Any],
       keys        table moved (any environment's catalog/schema,  never allowed
                   or its name), keys, or the query skeleton edited
       metadata    definition text, description, owner, SLA, ...  patch bump
-                  (and access granted in access_list)
-      revoked     access removed from access_list               minor bump, with a warning
+                  (and access granted in roles)
+      revoked     access removed from roles                     minor bump, with a warning
     SQL comments and whitespace don't count as changes. If main has no SQL for the table
     yet (the PR that first adds it), there's nothing to compare the SQL with.
     """
@@ -350,7 +466,7 @@ def change_problems(base: dict[str, Any], proposed: dict[str, Any],
                             f"logic as {new}, deprecate {c['feature']}, remove it once nothing reads it")
         elif c["kind"] == REMOVED and base_feats[c["feature"]]["status"] != "deprecated":
             problems.append(f"{c['feature']}: active features can't be removed — deprecate it "
-                            "(sunset_date, replaced_by) in one release and remove it in a later one")
+                            "(sunsetDate, replacedBy) in one release and remove it in a later one")
 
     try:
         old_v, new_v = parse_version(base["version"]), parse_version(proposed["version"])
@@ -502,16 +618,15 @@ def uc_metadata_statements(contract: dict[str, Any], sql: dict[str, str]) -> lis
 
 
 # ---------------------------------------------------------------------------
-# Access: Unity Catalog grants derived from the contract's access_list
+# Access: Unity Catalog grants derived from the contract's roles
 # ---------------------------------------------------------------------------
 
 def access_entries(contract: dict[str, Any]) -> list[dict[str, Any]] | None:
-    """access_list as [{"principal", "privileges"}] (a bare name gets SELECT), or None when
-    the contract has no access_list (then its grants aren't managed)."""
+    """The contract's roles as [{"principal", "privileges"}], or None when the contract has
+    no roles (then its grants aren't managed)."""
     if "access_list" not in contract:
         return None
-    return [{"principal": e, "privileges": ["SELECT"]} if isinstance(e, str)
-            else {"principal": e["principal"], "privileges": [str(p).upper() for p in e["privileges"]]}
+    return [{"principal": e["principal"], "privileges": [str(p).upper() for p in e["privileges"]]}
             for e in contract["access_list"]]
 
 
@@ -522,7 +637,7 @@ def access_grants(contract: dict[str, Any]) -> set[tuple[str, str]] | None:
 
 
 def grant_statements(contract: dict[str, Any], current: set[tuple[str, str]], keep: set[str]) -> list[str]:
-    """GRANT / REVOKE statements that make the table's grants match access_list exactly.
+    """GRANT / REVOKE statements that make the table's grants match its roles exactly.
 
     current: the (principal, privilege) pairs granted on the table itself today, limited to
     ACCESS_PRIVILEGES. keep: principals never revoked (the table owner, the job's identity).
