@@ -56,7 +56,12 @@ def run_all(base_root: Path, proposed_root: Path, env: str,
         print("::endgroup::")
         blocked.append(name)
 
-    raw = {name: fcu.load_yaml(path) for name, path in proposed.items()}
+    raw = {}
+    for name, path in proposed.items():
+        try:
+            raw[name] = fcu.load_yaml(path)
+        except ValueError:
+            pass  # not valid YAML: check_change reports it
     for e in fcu.ENVIRONMENTS:
         tables = {}
         for name, contract in raw.items():
