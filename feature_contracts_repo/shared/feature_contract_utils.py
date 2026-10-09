@@ -80,17 +80,9 @@ def _custom(obj: dict[str, Any]) -> dict[str, Any]:
 
 def from_odcs(odcs: dict[str, Any]) -> dict[str, Any]:
     """The flat contract (see above) for an ODCS data contract. Lenient: whatever is missing
-    or malformed is left out, for validate_contract (and the ODCS schema check) to report.
-    A contract that isn't ODCS (no apiVersion) is returned as is (bare access_list names get
-    SELECT) — only so the PR that migrates a table can compare it with main; remove once
-    every contract on main is ODCS."""
-    if not isinstance(odcs, dict):
-        return {"problems": ["the contract must be a YAML mapping (an ODCS data contract)"], "features": []}
-    if "apiVersion" not in odcs:
-        if isinstance(odcs.get("access_list"), list):
-            odcs = {**odcs, "access_list": [{"principal": e, "privileges": ["SELECT"]} if isinstance(e, str) else e
-                                            for e in odcs["access_list"]]}
-        return odcs
+    or malformed is left out, for validate_contract (and the ODCS schema check) to report."""
+    if not isinstance(odcs, dict) or "apiVersion" not in odcs:
+        return {"problems": ["the contract must be an ODCS v3.0.1 data contract (apiVersion: v3.0.1)"]}
     c: dict[str, Any] = {"id": odcs.get("id"), "version": odcs.get("version"), "status": odcs.get("status"),
                          "problems": []}
     tables = odcs.get("schema")
@@ -250,21 +242,14 @@ def resolve(contract: dict[str, Any], env: str) -> dict[str, Any]:
             "sources": list(sources.values()), "environment": env}
 
 
-def load_table(path: str | Path, env: str,
-               legacy_vars: dict[str, str] | None = None) -> tuple[dict[str, Any], dict[str, str]]:
+def load_table(path: str | Path, env: str) -> tuple[dict[str, Any], dict[str, str]]:
     """(contract, {feature: SQL}) for one feature table in `env`.
 
-    Raises ValueError when `env` isn't defined or a ${placeholder} can't be filled. A contract
-    from before environments: existed (a `table:` with ${catalog}-style placeholders) is
-    filled from legacy_vars instead — only so the PR that migrates a table can compare it
-    with main; remove once every contract on main has environments:.
+    Raises ValueError when `env` isn't defined or a ${placeholder} can't be filled.
     """
     raw = load_yaml(path)
-    if "environments" not in raw and "table" in raw:
-        contract, values = _substitute(raw, legacy_vars or {}), dict(legacy_vars or {})
-    else:
-        contract = resolve(raw, env)
-        values = dict(raw["environments"][env].get("sources") or {})
+    contract = resolve(raw, env)
+    values = dict(raw["environments"][env].get("sources") or {})
     sql = load_feature_sql(path, values)
     unfilled = sorted({m for text in [*sql.values()] for m in PLACEHOLDER_RE.findall(_strip_comments(text))}
                       - SQL_RESERVED) + sorted(set(PLACEHOLDER_RE.findall(yaml.safe_dump(contract))))
@@ -455,25 +440,19 @@ def diff_contract(base: dict[str, Any], proposed: dict[str, Any],
     def add(feature: str, kind: str, message: str) -> None:
         changes.append({"feature": feature, "kind": kind, "message": message})
 
-    if isinstance(base.get("environments"), dict) and isinstance(proposed.get("environments"), dict):
-        for env in ENVIRONMENTS:
-            old, new = base["environments"].get(env), proposed["environments"].get(env)
-            if not isinstance(new, dict):
-                continue
-            if not isinstance(old, dict):
-                add("<table>", METADATA, f"{env} environment added")
-                continue
-            old_t = f"{old.get('catalog')}.{old.get('schema')}.{base.get('name')}"
-            new_t = f"{new.get('catalog')}.{new.get('schema')}.{proposed.get('name')}"
-            if old_t != new_t:
-                add("<table>", KEYS, f"{env}: table moves {old_t} -> {new_t}")
-            if old.get("sources") != new.get("sources"):
-                add("<table>", METADATA, f"{env} sources changed")
-    else:  # main's contract predates environments: compare the environment being checked
-        if base["table"] != proposed["table"]:
-            add("<table>", KEYS, f"table renamed {base['table']} -> {proposed['table']}")
-        if list(base.get("sources", [])) != list(proposed.get("sources", [])):
-            add("<table>", METADATA, "sources changed")
+    for env in ENVIRONMENTS:
+        old, new = base["environments"].get(env), proposed["environments"].get(env)
+        if not isinstance(new, dict):
+            continue
+        if not isinstance(old, dict):
+            add("<table>", METADATA, f"{env} environment added")
+            continue
+        old_t = f"{old.get('catalog')}.{old.get('schema')}.{base.get('name')}"
+        new_t = f"{new.get('catalog')}.{new.get('schema')}.{proposed.get('name')}"
+        if old_t != new_t:
+            add("<table>", KEYS, f"{env}: table moves {old_t} -> {new_t}")
+        if old.get("sources") != new.get("sources"):
+            add("<table>", METADATA, f"{env} sources changed")
     if (list(base["primary_keys"]) != list(proposed["primary_keys"])
             or base["timestamp_key"] != proposed["timestamp_key"]):
         add("<keys>", KEYS, "primary/timestamp key changed")

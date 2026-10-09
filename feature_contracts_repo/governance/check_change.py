@@ -73,15 +73,14 @@ def _validate(contract: dict[str, Any], sql: dict[str, str]) -> list[str]:
 
 def run(base_path: str | None, proposed_path: str, env: str,
         dependencies_of: Callable[[str], Report | None] | None = find_dependencies,
-        compile_with: Callable[[str, list[str]], str | None] | None = compile_sql,
-        legacy_vars: dict[str, str] | None = None) -> int:
+        compile_with: Callable[[str, list[str]], str | None] | None = compile_sql) -> int:
     if base_path is None:
         return run_new(proposed_path, env, dependencies_of, compile_with)
     loaded = _load(proposed_path, env)
     if loaded is None:
         return 1
     proposed, proposed_sql = loaded
-    base, base_sql = fcu.load_table(base_path, env, legacy_vars)
+    base, base_sql = fcu.load_table(base_path, env)
 
     print(f"Feature contract check: {proposed['table']}")
     print(f"  main {base['version']}  ->  PR {proposed['version']}\n")
@@ -264,13 +263,10 @@ def main() -> None:
     parser.add_argument("--proposed", required=True, help="contract in the PR")
     parser.add_argument("--env", default="staging", choices=fcu.ENVIRONMENTS,
                         help="environment to check the table in (where it lives: its server for <env>)")
-    parser.add_argument("--legacy-var", action="append", default=[], metavar="NAME=VALUE",
-                        help="placeholder value for a base contract from before environments: (repeatable)")
     parser.add_argument("--offline", action="store_true", help="skip the SQL compile and dependency lookups")
     args = parser.parse_args()
-    legacy = dict(v.split("=", 1) for v in args.legacy_var)
     sys.exit(run(args.base, args.proposed, args.env,
-                 *((None, None) if args.offline else (find_dependencies, compile_sql)), legacy_vars=legacy))
+                 *((None, None) if args.offline else (find_dependencies, compile_sql))))
 
 
 if __name__ == "__main__":

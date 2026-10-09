@@ -44,8 +44,7 @@ def contracts(features_root: Path) -> dict[str, Path]:
 
 
 def run_all(base_root: Path, proposed_root: Path, env: str,
-            dependencies_of=find_dependencies, compile_with=compile_sql,
-            legacy_vars: dict[str, str] | None = None) -> int:
+            dependencies_of=find_dependencies, compile_with=compile_sql) -> int:
     base, proposed = contracts(base_root / "features"), contracts(proposed_root / "features")
     blocked = []
 
@@ -85,7 +84,7 @@ def run_all(base_root: Path, proposed_root: Path, env: str,
     for name, path in proposed.items():
         print(f"::group::features/{name}" + ("" if name in base else " (new)"))
         code = check_change.run(str(base[name]) if name in base else None, str(path), env,
-                                dependencies_of, compile_with, legacy_vars)
+                                dependencies_of, compile_with)
         print("::endgroup::")
         if code:
             blocked.append(name)
@@ -100,13 +99,10 @@ def main() -> None:
     parser.add_argument("--base-root", required=True, help="checkout of the base branch at the repo root")
     parser.add_argument("--env", default="staging", choices=fcu.ENVIRONMENTS,
                         help="environment to check the tables in (where each lives: its server for <env>)")
-    parser.add_argument("--legacy-var", action="append", default=[], metavar="NAME=VALUE",
-                        help="placeholder value for base contracts from before environments: (repeatable)")
     parser.add_argument("--offline", action="store_true", help="skip the SQL compile and dependency lookups")
     args = parser.parse_args()
-    legacy = dict(v.split("=", 1) for v in args.legacy_var)
     sys.exit(run_all(Path(args.base_root), ROOT, args.env,
-                     *((None, None) if args.offline else (find_dependencies, compile_sql)), legacy_vars=legacy))
+                     *((None, None) if args.offline else (find_dependencies, compile_sql))))
 
 
 if __name__ == "__main__":

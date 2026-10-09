@@ -77,12 +77,7 @@ jobs:
         run: |
           set -euo pipefail
           git worktree add -q --detach /tmp/base "$BASE"   # no base = no comparison: fail the run
-          # --legacy-var: placeholder values for main's contracts from before environments:
-          # existed, so the PR that migrates them can be compared. Remove once that's on main.
-          python governance/check_all.py --env staging --base-root "/tmp/base/$ROOT" \
-            --legacy-var catalog=workspace \
-            --legacy-var producer_schema=team_a_features_staging \
-            --legacy-var raw_schema=feature_demo_raw_staging
+          python governance/check_all.py --env staging --base-root "/tmp/base/$ROOT"
 
       # 4. All checks passed — build the tables, provision access, read them. Skipped on PRs.
       - name: Create the feature tables and provision access
